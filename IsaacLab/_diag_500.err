@@ -1,0 +1,155 @@
+5.0.0: Pulling from nvidia/isaac-sim
+7478e0ac0f23: Pulling fs layer
+45f8eb5f3d64: Pulling fs layer
+217f19e84bb6: Pulling fs layer
+ccb3af6f7a2b: Pulling fs layer
+4ac634a388fa: Pulling fs layer
+7136bae5c750: Pulling fs layer
+10157deeab15: Pulling fs layer
+1564a0d327cb: Pulling fs layer
+49aa5f62289a: Pulling fs layer
+f0c3c8a60908: Pulling fs layer
+faa6ab19afbb: Pulling fs layer
+8b9f8913e6a6: Pulling fs layer
+84b0f15f54a8: Pulling fs layer
+61dc10eebbe2: Pulling fs layer
+dab057395e03: Pulling fs layer
+89447ab5ea1a: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+325e1639a108: Pulling fs layer
+c82b32c32515: Pulling fs layer
+ccb3af6f7a2b: Waiting
+9ff679b93fe3: Pulling fs layer
+4ac634a388fa: Waiting
+7136bae5c750: Waiting
+10157deeab15: Waiting
+1bd69e4d28a7: Pulling fs layer
+1564a0d327cb: Waiting
+fdd8a74e0236: Pulling fs layer
+faa6ab19afbb: Waiting
+1cbef604af34: Pulling fs layer
+49aa5f62289a: Waiting
+f5f0f5b3b3ad: Pulling fs layer
+89447ab5ea1a: Waiting
+f0c3c8a60908: Waiting
+dab057395e03: Waiting
+8b9f8913e6a6: Waiting
+4f4fb700ef54: Waiting
+84b0f15f54a8: Waiting
+c0643aa6f6e4: Pulling fs layer
+325e1639a108: Waiting
+61dc10eebbe2: Waiting
+41e563a07564: Pulling fs layer
+1bd69e4d28a7: Waiting
+c82b32c32515: Waiting
+f5f0f5b3b3ad: Waiting
+fdd8a74e0236: Waiting
+1cbef604af34: Waiting
+8e040c4a1d70: Pulling fs layer
+9ff679b93fe3: Waiting
+0597d4685148: Pulling fs layer
+41e563a07564: Waiting
+1cdc8ee12edc: Pulling fs layer
+0597d4685148: Waiting
+1cdc8ee12edc: Waiting
+2cf5e6152ab9: Pulling fs layer
+eb2d5de0a4a2: Pulling fs layer
+2cf5e6152ab9: Waiting
+8b451a22cf5a: Pulling fs layer
+eb2d5de0a4a2: Waiting
+7d891d20d5d3: Pulling fs layer
+8b451a22cf5a: Waiting
+7d891d20d5d3: Waiting
+45f8eb5f3d64: Verifying Checksum
+45f8eb5f3d64: Download complete
+217f19e84bb6: Download complete
+ccb3af6f7a2b: Verifying Checksum
+ccb3af6f7a2b: Download complete
+4ac634a388fa: Verifying Checksum
+4ac634a388fa: Download complete
+7478e0ac0f23: Verifying Checksum
+7478e0ac0f23: Download complete
+7478e0ac0f23: Pull complete
+45f8eb5f3d64: Pull complete
+217f19e84bb6: Pull complete
+ccb3af6f7a2b: Pull complete
+4ac634a388fa: Pull complete
+1564a0d327cb: Download complete
+7136bae5c750: Download complete
+7136bae5c750: Pull complete
+10157deeab15: Download complete
+10157deeab15: Pull complete
+1564a0d327cb: Pull complete
+49aa5f62289a: Verifying Checksum
+49aa5f62289a: Download complete
+49aa5f62289a: Pull complete
+faa6ab19afbb: Verifying Checksum
+faa6ab19afbb: Download complete
+8b9f8913e6a6: Verifying Checksum
+8b9f8913e6a6: Download complete
+84b0f15f54a8: Verifying Checksum
+84b0f15f54a8: Download complete
+61dc10eebbe2: Verifying Checksum
+61dc10eebbe2: Download complete
+f0c3c8a60908: Verifying Checksum
+f0c3c8a60908: Download complete
+dab057395e03: Verifying Checksum
+dab057395e03: Download complete
+89447ab5ea1a: Verifying Checksum
+89447ab5ea1a: Download complete
+4f4fb700ef54: Verifying Checksum
+4f4fb700ef54: Download complete
+325e1639a108: Verifying Checksum
+325e1639a108: Download complete
+c82b32c32515: Verifying Checksum
+c82b32c32515: Download complete
+1bd69e4d28a7: Verifying Checksum
+1bd69e4d28a7: Download complete
+f0c3c8a60908: Pull complete
+fdd8a74e0236: Verifying Checksum
+fdd8a74e0236: Download complete
+faa6ab19afbb: Pull complete
+8b9f8913e6a6: Pull complete
+84b0f15f54a8: Pull complete
+61dc10eebbe2: Pull complete
+1cbef604af34: Verifying Checksum
+1cbef604af34: Download complete
+dab057395e03: Pull complete
+89447ab5ea1a: Pull complete
+4f4fb700ef54: Pull complete
+325e1639a108: Pull complete
+f5f0f5b3b3ad: Verifying Checksum
+f5f0f5b3b3ad: Download complete
+c82b32c32515: Pull complete
+c0643aa6f6e4: Download complete
+41e563a07564: Download complete
+8e040c4a1d70: Verifying Checksum
+8e040c4a1d70: Download complete
+0597d4685148: Download complete
+1cdc8ee12edc: Verifying Checksum
+1cdc8ee12edc: Download complete
+2cf5e6152ab9: Verifying Checksum
+2cf5e6152ab9: Download complete
+eb2d5de0a4a2: Download complete
+8b451a22cf5a: Download complete
+7d891d20d5d3: Verifying Checksum
+7d891d20d5d3: Download complete
+9ff679b93fe3: Verifying Checksum
+9ff679b93fe3: Download complete
+9ff679b93fe3: Pull complete
+1bd69e4d28a7: Pull complete
+fdd8a74e0236: Pull complete
+1cbef604af34: Pull complete
+f5f0f5b3b3ad: Pull complete
+c0643aa6f6e4: Pull complete
+41e563a07564: Pull complete
+8e040c4a1d70: Pull complete
+0597d4685148: Pull complete
+1cdc8ee12edc: Pull complete
+2cf5e6152ab9: Pull complete
+eb2d5de0a4a2: Pull complete
+8b451a22cf5a: Pull complete
+7d891d20d5d3: Pull complete
+Digest: sha256:499e1fd7a3ffc68c6c6fff466d4a6a6dc9ab1573e0a28dbd5f100501ea64e410
+Status: Downloaded newer image for nvcr.io/nvidia/isaac-sim:5.0.0
+nvcr.io/nvidia/isaac-sim:5.0.0

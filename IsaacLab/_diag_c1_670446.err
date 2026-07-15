@@ -1,0 +1,24 @@
+5.1.0: Pulling from nvidia/isaac-sim
+Digest: sha256:f3563cb2ba0c18af0b2fb321360dcb73a917b899f879e3213623d6bee484fa54
+Status: Image is up to date for nvcr.io/nvidia/isaac-sim:5.1.0
+nvcr.io/nvidia/isaac-sim:5.1.0
++ echo '=== HOST ==='
++ hostname
++ id
++ echo '=== /isaac-sim top ==='
++ ls -la /isaac-sim
++ head -20
++ echo '=== python.sh ==='
++ ls -la /isaac-sim/python.sh
++ echo '=== kit python dir ==='
++ ls -la /isaac-sim/kit/python/bin/
++ head -10
++ echo '=== passwd isaac-sim user ==='
++ getent passwd isaac-sim
++ true
++ getent passwd 1234
++ true
++ echo '=== try execute ==='
++ /isaac-sim/python.sh -c 'print('\''python.sh ok'\'')'
++ /isaac-sim/kit/python/bin/python3 -c 'print('\''kit python ok'\'')'
++ echo '=== done ==='

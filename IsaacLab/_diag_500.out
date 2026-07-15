@@ -1,0 +1,84 @@
+=== IMAGE DIAG: 5.0.0 ===
+uid=2024248(jayden) gid=1000070(domain users) groups=1000070(domain users),1208826(compute),1254277(storage-home1-home-ro),1304231(storage-bga-gmsroot-ro),1304616(storage-bga-site-locks-rw),1304619(storage-bga-shared-ro),1313191(storage-ris-sas-ro),1358928(storage-engineering-licenses-ro),1358962(storage-engineering-bin-ro),1377617(compute-sibai),1377618(storage-sibai),5160381(compute2),5453544(storage-ris-services-ris-compute2-public-ro),7045317(compute2-sibai),7147214(storage3-bga-gmsroot-ro),7147226(storage3-bga-shared-ro),7147233(storage3-bga-site-locks-rw),7151590(storage1),7151591(storage2),7151592(storage3),7151593(storage),7151594(computeservice)
+--- ls / ---
+total 5
+drwxr-xr-x.    1 root   root          102 Jun 18 04:15 .
+drwxr-xr-x.    1 root   root          102 Jun 18 04:15 ..
+-rwxr-xr-x.    1 root   root            0 Jun 18 04:14 .dockerenv
+lrwxrwxrwx.    1 root   root            7 Sep 11  2024 bin -> usr/bin
+drwxr-xr-x.    2 root   root            6 Apr 18  2022 boot
+drwxr-xr-x.    7 root   root          580 Jun 18 04:15 dev
+drwxr-xr-x.    1 root   root           39 Jun 18 04:15 etc
+-rwxr-xr-x.    1 root   root          588 Feb 27  2025 eula.sh
+drwxr-xr-x.    1 root   root           20 Jun 18 04:15 home
+drwxr-xr-x.    1 root   root           28 Jul 31  2025 isaac-sim
+lrwxrwxrwx.    1 root   root            7 Sep 11  2024 lib -> usr/lib
+lrwxrwxrwx.    1 root   root            9 Sep 11  2024 lib32 -> usr/lib32
+lrwxrwxrwx.    1 root   root            9 Sep 11  2024 lib64 -> usr/lib64
+lrwxrwxrwx.    1 root   root           10 Sep 11  2024 libx32 -> usr/libx32
+drwxr-xr-x.    2 root   root            6 Sep 11  2024 media
+drwxr-xr-x.    2 root   root            6 Sep 11  2024 mnt
+drwxr-xr-x.    1 root   root           28 Jun 18 04:15 opt
+dr-xr-xr-x. 1058 root   root            0 Jun 18 04:15 proc
+drwxr-xr-x.    3 root   root           17 Jun 18 04:15 rdcw
+--- try /isaac-sim ---
+total 232
+drwxr-xr-x.   1 root root    28 Jul 31  2025 .
+drwxr-xr-x.   1 root root   102 Jun 18 04:15 ..
+drwxr-xr-x.   2 root root    64 Jul 31  2025 .vscode
+-rw-r--r--.   1 root root 49043 Jul 31  2025 LICENSE.txt
+  File: /isaac-sim
+  Size: 28        	Blocks: 0          IO Block: 4096   directory
+Device: 54h/84d	Inode: 440213556   Links: 1
+Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-06-18 04:14:36.106627288 +0000
+Modify: 2025-07-31 04:13:08.000000000 +0000
+Change: 2026-06-18 04:14:36.106627288 +0000
+ Birth: 2026-06-18 04:14:36.105627200 +0000
+--- try python.sh ---
+-rwxr-xr-x. 1 root root 1897 Jul 31  2025 /isaac-sim/python.sh
+ok
+=== END ===
+
+------------------------------------------------------------
+Sender: LSF System <lsfadmin@compute1-exec-197.ris.wustl.edu>
+Subject: Job 670450: </bin/bash /workspace/_diag_c1_image.sh 5.0.0> in cluster <compute1-lsf> Done
+
+Job </bin/bash /workspace/_diag_c1_image.sh 5.0.0> was submitted from host <compute1-client-1.ris.wustl.edu> by user <jayden> in cluster <compute1-lsf> at Wed Jun 17 23:09:22 2026
+Job was executed on host(s) <2*compute1-exec-197.ris.wustl.edu>, in queue <general-interactive>, as user <jayden> in cluster <compute1-lsf> at Wed Jun 17 23:09:24 2026
+</home/jayden> was used as the home directory.
+</rdcw/fs2/sibai/Active/ihab/research_new> was used as the working directory.
+Started at Wed Jun 17 23:09:24 2026
+Terminated at Wed Jun 17 23:15:10 2026
+Results reported at Wed Jun 17 23:15:10 2026
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+/bin/bash /workspace/_diag_c1_image.sh 5.0.0
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   53755736.00 sec.
+    Max Memory :                                 20171719 MB
+    Average Memory :                             2951911.75 MB
+    Total Requested Memory :                     16384.00 MB
+    Delta Memory :                               -20155336.00 MB
+    Max Swap :                                   -
+    Max Processes :                              5
+    Max Threads :                                21
+    Run time :                                   348 sec.
+    Turnaround time :                            348 sec.
+
+The output (if any) is above this job summary.
+
+
+
+PS:
+
+Read file </storage1/fs1/sibai/Active/ihab/research_new/dino_wm_jayden/IsaacLab/_diag_500.err> for stderr output of this job.
+

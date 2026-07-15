@@ -1,0 +1,57 @@
+=== HOST ===
+compute1-exec-197.ris.wustl.edu
+uid=2024248(jayden) gid=1000070(domain users) groups=1000070(domain users),1208826(compute),1254277(storage-home1-home-ro),1304231(storage-bga-gmsroot-ro),1304616(storage-bga-site-locks-rw),1304619(storage-bga-shared-ro),1313191(storage-ris-sas-ro),1358928(storage-engineering-licenses-ro),1358962(storage-engineering-bin-ro),1377617(compute-sibai),1377618(storage-sibai),5160381(compute2),5453544(storage-ris-services-ris-compute2-public-ro),7045317(compute2-sibai),7147214(storage3-bga-gmsroot-ro),7147226(storage3-bga-shared-ro),7147233(storage3-bga-site-locks-rw),7151590(storage1),7151591(storage2),7151592(storage3),7151593(storage),7151594(computeservice)
+=== /isaac-sim top ===
+ls: cannot open directory '/isaac-sim': Permission denied
+=== python.sh ===
+ls: cannot access '/isaac-sim/python.sh': Permission denied
+=== kit python dir ===
+ls: cannot access '/isaac-sim/kit/python/bin/': Permission denied
+=== passwd isaac-sim user ===
+=== try execute ===
+/workspace/_diag_c1_isaac.sh: line 17: /isaac-sim/python.sh: Permission denied
+/workspace/_diag_c1_isaac.sh: line 18: /isaac-sim/kit/python/bin/python3: Permission denied
+=== done ===
+
+------------------------------------------------------------
+Sender: LSF System <lsfadmin@compute1-exec-197.ris.wustl.edu>
+Subject: Job 670446: </bin/bash /workspace/_diag_c1_isaac.sh> in cluster <compute1-lsf> Done
+
+Job </bin/bash /workspace/_diag_c1_isaac.sh> was submitted from host <compute1-client-1.ris.wustl.edu> by user <jayden> in cluster <compute1-lsf> at Wed Jun 17 23:08:43 2026
+Job was executed on host(s) <2*compute1-exec-197.ris.wustl.edu>, in queue <general-interactive>, as user <jayden> in cluster <compute1-lsf> at Wed Jun 17 23:08:44 2026
+</home/jayden> was used as the home directory.
+</rdcw/fs2/sibai/Active/ihab/research_new> was used as the working directory.
+Started at Wed Jun 17 23:08:44 2026
+Terminated at Wed Jun 17 23:09:05 2026
+Results reported at Wed Jun 17 23:09:05 2026
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+/bin/bash /workspace/_diag_c1_isaac.sh
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   10.26 sec.
+    Max Memory :                                 15 MB
+    Average Memory :                             15.00 MB
+    Total Requested Memory :                     16384.00 MB
+    Delta Memory :                               16369.00 MB
+    Max Swap :                                   -
+    Max Processes :                              5
+    Max Threads :                                18
+    Run time :                                   26 sec.
+    Turnaround time :                            22 sec.
+
+The output (if any) is above this job summary.
+
+
+
+PS:
+
+Read file </storage1/fs1/sibai/Active/ihab/research_new/dino_wm_jayden/IsaacLab/_diag_c1_670446.err> for stderr output of this job.
+
