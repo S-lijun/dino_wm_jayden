@@ -12,6 +12,10 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
+# Matches DataCollection_test.py camera_fps / next_camera_time_s gating.
+DEFAULT_CAMERA_FPS = 15.0
+OBSES_15FPS_DIRNAME = "obses_15fps"
+
 parser = argparse.ArgumentParser(description="Collect humanoid G1 offline trajectories.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -27,6 +31,18 @@ parser.add_argument(
     + "/humanoid_g1",
 )
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument(
+    "--img_height",
+    type=int,
+    default=640,
+    help="Sensor height in pixels (portrait 640×480 before CCW rotation → landscape PNG).",
+)
+parser.add_argument(
+    "--img_width",
+    type=int,
+    default=480,
+    help="Sensor width in pixels.",
+)
 parser.add_argument(
     "--visual_mode",
     type=str,
@@ -51,6 +67,29 @@ parser.add_argument(
     default=0.5,
     help="Nominal planar speed (m/s) for waypoint tracking.",
 )
+parser.add_argument(
+    "--bin_x",
+    type=float,
+    default=2.0,
+    help="Blue bin world X position (m).",
+)
+parser.add_argument(
+    "--bin_y",
+    type=float,
+    default=0.0,
+    help="Blue bin world Y position (m).",
+)
+parser.add_argument(
+    "--camera_fps",
+    type=float,
+    default=DEFAULT_CAMERA_FPS,
+    help="Sim-time rate for obses_15fps/ subsampling (matches DataCollection_test camera_fps).",
+)
+parser.add_argument(
+    "--save_full_obses",
+    action="store_true",
+    help="Also save per-control-step obses/ (default: only obses_15fps/).",
+)
 args_cli, _ = parser.parse_known_args()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,19 +105,39 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper, VISUAL_SIZE
+from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 from env.isaac.waypoint_utils import WaypointNavController
+
+
+def subsample_frame_indices(num_frames: int, sim_dt: float, camera_fps: float) -> list[int]:
+    """Indices into a per-step frame list sampled on uniform sim-time (like DataCollection_test)."""
+    if num_frames <= 0:
+        return []
+    period_s = 1.0 / camera_fps
+    indices: list[int] = []
+    next_camera_time_s = 0.0
+    for step in range(num_frames):
+        sim_time_s = step * sim_dt
+        if sim_time_s + 1e-12 >= next_camera_time_s:
+            indices.append(step)
+            next_camera_time_s += period_s
+    return indices
 
 
 def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: int):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     obses_dir = output_path / "obses"
-    obses_dir.mkdir(exist_ok=True)
+    if args_cli.save_full_obses:
+        obses_dir.mkdir(exist_ok=True)
+    obses_15fps_dir = output_path / OBSES_15FPS_DIRNAME
+    if _visual_mode != "off":
+        obses_15fps_dir.mkdir(exist_ok=True)
 
     wrapper = IsaacG1Wrapper(
         args_cli,
         visual_mode=_visual_mode,
+        img_res=(args_cli.img_height, args_cli.img_width),
         stuck_contact_steps=args_cli.stuck_contact_steps,
         waypoint_stop_thresh=args_cli.waypoint_stop_thresh,
         max_speed=args_cli.max_speed,
@@ -105,7 +164,8 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         print(
             f"[EP {ep}] regions={reset_info.get('waypoint_region_names')} "
             f"waypoints={reset_info.get('waypoints')} "
-            f"active_obstacles={reset_info.get('active_obstacles')}"
+            f"blue_bin={reset_info.get('obstacle_positions', {}).get('blue_bin_0')} "
+            f"robot_xy={reset_info.get('robot_xy')}"
         )
 
         episode_actions = []
@@ -117,8 +177,6 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         for step in range(max_steps):
             obs = wrapper.get_raw_obs()
             episode_obs.append(torch.from_numpy(obs["visual"]))
-            episode_states.append(torch.from_numpy(wrapper.get_full_state()))
-            episode_costs.append(torch.tensor(wrapper.calculate_cost(), dtype=torch.float32))
 
             robot = wrapper.env.unwrapped.scene["robot"]
             base_pos = robot.data.root_pos_w[0].cpu().numpy()
@@ -126,6 +184,10 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
             cmd = nav.compute_command(base_pos, base_quat, wrapper.waypoint)
             episode_actions.append(torch.from_numpy(cmd))
             _, _, _, step_info = wrapper.apply_velocity_command(cmd)
+
+            # Post-step labels (matches DataCollection_test.py after env.step).
+            episode_states.append(torch.from_numpy(wrapper.get_full_state()))
+            episode_costs.append(torch.tensor(wrapper.calculate_cost(), dtype=torch.float32))
 
             if wrapper.advance_waypoint_if_reached():
                 end_reason = "all_waypoints"
@@ -149,7 +211,14 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         all_states.append(torch.stack(episode_states))
         all_costs.append(torch.stack(episode_costs))
         seq_lengths.append(len(episode_actions))
-        torch.save(torch.stack(episode_obs).cpu(), obses_dir / f"episode_{ep}.pth")
+        if args_cli.save_full_obses:
+            torch.save(torch.stack(episode_obs).cpu(), obses_dir / f"episode_{ep}.pth")
+        if _visual_mode != "off":
+            idx_15 = subsample_frame_indices(
+                len(episode_obs), wrapper.sim_dt, args_cli.camera_fps
+            )
+            obs_15 = torch.stack([episode_obs[i] for i in idx_15]).cpu()
+            torch.save(obs_15, obses_15fps_dir / f"episode_{ep}.pth")
 
         if (ep + 1) % 50 == 0:
             print(
@@ -181,12 +250,19 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
     torch.save(
         {
             "proprio_dim": wrapper.proprio_dim,
-            "visual_size": VISUAL_SIZE,
+            "visual_size": wrapper.visual_output_size,
+            "sensor_img_res": wrapper.img_res,
+            "control_fps": 1.0 / wrapper.sim_dt,
+            "visual_fps": args_cli.camera_fps,
+            "save_full_obses": args_cli.save_full_obses,
+            "obses_15fps_dir": OBSES_15FPS_DIRNAME,
             "action_dim": action_dim,
             "state_dim": state_dim,
             "stuck_contact_steps": args_cli.stuck_contact_steps,
             "waypoint_stop_thresh": args_cli.waypoint_stop_thresh,
             "max_speed": args_cli.max_speed,
+            "blue_bin_xy": (args_cli.bin_x, args_cli.bin_y),
+            "state_lidar_min_field": "lidar_min_range_nonzero_m",
             "end_reason_counts": {
                 "all_waypoints": n_finished_all_waypoints,
                 "stuck": n_stuck,

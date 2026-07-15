@@ -160,7 +160,8 @@ def load_lab_scene_usd(
 
 def rotate_sensor_ccw_to_landscape(img: np.ndarray) -> np.ndarray:
     """Portrait sensor frame → CCW 90° → 640×480 landscape (matches DataCollection_loop)."""
-    return np.rot90(img, k=1)
+    # rot90 returns a view with negative strides; copy so torch.from_numpy / imageio are safe.
+    return np.ascontiguousarray(np.rot90(img, k=1))
 
 
 def ensure_landscape_rgb(rgb: np.ndarray, img_res: tuple[int, int] | None = None) -> np.ndarray:

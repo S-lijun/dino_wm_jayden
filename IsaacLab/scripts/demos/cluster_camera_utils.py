@@ -46,9 +46,11 @@ def configure_headless_cameras(args_cli, *, verbose: bool = True) -> None:
 
     if getattr(args_cli, "headless", False) and not getattr(args_cli, "rendering_mode", None):
         args_cli.rendering_mode = "performance"
+        #args_cli.rendering_mode = None
 
     use_hpc_gs = getattr(args_cli, "hpc_gs_rgb", True)
     extra = HPC_GS_RGB_KIT_ARGS if use_hpc_gs else DEFAULT_HEADLESS_CAMERA_KIT_ARGS
+    
     existing = getattr(args_cli, "kit_args", "") or ""
     args_cli.kit_args = (existing + " " + extra).strip()
 

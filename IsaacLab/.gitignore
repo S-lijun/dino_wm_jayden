@@ -4,6 +4,10 @@
 **/*.so
 **/*.log*
 
+# data
+data/*
+!data/.gitkeep
+
 # Omniverse
 **/*.dmp
 **/.thumbs
