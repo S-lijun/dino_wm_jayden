@@ -62,6 +62,9 @@ torch_device = getattr(args_cli, "device", "cuda:0")
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Prefer repo root after AppLauncher mutates sys.path (Isaac cv2/utils shadowing).
+sys.path.insert(0, REPO_ROOT)
+
 # ---------------------------------------------------------------------
 # Imports after AppLauncher
 # ---------------------------------------------------------------------
@@ -81,7 +84,7 @@ from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import Actor, Critic
 from PyHJ.policy import avoid_DDPGPolicy_annealing
 
-from plan import load_model
+from wm_load import load_model  # not plan.py — avoids env.venv / utils collision
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 
 
@@ -187,8 +190,13 @@ def main():
             latent_h=args.latent_h,
         )
 
-    train_envs = DummyVectorEnv([make_env for _ in range(args.training_num)])
-    test_envs = DummyVectorEnv([make_env for _ in range(args.test_num)])
+    # Isaac Sim allows only one SimulationContext per process. Do not create a
+    # second DummyVectorEnv for "test" — offpolicy_trainer already uses
+    # test_collector=None below.
+    if args.training_num != 1:
+        print(f"[WARN] Forcing training_num=1 (was {args.training_num})")
+        args.training_num = 1
+    train_envs = DummyVectorEnv([make_env])
 
     state_space = train_envs.observation_space[0]
     action_space = train_envs.action_space[0]

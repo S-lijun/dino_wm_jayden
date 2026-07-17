@@ -48,11 +48,14 @@ torch_device = getattr(args_cli, "device", "cuda:0")
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+# Prefer repo root after AppLauncher mutates sys.path (Isaac cv2/utils shadowing).
+sys.path.insert(0, REPO_ROOT)
+
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from plan import load_model
+from wm_load import load_model  # not plan.py — avoids env.venv / utils collision
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 
 

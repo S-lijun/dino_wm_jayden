@@ -34,10 +34,9 @@ class LatentHumanoidEnv(gym.Env):
         self.wm = wm
         self.wm.eval()
 
-        self.wrapper = IsaacG1Wrapper(
-            args_cli,
-            enable_cameras=getattr(args_cli, "enable_cameras", True),
-        )
+        # enable_cameras is handled by AppLauncher / visual_mode on args_cli,
+        # not as an IsaacG1Wrapper kwarg.
+        self.wrapper = IsaacG1Wrapper(args_cli)
 
         if latent_h:
             raise NotImplementedError("FailureClassifier latent_h is not wired for Isaac G1 yet.")

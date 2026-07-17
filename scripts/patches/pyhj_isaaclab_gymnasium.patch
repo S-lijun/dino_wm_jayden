@@ -1,0 +1,47 @@
+diff --git a/PyHJ/__init__.py b/PyHJ/__init__.py
+index a2a6c6a..44d3d9b 100644
+--- a/PyHJ/__init__.py
++++ b/PyHJ/__init__.py
+@@ -1,4 +1,18 @@
+-from PyHJ import data, env, exploration, policy, trainer, utils, reach_rl_gym_envs
++from PyHJ import data, env, exploration, policy, trainer, utils
++
++# Built-in reachability gym envs are optional. Importing them under Isaac Lab
++# (gymnasium 1.x) used to fail; humanoid HJ uses LatentHumanoidEnv instead.
++try:
++    from PyHJ import reach_rl_gym_envs  # noqa: F401
++except Exception as _reach_env_exc:  # pragma: no cover
++    reach_rl_gym_envs = None  # type: ignore
++    import warnings
++
++    warnings.warn(
++        f"PyHJ.reach_rl_gym_envs unavailable ({_reach_env_exc!r}); "
++        "OK if you train with a custom env (e.g. LatentHumanoidEnv).",
++        stacklevel=1,
++    )
+ 
+ __version__ = "0.0.1" # we adapt this repo from Tianshou version 0.5.1
+ 
+diff --git a/PyHJ/reach_rl_gym_envs/__init__.py b/PyHJ/reach_rl_gym_envs/__init__.py
+index be9fe26..2798247 100644
+--- a/PyHJ/reach_rl_gym_envs/__init__.py
++++ b/PyHJ/reach_rl_gym_envs/__init__.py
+@@ -1,14 +1,9 @@
+-"""Registers the internal gym envs then loads the env plugins for module using the entry point."""
+-from typing import Any
++"""Registers the internal gym envs (optional for Isaac / LatentHumanoid training).
+ 
+-from gymnasium.envs.registration import (
+-    load_plugin_envs,
+-    make,
+-    pprint_registry,
+-    register,
+-    registry,
+-    spec,
+-)
++``load_plugin_envs`` existed in older gymnasium (0.28/0.29) but was removed in
++1.x (Isaac Lab pins gymnasium==1.2.0). It was unused here anyway.
++"""
++from gymnasium.envs.registration import register
+ 
+ 

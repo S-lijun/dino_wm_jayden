@@ -12,7 +12,16 @@ from multiprocessing import Array, Pipe, connection
 from multiprocessing.context import Process
 from typing import Any, Callable, List, Optional, Tuple, Union
 
-from utils import aggregate_dct
+# Under Isaac Sim, bare ``import utils`` resolves to OpenCV's cv2/utils.
+import importlib.util
+from pathlib import Path as _Path
+
+_utils_path = _Path(__file__).resolve().parents[1] / "utils.py"
+_utils_spec = importlib.util.spec_from_file_location("dino_wm_utils", _utils_path)
+_utils_mod = importlib.util.module_from_spec(_utils_spec)
+assert _utils_spec.loader is not None
+_utils_spec.loader.exec_module(_utils_mod)
+aggregate_dct = _utils_mod.aggregate_dct
 
 gym_old_venv_step_type = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 gym_new_venv_step_type = Tuple[
