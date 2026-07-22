@@ -49,6 +49,16 @@ parser.add_argument(
     default="depth_rgb",
     choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb"],
 )
+parser.add_argument(
+    "--resume_policy",
+    type=str,
+    default=None,
+    help=(
+        "Path to a saved .../epoch_id_N/policy.pth. "
+        "Loads weights and continues training from epoch N+1 up to --total-episodes "
+        "(from YAML / CLI, e.g. 120)."
+    ),
+)
 # --device is already registered by AppLauncher.add_app_launcher_args()
 
 args_cli, remaining = parser.parse_known_args()
@@ -123,6 +133,30 @@ def get_args_and_merge_config():
         setattr(args, key.replace("-", "_"), val)
 
     return args
+
+
+def _parse_resume_epoch_from_path(policy_path: str | Path) -> int:
+    """Infer N from '.../epoch_id_N/policy.pth'."""
+    import re
+
+    for part in Path(policy_path).resolve().parts[::-1]:
+        m = re.fullmatch(r"epoch_id_(\d+)", part)
+        if m:
+            return int(m.group(1))
+    raise ValueError(
+        f"Cannot parse epoch from --resume_policy path (expected .../epoch_id_N/policy.pth): "
+        f"{policy_path}"
+    )
+
+
+def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
+    """Load a previously saved policy.state_dict() into ``policy``."""
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(f"--resume_policy not found: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    policy.load_state_dict(state, strict=True)
+    print(f"[INFO] Resumed policy from {ckpt_path}")
 
 
 def main():
@@ -245,6 +279,25 @@ def main():
         actor_gradient_steps=args.actor_gradient_steps,
     )
 
+    # Warm-start from a previous safety-filter checkpoint (actor+critic+targets).
+    # Continues until args.total_episodes (same target as a fresh run, e.g. 120).
+    resume_epoch = 0
+    if args.resume_policy:
+        load_policy_checkpoint(policy, args.resume_policy, args.device)
+        resume_epoch = _parse_resume_epoch_from_path(args.resume_policy)
+        if resume_epoch >= args.total_episodes:
+            raise ValueError(
+                f"resume epoch {resume_epoch} already >= total-episodes "
+                f"{args.total_episodes}; nothing to train."
+            )
+        print(
+            f"[INFO] Resumed at epoch {resume_epoch}; "
+            f"continuing through epoch {args.total_episodes}"
+        )
+
+    start_epoch = resume_epoch + 1
+    end_epoch = args.total_episodes
+
     orig_learn = policy.learn
     policy.last_actor_loss = 0.0
     policy.last_critic_loss = 0.0
@@ -267,13 +320,21 @@ def main():
 
     buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
     train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
+    # Replay buffer is not restored; collect a fresh warm-up even when resuming weights.
     print("[INFO] Collecting initial transitions...")
     train_collector.collect(1000)
     print("[INFO] Initial collection done.")
 
     log_path = Path(f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}")
-    for epoch in range(1, args.total_episodes + 1):
-        print(f"\n=== Epoch {epoch}/{args.total_episodes} ===")
+    if args.resume_policy:
+        log_path = Path(
+            f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+        )
+    print(
+        f"[INFO] Training epochs {start_epoch}..{end_epoch}; ckpts -> {log_path}"
+    )
+    for epoch in range(start_epoch, end_epoch + 1):
+        print(f"\n=== Epoch {epoch}/{end_epoch} ===")
         stats = offpolicy_trainer(
             policy=policy,
             train_collector=train_collector,
