@@ -8,12 +8,15 @@ import gymnasium as gym
 import numpy as np
 import torch
 from gymnasium.spaces import Box
+from PIL import Image
 
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
 DEFAULT_VISUAL_FPS = 15.0
 DEFAULT_MAX_EPISODE_SIM_STEPS = 3000
+DEFAULT_WANDB_VIDEO_EVERY = 5
+DEFAULT_WANDB_VIDEO_SIZE = (120, 160)  # (H, W) for uploaded rollouts
 
 
 class LatentHumanoidEnv(gym.Env):
@@ -53,6 +56,8 @@ class LatentHumanoidEnv(gym.Env):
         latent_h: bool = False,
         max_episode_steps: int = DEFAULT_MAX_EPISODE_SIM_STEPS,
         visual_fps: float = DEFAULT_VISUAL_FPS,
+        wandb_video_every: int | None = None,
+        wandb_video_size: tuple[int, int] = DEFAULT_WANDB_VIDEO_SIZE,
     ):
         super().__init__()
         self.args = args
@@ -66,6 +71,17 @@ class LatentHumanoidEnv(gym.Env):
         )
         self.visual_fps = float(getattr(args, "visual_fps", visual_fps))
         self.visual_period_s = 1.0 / self.visual_fps
+
+        if wandb_video_every is None:
+            wandb_video_every = int(
+                getattr(args, "wandb_video_every", DEFAULT_WANDB_VIDEO_EVERY)
+            )
+        # 0 / negative disables rollout video uploads.
+        self.wandb_video_every = int(wandb_video_every)
+        self.wandb_video_size = tuple(wandb_video_size)
+        self._finished_episodes = 0
+        self._record_this_episode = False
+        self._episode_frames: list[np.ndarray] = []
 
         self._episode_sim_step = 0
         self._episode_visual_step = 0
@@ -81,6 +97,9 @@ class LatentHumanoidEnv(gym.Env):
 
         reset_info = self.wrapper.reset_scene(seed=getattr(args, "seed", None))
         self._reset_timers()
+        # Constructor warm-up reset is not a training episode; do not record.
+        self._record_this_episode = False
+        self._episode_frames = []
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)
         approx_substeps = max(1, int(round(self.visual_period_s / self.sim_dt)))
@@ -88,7 +107,8 @@ class LatentHumanoidEnv(gym.Env):
             f"[LatentHumanoidEnv] latent shape: {z.shape}, "
             f"sim_dt={self.sim_dt:.6f} (~{1.0 / self.sim_dt:.1f} Hz), "
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
-            f"max_episode_sim_steps={self.max_episode_sim_steps}, reset: {reset_info}"
+            f"max_episode_sim_steps={self.max_episode_sim_steps}, "
+            f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
 
         self.observation_space = Box(
@@ -114,10 +134,89 @@ class LatentHumanoidEnv(gym.Env):
             "stuck": np.float32(1.0 if stuck else 0.0),
         }
 
+    def _visual_to_uint8_hwc(self, visual: Any) -> np.ndarray:
+        """Normalize wrapper visual to uint8 (H, W, 3)."""
+        if isinstance(visual, torch.Tensor):
+            arr = visual.detach().cpu().numpy()
+        else:
+            arr = np.asarray(visual)
+        if arr.ndim != 3:
+            raise ValueError(f"Expected HxWxC visual, got shape {arr.shape}")
+        if arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.max() <= 1.0:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        else:
+            arr = arr.astype(np.uint8)
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        return arr[..., :3]
+
+    def _resize_frame_chw(self, visual: Any) -> np.ndarray:
+        """Return downscaled uint8 frame as (C, H, W) for wandb.Video."""
+        hwc = self._visual_to_uint8_hwc(visual)
+        th, tw = self.wandb_video_size
+        img = Image.fromarray(hwc)
+        img = img.resize((tw, th), Image.BILINEAR)
+        return np.transpose(np.asarray(img, dtype=np.uint8), (2, 0, 1))
+
+    def _start_episode_recording(self) -> None:
+        self._episode_frames = []
+        if self.wandb_video_every <= 0:
+            self._record_this_episode = False
+            return
+        # Record episodes 10, 20, 30, ... (1-based index after previous finishes).
+        next_ep = self._finished_episodes + 1
+        self._record_this_episode = (next_ep % self.wandb_video_every) == 0
+
+    def _append_frame(self, obs: dict[str, Any]) -> None:
+        if not self._record_this_episode:
+            return
+        try:
+            self._episode_frames.append(self._resize_frame_chw(obs["visual"]))
+        except Exception as exc:  # noqa: BLE001 — never break training for logging
+            print(f"[WARN] wandb frame append failed: {exc}")
+
+    def _log_episode_video(self, end_reason: str | None) -> None:
+        if not self._record_this_episode or not self._episode_frames:
+            return
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+            frames = np.stack(self._episode_frames, axis=0)  # (T, C, H, W)
+            ep_id = self._finished_episodes
+            wandb.log(
+                {
+                    "rollout/video": wandb.Video(
+                        frames,
+                        fps=max(1, int(round(self.visual_fps))),
+                        format="gif",
+                    ),
+                    "rollout/episode": ep_id,
+                    "rollout/end_reason": self._END_REASON_CODE.get(end_reason, 0),
+                    "rollout/visual_steps": self._episode_visual_step,
+                }
+            )
+            print(
+                f"[LatentHumanoidEnv] uploaded wandb video for episode {ep_id} "
+                f"({len(self._episode_frames)} frames, reason={end_reason})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] wandb video upload failed: {exc}")
+        finally:
+            self._episode_frames = []
+            self._record_this_episode = False
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         reset_info = self.wrapper.reset_scene(seed=seed)
         self._reset_timers()
+        self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
+        self._append_frame(obs)
         z = self.encode(obs)
         if reset_info is not None:
             print(
@@ -160,6 +259,7 @@ class LatentHumanoidEnv(gym.Env):
 
         self._episode_visual_step += 1
         obs = self.wrapper.get_raw_obs()
+        self._append_frame(obs)
         z_next = self.encode(obs)
 
         terminated = False
@@ -170,6 +270,8 @@ class LatentHumanoidEnv(gym.Env):
                 f"visual_steps={self._episode_visual_step} "
                 f"sim_steps={self._episode_sim_step}"
             )
+            self._finished_episodes += 1
+            self._log_episode_video(end_reason)
         return z_next, h_s, terminated, truncated, self._pyhj_info(end_reason, stuck)
 
     def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:

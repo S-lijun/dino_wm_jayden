@@ -59,6 +59,12 @@ parser.add_argument(
         "(from YAML / CLI, e.g. 120)."
     ),
 )
+parser.add_argument(
+    "--wandb_video_every",
+    type=int,
+    default=5,
+    help="Upload a rollout video to wandb every N finished episodes (0 disables).",
+)
 # --device is already registered by AppLauncher.add_app_launcher_args()
 
 args_cli, remaining = parser.parse_known_args()
@@ -222,6 +228,7 @@ def main():
             args_cli,
             with_proprio=args.with_proprio,
             latent_h=args.latent_h,
+            wandb_video_every=args.wandb_video_every,
         )
 
     # Isaac Sim allows only one SimulationContext per process. Do not create a
