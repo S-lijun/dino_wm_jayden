@@ -501,7 +501,14 @@ class IsaacG1Wrapper:
         return is_collision
 
     def get_safety_diagnostics(self) -> dict[str, float]:
-        """Return LiDAR + contact fields for validation logging."""
+        """Return LiDAR + contact fields for validation logging.
+
+        ``h_s`` continuous PyHJ avoid cost (<0 unsafe, >0 safe):
+        1) base: ``lidar_min_distance - lidar_distance_threshold``
+           (no valid hit → +1.0 safe)
+        2) if contact force on a monitored link exceeds threshold, treat as
+           at least as bad as distance 0: ``h_s = min(h_s, -threshold)``.
+        """
         self._update_lidar_stats()
         contact = self.get_contact_collision()
         lidar_dist = self._last_lidar_stats.get("lidar_min_distance", float("nan"))
@@ -509,17 +516,24 @@ class IsaacG1Wrapper:
         lidar_unsafe = float(
             np.isfinite(lidar_dist) and lidar_dist < self.lidar_distance_threshold
         )
-        h_s = 1.0 if (contact > 0.5 or lidar_unsafe > 0.5) else 0.0
+        if np.isfinite(lidar_dist):
+            h_s = float(lidar_dist - self.lidar_distance_threshold)
+        else:
+            # No valid hit: treat as safely far (do not poison training with NaN).
+            h_s = 1.0
+        if contact > 0.5:
+            # Contact ≡ dist 0 on the same margin scale.
+            h_s = min(h_s, -float(self.lidar_distance_threshold))
         return {
             "lidar_min_distance": float(lidar_dist),
             "lidar_min_distance_xy": float(lidar_xy),
             "contact_collision": float(contact),
             "lidar_unsafe": lidar_unsafe,
-            "h_s": h_s,
+            "h_s": float(h_s),
         }
 
     def calculate_cost(self) -> float:
-        """Safety cost: 1.0 if contact collision or LiDAR too close, else 0.0."""
+        """Continuous safety cost: LiDAR margin + contact floor (<0 unsafe)."""
         return float(self.get_safety_diagnostics()["h_s"])
 
 
@@ -581,8 +595,9 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        vx = float(np.clip(action[0], -self.max_speed, self.max_speed))
-        vy = float(np.clip(action[1], -self.max_speed, self.max_speed))
+        # HJ / env action: vx in [0, 0.8]; vy in [-0.8, 0.8]; yaw_rate in [-1, 1]
+        vx = float(np.clip(action[0], 0.0, 0.8))
+        vy = float(np.clip(action[1], -0.8, 0.8))
         yaw_rate = float(np.clip(action[2], -1.0, 1.0))
 
         self.commands[0, 0] = vx

@@ -62,7 +62,7 @@ parser.add_argument(
 parser.add_argument(
     "--wandb_video_every",
     type=int,
-    default=5,
+    default=1,
     help="Upload a rollout video to wandb every N finished episodes (0 disables).",
 )
 # --device is already registered by AppLauncher.add_app_launcher_args()

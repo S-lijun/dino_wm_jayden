@@ -14,8 +14,8 @@ from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
 DEFAULT_VISUAL_FPS = 15.0
-DEFAULT_MAX_EPISODE_SIM_STEPS = 3000
-DEFAULT_WANDB_VIDEO_EVERY = 5
+DEFAULT_MAX_EPISODE_SIM_STEPS = 1500
+DEFAULT_WANDB_VIDEO_EVERY = 1
 DEFAULT_WANDB_VIDEO_SIZE = (120, 160)  # (H, W) for uploaded rollouts
 
 
@@ -30,9 +30,10 @@ class LatentHumanoidEnv(gym.Env):
     Episode ends (not based on safety cost ``h_s``):
     - all waypoints reached
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
-    - sim-step count hits ``max_episode_steps`` (default 3000 control steps)
+    - sim-step count hits ``max_episode_steps`` (default 1500 control steps)
 
-    Collision / LiDAR ``h_s`` is the step cost but does **not** end the episode.
+    Continuous safety cost ``h_s`` (LiDAR margin + contact floor; <0 unsafe)
+    does **not** end the episode.
     """
 
     metadata = {"render_modes": []}
@@ -114,9 +115,10 @@ class LatentHumanoidEnv(gym.Env):
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
         )
+        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.8, 0.8], yaw in [-1, 1]
         self.action_space = Box(
-            low=np.array([-0.5, -0.5, -1.0], dtype=np.float32),
-            high=np.array([0.5, 0.5, 1.0], dtype=np.float32),
+            low=np.array([0.0, -0.8, -1.0], dtype=np.float32),
+            high=np.array([0.8, 0.8, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -167,7 +169,7 @@ class LatentHumanoidEnv(gym.Env):
         if self.wandb_video_every <= 0:
             self._record_this_episode = False
             return
-        # Record episodes 10, 20, 30, ... (1-based index after previous finishes).
+        # Record every N-th finished episode (1-based); default N=1 → every episode.
         next_ep = self._finished_episodes + 1
         self._record_this_episode = (next_ep % self.wandb_video_every) == 0
 
@@ -227,7 +229,8 @@ class LatentHumanoidEnv(gym.Env):
 
     def step(self, action):
         """Hold ``action`` across sim substeps until the next 15 fps visual sample."""
-        h_s = 0.0
+        # Continuous margin: smaller = more dangerous → aggregate with min.
+        h_s = float("inf")
         stuck = False
         end_reason = None
         step_info: dict[str, Any] = {}
@@ -240,7 +243,7 @@ class LatentHumanoidEnv(gym.Env):
             self._episode_sim_step += 1
             sim_time_s = self._episode_sim_step * self.sim_dt
 
-            h_s = max(h_s, float(self.wrapper.calculate_cost()))
+            h_s = min(h_s, float(self.wrapper.calculate_cost()))
             stuck = stuck or bool(step_info.get("stuck", False))
 
             if self.wrapper.advance_waypoint_if_reached():
