@@ -503,11 +503,10 @@ class IsaacG1Wrapper:
     def get_safety_diagnostics(self) -> dict[str, float]:
         """Return LiDAR + contact fields for validation logging.
 
-        ``h_s`` continuous PyHJ avoid cost (<0 unsafe, >0 safe):
-        1) base: ``lidar_min_distance - lidar_distance_threshold``
-           (no valid hit → +1.0 safe)
-        2) if contact force on a monitored link exceeds threshold, treat as
-           at least as bad as distance 0: ``h_s = min(h_s, -threshold)``.
+        ``h_s`` is the continuous PyHJ avoid cost:
+        ``lidar_min_distance - lidar_distance_threshold`` (<0 unsafe, >0 safe).
+        If no valid LiDAR hit, treat as far/safe (large positive).
+        Contact is logged but does not enter ``h_s``.
         """
         self._update_lidar_stats()
         contact = self.get_contact_collision()
@@ -521,19 +520,16 @@ class IsaacG1Wrapper:
         else:
             # No valid hit: treat as safely far (do not poison training with NaN).
             h_s = 1.0
-        if contact > 0.5:
-            # Contact ≡ dist 0 on the same margin scale.
-            h_s = min(h_s, -float(self.lidar_distance_threshold))
         return {
             "lidar_min_distance": float(lidar_dist),
             "lidar_min_distance_xy": float(lidar_xy),
             "contact_collision": float(contact),
             "lidar_unsafe": lidar_unsafe,
-            "h_s": float(h_s),
+            "h_s": h_s,
         }
 
     def calculate_cost(self) -> float:
-        """Continuous safety cost: LiDAR margin + contact floor (<0 unsafe)."""
+        """Continuous safety cost: dist - threshold (<0 unsafe, >0 safe)."""
         return float(self.get_safety_diagnostics()["h_s"])
 
 
@@ -595,9 +591,9 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        # HJ / env action: vx in [0, 0.8]; vy in [-0.8, 0.8]; yaw_rate in [-1, 1]
+        # HJ / env action: vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw_rate in [-1, 1]
         vx = float(np.clip(action[0], 0.0, 0.8))
-        vy = float(np.clip(action[1], -0.8, 0.8))
+        vy = float(np.clip(action[1], -0.5, 0.5))
         yaw_rate = float(np.clip(action[2], -1.0, 1.0))
 
         self.commands[0, 0] = vx

@@ -32,8 +32,8 @@ class LatentHumanoidEnv(gym.Env):
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
     - sim-step count hits ``max_episode_steps`` (default 1500 control steps)
 
-    Continuous safety cost ``h_s`` (LiDAR margin + contact floor; <0 unsafe)
-    does **not** end the episode.
+    Continuous LiDAR margin ``h_s = lidar_min_distance - 0.3`` is the step
+    cost (<0 unsafe, >0 safe) but does **not** end the episode.
     """
 
     metadata = {"render_modes": []}
@@ -115,10 +115,10 @@ class LatentHumanoidEnv(gym.Env):
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
         )
-        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.8, 0.8], yaw in [-1, 1]
+        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-1, 1]
         self.action_space = Box(
-            low=np.array([0.0, -0.8, -1.0], dtype=np.float32),
-            high=np.array([0.8, 0.8, 1.0], dtype=np.float32),
+            low=np.array([0.0, -0.5, -1.0], dtype=np.float32),
+            high=np.array([0.8, 0.5, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
