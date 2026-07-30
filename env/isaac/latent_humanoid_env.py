@@ -83,6 +83,10 @@ class LatentHumanoidEnv(gym.Env):
         self._finished_episodes = 0
         self._record_this_episode = False
         self._episode_frames: list[np.ndarray] = []
+        # Set by trainer via DummyVectorEnv.set_env_attr after policy is built.
+        self.policy_for_log = None
+        # Shared dict with trainer: {"env_step": int, "update": int}
+        self.log_state = None
 
         self._episode_sim_step = 0
         self._episode_visual_step = 0
@@ -115,10 +119,10 @@ class LatentHumanoidEnv(gym.Env):
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
         )
-        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-1, 1]
+        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-0.5, 0.5]
         self.action_space = Box(
-            low=np.array([0.0, -0.5, -1.0], dtype=np.float32),
-            high=np.array([0.8, 0.5, 1.0], dtype=np.float32),
+            low=np.array([0.0, -0.5, -0.5], dtype=np.float32),
+            high=np.array([0.8, 0.5, 0.5], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -156,28 +160,116 @@ class LatentHumanoidEnv(gym.Env):
             arr = np.repeat(arr, 3, axis=-1)
         return arr[..., :3]
 
-    def _resize_frame_chw(self, visual: Any) -> np.ndarray:
+    def _hj_value(self, z: np.ndarray) -> float | None:
+        """Q(z, π(z)) from the current actor/critic (deterministic, no noise)."""
+        policy = self.policy_for_log
+        if policy is None:
+            return None
+        try:
+            with torch.no_grad():
+                z_t = torch.as_tensor(z, dtype=torch.float32, device=self.device)
+                if z_t.ndim == 1:
+                    z_t = z_t.unsqueeze(0)
+                act, _ = policy.actor(z_t)
+                q = policy.critic(z_t, act)
+                return float(q.reshape(-1)[0].item())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] HJ value compute failed: {exc}")
+            return None
+
+    def _log_rollout_metrics(
+        self,
+        l_val: float,
+        hj_val: float | None,
+        *,
+        bump_env_step: bool = True,
+    ) -> None:
+        """One wandb.log per env transition; x-axis is trainer/env_step."""
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+            if self.log_state is None:
+                self.log_state = {"env_step": 0, "update": 0}
+            if bump_env_step:
+                self.log_state["env_step"] = int(self.log_state.get("env_step", 0)) + 1
+            step = int(self.log_state["env_step"])
+            payload: dict[str, float] = {
+                "trainer/env_step": float(step),
+                "safety/l": float(l_val),
+            }
+            if hj_val is not None and np.isfinite(hj_val):
+                payload["safety/hj"] = float(hj_val)
+            # Deterministic actor cmd stashed by exploration_noise wrapper (pre-noise).
+            policy = self.policy_for_log
+            act = getattr(policy, "last_clean_act_env", None) if policy is not None else None
+            if act is not None:
+                act = np.asarray(act, dtype=np.float64).reshape(-1)
+                if act.size >= 3:
+                    payload["actor_action/vx"] = float(act[0])
+                    payload["actor_action/vy"] = float(act[1])
+                    payload["actor_action/theta"] = float(act[2])
+            wandb.log(payload)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] rollout metric wandb log failed: {exc}")
+
+    def _overlay_metrics_hwc(
+        self, hwc: np.ndarray, hj_val: float | None, l_val: float | None
+    ) -> np.ndarray:
+        """Burn HJ / l text into an HxWxC uint8 frame (no opaque background)."""
+        from PIL import ImageDraw
+
+        img = Image.fromarray(hwc)
+        draw = ImageDraw.Draw(img)
+        lines = []
+        if hj_val is not None and np.isfinite(hj_val):
+            lines.append(f"HJ {hj_val:.2f}")
+        if l_val is not None and np.isfinite(l_val):
+            lines.append(f"l {l_val:.2f}")
+        if not lines:
+            return hwc
+        y = 2
+        for line in lines:
+            # Thin dark outline for readability; leave pixels behind visible.
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                draw.text((2 + dx, y + dy), line, fill=(0, 0, 0))
+            draw.text((2, y), line, fill=(255, 60, 60))
+            y += 12
+        return np.asarray(img, dtype=np.uint8)
+
+    def _resize_frame_chw(
+        self,
+        visual: Any,
+        hj_val: float | None = None,
+        l_val: float | None = None,
+    ) -> np.ndarray:
         """Return downscaled uint8 frame as (C, H, W) for wandb.Video."""
         hwc = self._visual_to_uint8_hwc(visual)
         th, tw = self.wandb_video_size
         img = Image.fromarray(hwc)
         img = img.resize((tw, th), Image.BILINEAR)
-        return np.transpose(np.asarray(img, dtype=np.uint8), (2, 0, 1))
+        hwc_small = np.asarray(img, dtype=np.uint8)
+        hwc_small = self._overlay_metrics_hwc(hwc_small, hj_val, l_val)
+        return np.transpose(hwc_small, (2, 0, 1))
 
     def _start_episode_recording(self) -> None:
         self._episode_frames = []
-        if self.wandb_video_every <= 0:
-            self._record_this_episode = False
-            return
-        # Record every N-th finished episode (1-based); default N=1 → every episode.
-        next_ep = self._finished_episodes + 1
-        self._record_this_episode = (next_ep % self.wandb_video_every) == 0
+        # Always record when video logging is enabled (every episode).
+        self._record_this_episode = self.wandb_video_every > 0
 
-    def _append_frame(self, obs: dict[str, Any]) -> None:
+    def _append_frame(
+        self,
+        obs: dict[str, Any],
+        hj_val: float | None = None,
+        l_val: float | None = None,
+    ) -> None:
         if not self._record_this_episode:
             return
         try:
-            self._episode_frames.append(self._resize_frame_chw(obs["visual"]))
+            self._episode_frames.append(
+                self._resize_frame_chw(obs["visual"], hj_val=hj_val, l_val=l_val)
+            )
         except Exception as exc:  # noqa: BLE001 — never break training for logging
             print(f"[WARN] wandb frame append failed: {exc}")
 
@@ -191,18 +283,19 @@ class LatentHumanoidEnv(gym.Env):
                 return
             frames = np.stack(self._episode_frames, axis=0)  # (T, C, H, W)
             ep_id = self._finished_episodes
-            wandb.log(
-                {
-                    "rollout/video": wandb.Video(
-                        frames,
-                        fps=max(1, int(round(self.visual_fps))),
-                        format="gif",
-                    ),
-                    "rollout/episode": ep_id,
-                    "rollout/end_reason": self._END_REASON_CODE.get(end_reason, 0),
-                    "rollout/visual_steps": self._episode_visual_step,
-                }
-            )
+            payload = {
+                "rollout/video": wandb.Video(
+                    frames,
+                    fps=max(1, int(round(self.visual_fps))),
+                    format="gif",
+                ),
+                "rollout/episode": ep_id,
+                "rollout/end_reason": self._END_REASON_CODE.get(end_reason, 0),
+                "rollout/visual_steps": self._episode_visual_step,
+            }
+            if self.log_state is not None:
+                payload["trainer/env_step"] = float(self.log_state.get("env_step", 0))
+            wandb.log(payload)
             print(
                 f"[LatentHumanoidEnv] uploaded wandb video for episode {ep_id} "
                 f"({len(self._episode_frames)} frames, reason={end_reason})"
@@ -218,8 +311,12 @@ class LatentHumanoidEnv(gym.Env):
         self._reset_timers()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
-        self._append_frame(obs)
         z = self.encode(obs)
+        l_val = float(self.wrapper.calculate_cost())
+        hj_val = self._hj_value(z)
+        # Reset frame: same env_step index, do not bump (no transition yet).
+        self._log_rollout_metrics(l_val, hj_val, bump_env_step=False)
+        self._append_frame(obs, hj_val=hj_val, l_val=l_val)
         if reset_info is not None:
             print(
                 f"[LatentHumanoidEnv] reset robot_xy={reset_info.get('robot_xy')} "
@@ -262,8 +359,10 @@ class LatentHumanoidEnv(gym.Env):
 
         self._episode_visual_step += 1
         obs = self.wrapper.get_raw_obs()
-        self._append_frame(obs)
         z_next = self.encode(obs)
+        hj_val = self._hj_value(z_next)
+        self._log_rollout_metrics(h_s, hj_val, bump_env_step=True)
+        self._append_frame(obs, hj_val=hj_val, l_val=h_s)
 
         terminated = False
         truncated = end_reason is not None

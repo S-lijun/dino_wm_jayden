@@ -591,10 +591,10 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        # HJ / env action: vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw_rate in [-1, 1]
+        # HJ / env action: vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw_rate in [-0.5, 0.5]
         vx = float(np.clip(action[0], 0.0, 0.8))
         vy = float(np.clip(action[1], -0.5, 0.5))
-        yaw_rate = float(np.clip(action[2], -1.0, 1.0))
+        yaw_rate = float(np.clip(action[2], -0.5, 0.5))
 
         self.commands[0, 0] = vx
         self.commands[0, 1] = vy

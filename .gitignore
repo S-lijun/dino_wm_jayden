@@ -31,3 +31,6 @@ checkpoints/
 *.npy
 *.npz
 *.pkl
+# Large local data / checkpoints
+wm_ckpt_18-27-17/
+Trajectories/
