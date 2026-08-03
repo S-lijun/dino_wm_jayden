@@ -11,6 +11,11 @@ from gymnasium.spaces import Box
 from PIL import Image
 
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
+from env.isaac.waypoint_utils import (
+    DEFAULT_TRAJECTORY_REGIONS,
+    DEFAULT_TRAJECTORY_REGION_SEQUENCE,
+    WaypointNavController,
+)
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
 DEFAULT_VISUAL_FPS = 15.0
@@ -96,12 +101,18 @@ class LatentHumanoidEnv(gym.Env):
         # not as an IsaacG1Wrapper kwarg.
         self.wrapper = IsaacG1Wrapper(args_cli)
         self.sim_dt = float(self.wrapper.sim_dt)
+        # Same region-nav controller used in DataCollection_loop_test.
+        self.waypoint_nav = WaypointNavController(
+            max_speed=float(getattr(self.wrapper, "max_speed", 0.5)),
+            stop_thresh=float(self.wrapper.waypoint_stop_thresh),
+        )
 
         if latent_h:
             raise NotImplementedError("FailureClassifier latent_h is not wired for Isaac G1 yet.")
 
         reset_info = self.wrapper.reset_scene(seed=getattr(args, "seed", None))
         self._reset_timers()
+        self.waypoint_nav.reset()
         # Constructor warm-up reset is not a training episode; do not record.
         self._record_this_episode = False
         self._episode_frames = []
@@ -114,6 +125,11 @@ class LatentHumanoidEnv(gym.Env):
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
+        )
+        print(
+            "[LatentHumanoidEnv] trajectory regions "
+            f"(obstacle≈(2,0,0.5)): { {k: {'center': v['center'].tolist(), 'r': v['r']} for k, v in DEFAULT_TRAJECTORY_REGIONS.items()} }; "
+            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE}"
         )
 
         self.observation_space = Box(
@@ -131,6 +147,16 @@ class LatentHumanoidEnv(gym.Env):
         self._episode_visual_step = 0
         # Next encode boundary after t=0 (reset already encoded the t=0 frame).
         self._next_visual_time_s = self.visual_period_s
+
+    def compute_waypoint_nav_action(self) -> np.ndarray:
+        """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint."""
+        base_pos, base_quat = self.wrapper.get_robot_base_pose()
+        cmd = self.waypoint_nav.compute_command(
+            base_pos, base_quat, self.wrapper.waypoint
+        )
+        low = np.asarray(self.action_space.low, dtype=np.float32)
+        high = np.asarray(self.action_space.high, dtype=np.float32)
+        return np.clip(np.asarray(cmd, dtype=np.float32).reshape(3), low, high)
 
     def _pyhj_info(self, end_reason: str | None = None, stuck: bool = False) -> dict:
         """Scalar-only info with a fixed key set (required by PyHJ Batch assignment)."""
@@ -309,6 +335,7 @@ class LatentHumanoidEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         reset_info = self.wrapper.reset_scene(seed=seed)
         self._reset_timers()
+        self.waypoint_nav.reset()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)

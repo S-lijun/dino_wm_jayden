@@ -158,6 +158,9 @@ class IsaacG1Wrapper:
             if trajectory_region_sequence is not None
             else DEFAULT_TRAJECTORY_REGION_SEQUENCE
         )
+        # Buffer / reset: alternate left vs right pass instead of random choice.
+        self.alternate_left_right = True
+        self._pass_side_toggle = 0  # even → left, odd → right
         self.max_speed = max_speed
 
         if demos_dir is None:
@@ -355,10 +358,23 @@ class IsaacG1Wrapper:
             )
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
+        """Sample front → left|right → back; left/right alternate across episodes."""
+        sequence: list[str | tuple[str, ...]] = []
+        for entry in self.trajectory_region_sequence:
+            if (
+                self.alternate_left_right
+                and isinstance(entry, tuple)
+                and set(entry) == {"left", "right"}
+            ):
+                side = "left" if (self._pass_side_toggle % 2 == 0) else "right"
+                self._pass_side_toggle += 1
+                sequence.append(side)
+            else:
+                sequence.append(entry)
         return generate_random_waypoint_sequence(
             rng,
             trajectory_regions=self.trajectory_regions,
-            trajectory_region_sequence=self.trajectory_region_sequence,
+            trajectory_region_sequence=sequence,
         )
 
     def _reset_stuck_counters(self) -> None:
@@ -570,6 +586,14 @@ class IsaacG1Wrapper:
         proprio = robot.data.joint_pos[0, : self.num_joints].detach().cpu().numpy().astype(np.float32)
 
         return {"visual": visual, "proprio": proprio}
+
+    def get_robot_base_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (base_pos_w xyz, base_quat_w wxyz) as float64 numpy arrays."""
+        robot = self.env.unwrapped.scene["robot"]
+        data = robot.data
+        base_pos = data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+        base_quat = data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+        return base_pos, base_quat
 
     def get_full_state(self) -> np.ndarray:
         """Flat state vector for offline dataset storage."""

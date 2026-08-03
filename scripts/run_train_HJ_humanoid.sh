@@ -31,7 +31,7 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] python: ${ISAAC_PYTHON}"
-echo "[INFO] HJ anti-collapse: gamma=0.98, noise=0.3, actor-lr=1e-5, critic-warmup=1000, new_expl=off, action/boundary-reg"
+echo "[INFO] HJ anti-collapse: gamma=0.98, noise=0.3, actor-lr=1e-5, critic-warmup=1000, actor-bc=1000, new_expl=off, boundary-reg (no L2-to-zero)"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid.py \
   --headless \
@@ -47,6 +47,7 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid.py \
   --exploration-noise 0.3 \
   --actor-lr 1e-5 \
   --critic_warmup_updates 1000 \
-  --action_reg_coef 0.1 \
+  --actor_bc_warmup_updates 1000 \
+  --action_reg_coef 0.0 \
   --boundary_reg_coef 0.5 \
   "$@"

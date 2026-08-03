@@ -75,10 +75,24 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--actor_bc_warmup_updates",
+    type=int,
+    default=1000,
+    help=(
+        "After critic warm-up, behavior-clone the actor to buffer actions "
+        "(waypoint demos) so joint training does not start from mid-action "
+        "collapse (vx≈0.4)."
+    ),
+)
+parser.add_argument(
     "--action_reg_coef",
     type=float,
-    default=0.1,
-    help="L2 penalty on actor output in [-1,1] (anti tanh-corner collapse).",
+    default=0.0,
+    help=(
+        "DEPRECATED mid-point L2 on actor output in [-1,1]. "
+        "Do NOT use: zero maps to vx=0.4 and causes collapse. Prefer "
+        "--boundary_reg_coef. Kept for CLI compat; applied only if > 0."
+    ),
 )
 parser.add_argument(
     "--boundary_reg_coef",
@@ -115,14 +129,30 @@ import wandb
 from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
-from PyHJ.data import Collector, VectorReplayBuffer
+from PyHJ.data import Batch, Collector, VectorReplayBuffer
 from PyHJ.trainer import offpolicy_trainer
+from PyHJ.trainer.offpolicy import OffpolicyTrainer
 from PyHJ.env import DummyVectorEnv
 from PyHJ.exploration import GaussianNoise
 from PyHJ.utils import WandbLogger
 from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import Actor, Critic
 from PyHJ.policy import avoid_DDPGPolicy_annealing
+
+# Progress bar: only actor/critic. Reg / sat metrics still go to wandb via logger.
+_PROGRESS_BAR_LOSS_KEYS = ("loss/actor", "loss/critic")
+
+
+def _log_update_data_bar_filter(self, data, losses):
+    for k in losses.keys():
+        self.stat[k].add(losses[k])
+        losses[k] = self.stat[k].get()
+        if k in _PROGRESS_BAR_LOSS_KEYS:
+            data[k] = f"{losses[k]:.3f}"
+    self.logger.log_update_data(losses, self.gradient_step)
+
+
+OffpolicyTrainer.log_update_data = _log_update_data_bar_filter  # type: ignore[method-assign]
 
 from wm_load import load_model  # not plan.py — avoids env.venv / utils collision
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
@@ -336,7 +366,7 @@ def main():
     boundary_reg_coef = float(args.boundary_reg_coef)
 
     def learn_anti_tanh(batch, **kwargs):
-        """Actor: max Q + L2 / boundary reg so tanh does not pin to ±1 corners."""
+        """Actor: max Q + boundary reg (avoid ±1). No L2-to-zero (→ vx=0.4)."""
         del kwargs
         td, critic_loss = policy._mse_optimizer(
             batch, policy.critic, policy.critic_optim
@@ -346,13 +376,13 @@ def main():
             for _ in range(policy.actor_gradient_steps):
                 act = policy(batch, model="actor").act
                 safety_loss = -policy.critic(batch.obs, act).mean()
+                # Monitor-only mid-point energy; not used in loss by default.
                 action_reg = (act ** 2).mean()
                 boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
-                actor_loss = (
-                    safety_loss
-                    + action_reg_coef * action_reg
-                    + boundary_reg_coef * boundary_reg
-                )
+                actor_loss = safety_loss + boundary_reg_coef * boundary_reg
+                # Optional: only if user explicitly sets action_reg_coef > 0.
+                if action_reg_coef > 0.0:
+                    actor_loss = actor_loss + action_reg_coef * action_reg
                 policy.actor_optim.zero_grad()
                 actor_loss.backward()
                 policy.actor_optim.step()
@@ -377,10 +407,16 @@ def main():
         }
 
     policy.learn = learn_anti_tanh  # type: ignore[method-assign]
+    if action_reg_coef > 0.0:
+        print(
+            f"[WARN] action_reg_coef={action_reg_coef} pulls actor to 0 → vx≈0.4. "
+            "Prefer --action_reg_coef 0 (default) + actor BC warmup + boundary_reg."
+        )
     print(
         f"[INFO] anti-collapse: gamma={args.gamma_pyhj}, "
         f"actor_lr={args.actor_lr}, "
         f"critic_warmup_updates={args.critic_warmup_updates}, "
+        f"actor_bc_warmup_updates={args.actor_bc_warmup_updates}, "
         f"exploration_noise_start={args.exploration_noise} "
         f"(anneal → 0.1 over training), "
         f"new_expl=False, "
@@ -486,9 +522,45 @@ def main():
     buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
     train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
     # Replay buffer is not restored; collect a fresh warm-up even when resuming weights.
-    print("[INFO] Collecting initial transitions...")
+    # Initial buffer: region waypoint nav (DataCollection style), not random actor.
+    print(
+        "[INFO] Collecting initial transitions with WaypointNavController "
+        "(front -> left|right -> back; obstacle at (2,0,0.5))..."
+    )
+    _actor_forward = policy.forward
+    _expl_fn = policy.exploration_noise
+
+    def _waypoint_forward(batch, state=None, **kwargs):
+        del batch, state, kwargs
+        fns = train_envs.get_env_attr("compute_waypoint_nav_action")
+        acts_env = np.stack(
+            [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
+            axis=0,
+        )
+        acts = policy.map_action_inverse(acts_env)
+        return Batch(act=acts, state=None)
+
+    def _waypoint_expl(act, batch):
+        # Stash env cmd for actor_action/* logs; do not add Gaussian noise.
+        try:
+            if isinstance(act, torch.Tensor):
+                act_np = act.detach().cpu().numpy()
+            else:
+                act_np = np.asarray(act)
+            act_env = policy.map_action(np.array(act_np, dtype=np.float64, copy=True))
+            row = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
+            policy.last_clean_act_env = row
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] waypoint act stash failed: {exc}")
+            policy.last_clean_act_env = None
+        return act
+
+    policy.forward = _waypoint_forward  # type: ignore[method-assign]
+    policy.exploration_noise = _waypoint_expl  # type: ignore[method-assign]
     train_collector.collect(1000)
-    print("[INFO] Initial collection done.")
+    policy.forward = _actor_forward  # type: ignore[method-assign]
+    policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
+    print("[INFO] Initial waypoint collection done; restoring actor policy.")
 
     # Critic-only warm-up: fit Q before enabling actor (anti-collapse).
     n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))
@@ -514,9 +586,48 @@ def main():
                     f"loss/critic={metrics['loss/critic']:.4f}"
                 )
         policy.warmup = False
-        print("[INFO] Critic-only warmup done; enabling actor updates.")
+        print("[INFO] Critic-only warmup done.")
     else:
         policy.warmup = False
+
+    # Behavior-clone actor to waypoint buffer acts before RL (anti mid-action collapse).
+    n_actor_bc = int(getattr(args, "actor_bc_warmup_updates", 1000))
+    if n_actor_bc > 0 and not args.resume_policy:
+        print(
+            f"[INFO] Actor BC warmup: {n_actor_bc} updates "
+            f"(imitate waypoint buffer actions)..."
+        )
+        policy.warmup = False
+        for i in range(1, n_actor_bc + 1):
+            batch, _ = buffer.sample(args.batch_size_pyhj)
+            act_pred = policy(batch, model="actor").act
+            act_demo = torch.as_tensor(
+                batch.act, dtype=act_pred.dtype, device=act_pred.device
+            )
+            if act_demo.ndim == 1:
+                act_demo = act_demo.unsqueeze(0)
+            bc_loss = torch.nn.functional.mse_loss(act_pred, act_demo)
+            policy.actor_optim.zero_grad()
+            bc_loss.backward()
+            policy.actor_optim.step()
+            # Keep target actor in sync during BC (hard copy each step is fine).
+            policy.actor_old.load_state_dict(policy.actor.state_dict())
+            env_step = int(log_state.get("env_step", 0))
+            log_state["update"] = int(log_state.get("update", 0)) + 1
+            wandb.log(
+                {
+                    "trainer/env_step": float(env_step),
+                    "trainer/update": float(log_state["update"]),
+                    "loss/actor_bc": float(bc_loss.item()),
+                    "train/actor_bc_warmup": 1.0,
+                }
+            )
+            if i == 1 or i % 100 == 0 or i == n_actor_bc:
+                print(
+                    f"  actor_bc_warmup {i}/{n_actor_bc}: "
+                    f"loss/actor_bc={bc_loss.item():.4f}"
+                )
+        print("[INFO] Actor BC warmup done; enabling joint actor-critic training.")
 
     log_path = Path(f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}")
     if args.resume_policy:

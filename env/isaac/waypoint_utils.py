@@ -7,14 +7,18 @@ from typing import Any, Sequence
 import numpy as np
 
 # Default circular regions on the XY plane (matches DataCollection_loop_test.py).
+# Obstacle (blue_bin) is fixed at world (2.0, 0.0, 0.5):
+#   front / back = approach / depart along +x
+#   left / right = pass beside the bin
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
     "front": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 0.5},
     "back": {"center": np.array([3.0, 0.0], dtype=np.float64), "r": 0.3},
-    "left": {"center": np.array([2.0, 0.6], dtype=np.float64), "r": 0.6},
-    "right": {"center": np.array([2.0, -0.6], dtype=np.float64), "r": 0.6},
+    "left": {"center": np.array([2.0, 1.0], dtype=np.float64), "r": 0.3},
+    "right": {"center": np.array([2.0, -1.0], dtype=np.float64), "r": 0.3},
 }
 
-# front -> (left or right) -> back
+# front -> left|right -> back  (one waypoint sampled in each chosen region).
+# IsaacG1Wrapper alternates left/right across episodes (not random).
 DEFAULT_TRAJECTORY_REGION_SEQUENCE: list[str | tuple[str, ...]] = [
     "front",
     ("left", "right"),
