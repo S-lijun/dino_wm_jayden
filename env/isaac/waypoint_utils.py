@@ -6,24 +6,28 @@ from typing import Any, Sequence
 
 import numpy as np
 
-# Default circular regions on the XY plane (matches DataCollection_loop_test.py).
-# Obstacle (blue_bin) is fixed at world (2.0, 0.0, 0.5):
-#   front / back = approach / depart along +x
-#   left / right = pass beside the bin
+# Obstacle: FIXED at (2,0) during buffer; training resamples y∈[-0.5,0.5] on x=2.
+# front: fixed start at (0, 0) — no sampling range.
+# left / right: pass beside the bin; middle: straight into the bin (collision demos).
+# back: depart along +x.
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
-    "front": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 0.5},
+    "front": {"mode": "point", "xy": (0.0, 0.0)},
     "back": {"center": np.array([3.0, 0.0], dtype=np.float64), "r": 0.3},
     "left": {"center": np.array([2.0, 1.0], dtype=np.float64), "r": 0.3},
     "right": {"center": np.array([2.0, -1.0], dtype=np.float64), "r": 0.3},
+    # On the bin — buffer demos that walk straight into the obstacle.
+    "middle": {"mode": "point", "xy": (2.0, 0.0)},
 }
 
-# front -> left|right -> back  (one waypoint sampled in each chosen region).
-# IsaacG1Wrapper alternates left/right across episodes (not random).
+# front -> left|right|middle -> back.
+# IsaacG1Wrapper cycles left / right / middle across episodes (not random).
 DEFAULT_TRAJECTORY_REGION_SEQUENCE: list[str | tuple[str, ...]] = [
     "front",
-    ("left", "right"),
+    ("left", "right", "middle"),
     "back",
 ]
+
+PASS_SIDE_CYCLE: tuple[str, ...] = ("left", "right", "middle")
 
 
 def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
@@ -37,11 +41,21 @@ def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
 
 
 def sample_point_in_region(
-    center: np.ndarray,
-    radius: float,
+    region_cfg: dict[str, Any],
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Uniformly sample a point inside a 2D disk."""
+    """Sample a point from a region cfg (fixed point, disk, or vertical line)."""
+    mode = str(region_cfg.get("mode", "disk"))
+    if mode == "point":
+        xy = region_cfg["xy"]
+        return np.array([float(xy[0]), float(xy[1])], dtype=np.float64)
+    if mode == "line":
+        x = float(region_cfg["x"])
+        y = float(rng.uniform(float(region_cfg["y_min"]), float(region_cfg["y_max"])))
+        return np.array([x, y], dtype=np.float64)
+    # Default: uniform disk
+    center = np.asarray(region_cfg["center"], dtype=np.float64)
+    radius = float(region_cfg["r"])
     theta = rng.uniform(0.0, 2.0 * np.pi)
     rr = radius * np.sqrt(rng.uniform(0.0, 1.0))
     return center + rr * np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
@@ -79,9 +93,7 @@ def generate_random_waypoint_sequence(
             raise KeyError(
                 f"Region {region_name!r} not in trajectory_regions. Keys: {list(regions.keys())}"
             )
-        cfg = regions[region_name]
-        pt = sample_point_in_region(cfg["center"], float(cfg["r"]), rng)
-        points.append(pt)
+        points.append(sample_point_in_region(regions[region_name], rng))
         log_names.append(region_name)
 
     return np.stack(points, axis=0), log_names

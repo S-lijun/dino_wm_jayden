@@ -12,14 +12,15 @@ from PIL import Image
 
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 from env.isaac.waypoint_utils import (
-    DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     WaypointNavController,
 )
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
 DEFAULT_VISUAL_FPS = 15.0
-DEFAULT_MAX_EPISODE_SIM_STEPS = 1500
+# 1500 sim steps @ dt=0.005 ≈ 7.5s — too short to finish front→side→back on foot.
+# ~8000 ≈ 40s wall-clock sim time at 0.5 m/s with turns.
+DEFAULT_MAX_EPISODE_SIM_STEPS = 8000
 DEFAULT_WANDB_VIDEO_EVERY = 1
 DEFAULT_WANDB_VIDEO_SIZE = (120, 160)  # (H, W) for uploaded rollouts
 
@@ -35,11 +36,12 @@ class LatentHumanoidEnv(gym.Env):
     Episode ends (not based on safety cost ``h_s``):
     - all waypoints reached
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
-    - sim-step count hits ``max_episode_steps`` (default 1500 control steps)
-    - soft Y corridor: |y| > y_bound (default 2.0). Truncates only — does **not**
+    - sim-step count hits ``max_episode_steps`` (default 8000 control steps)
+    - soft Y corridor: |y| > y_bound (default 1.5). Truncates only — does **not**
       change ``h_s`` (not treated as collision). Cuts sparse flee trajectories.
+    - soft X far wall: x >= x_bound_max (default 4.0). Same truncate-only behavior.
 
-    Continuous LiDAR margin ``h_s = lidar_min_distance - 0.3`` is the step
+    Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` is the step
     cost (<0 unsafe, >0 safe) but does **not** end the episode.
     """
 
@@ -127,13 +129,24 @@ class LatentHumanoidEnv(gym.Env):
             f"sim_dt={self.sim_dt:.6f} (~{1.0 / self.sim_dt:.1f} Hz), "
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
-            f"y_bound=±{self.wrapper.y_bound} (OOB → truncate only, no h_s penalty), "
+            f"y_bound=±{self.wrapper.y_bound}, x_bound_max={self.wrapper.x_bound_max} "
+            f"(OOB → truncate only, no h_s penalty), "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
+        def _region_summary(v: dict) -> dict:
+            mode = v.get("mode", "disk")
+            if mode == "line":
+                return {"mode": "line", "x": v.get("x"), "y": [v.get("y_min"), v.get("y_max")]}
+            if mode == "point":
+                return {"mode": "point", "xy": list(v.get("xy", (0.0, 0.0)))}
+            return {"center": np.asarray(v["center"]).tolist(), "r": v["r"]}
+
         print(
             "[LatentHumanoidEnv] trajectory regions "
-            f"(obstacle≈(2,0,0.5)): { {k: {'center': v['center'].tolist(), 'r': v['r']} for k, v in DEFAULT_TRAJECTORY_REGIONS.items()} }; "
-            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE}"
+            f"{ {k: _region_summary(v) for k, v in self.wrapper.trajectory_regions.items()} }; "
+            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE}; "
+            f"bin FIXED in buffer, randomized in training "
+            f"(x=2, y∈{tuple(self.wrapper.obstacle_y_range)})"
         )
 
         self.observation_space = Box(
@@ -145,6 +158,14 @@ class LatentHumanoidEnv(gym.Env):
             high=np.array([0.8, 0.5, 0.5], dtype=np.float32),
             dtype=np.float32,
         )
+
+    @property
+    def randomize_obstacle(self) -> bool:
+        return bool(self.wrapper.randomize_obstacle)
+
+    @randomize_obstacle.setter
+    def randomize_obstacle(self, value: bool) -> None:
+        self.wrapper.randomize_obstacle = bool(value)
 
     def _reset_timers(self) -> None:
         self._episode_sim_step = 0
@@ -191,18 +212,22 @@ class LatentHumanoidEnv(gym.Env):
         return arr[..., :3]
 
     def _hj_value(self, z: np.ndarray) -> float | None:
-        """Q(z, π(z)) from the current actor/critic (deterministic, no noise)."""
+        """Q(z, a*) with a* = argmax over critic-sampled candidates (no actor)."""
         policy = self.policy_for_log
         if policy is None:
             return None
         try:
-            with torch.no_grad():
-                z_t = torch.as_tensor(z, dtype=torch.float32, device=self.device)
-                if z_t.ndim == 1:
-                    z_t = z_t.unsqueeze(0)
-                act, _ = policy.actor(z_t)
-                q = policy.critic(z_t, act)
-                return float(q.reshape(-1)[0].item())
+            from env.isaac.critic_select import select_action_max_q_numpy
+
+            n = int(getattr(policy, "_critic_action_samples", 64))
+            _, q = select_action_max_q_numpy(
+                policy.critic,
+                z,
+                act_dim=3,
+                n_candidates=n,
+                device=self.device,
+            )
+            return float(q)
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] HJ value compute failed: {exc}")
             return None
@@ -380,8 +405,8 @@ class LatentHumanoidEnv(gym.Env):
             if stuck:
                 end_reason = "stuck"
                 break
-            # Soft side walls: cut flee trajectories. Not a safety failure.
-            if self.wrapper.is_out_of_y_bounds():
+            # Soft walls: cut flee trajectories. Not a safety failure.
+            if self.wrapper.is_out_of_bounds():
                 end_reason = "out_of_bounds"
                 break
             if self._episode_sim_step >= self.max_episode_sim_steps:
@@ -404,11 +429,18 @@ class LatentHumanoidEnv(gym.Env):
         terminated = False
         truncated = end_reason is not None
         if truncated:
-            extra = (
-                f" (|y|>{self.wrapper.y_bound}, truncate-only)"
-                if end_reason == "out_of_bounds"
-                else ""
-            )
+            xy = self.wrapper.get_robot_xy_local()
+            if end_reason == "out_of_bounds":
+                if self.wrapper.is_out_of_x_bounds():
+                    extra = (
+                        f" (x={xy[0]:.3f}>={self.wrapper.x_bound_max}, truncate-only)"
+                    )
+                else:
+                    extra = (
+                        f" (|y|={abs(xy[1]):.3f}>{self.wrapper.y_bound}, truncate-only)"
+                    )
+            else:
+                extra = f" robot_xy=[{xy[0]:.3f},{xy[1]:.3f}]"
             print(
                 f"[LatentHumanoidEnv] episode end reason={end_reason}{extra} "
                 f"visual_steps={self._episode_visual_step} "

@@ -15,11 +15,13 @@ import torch
 from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
+    PASS_SIDE_CYCLE,
     generate_random_waypoint_sequence,
     waypoints_to_list,
 )
 
 # Obstacle scene keys registered on env_cfg.scene (see data_collection_obstacles.py).
+# LiDAR: one RayCaster per mesh, then merge_ray_hits_multi → lidar_min_distance.
 OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
     "blue_bin_0": {
         "default_z": 0.5,
@@ -122,12 +124,14 @@ class IsaacG1Wrapper:
         visual_mode: str | None = None,
         img_res: tuple[int, int] = (640, 480),
         env_prim_root: str = "/World/envs/env_0",
-        lidar_distance_threshold: float = 0.3,
+        lidar_distance_threshold: float = 1.0,
         collision_force_threshold: float = 0.1,
         stuck_contact_steps: int = 50,
         waypoint_stop_thresh: float = 0.1,
         # Soft corridor about the bin at (2, 0): leave room to pass left/right.
-        y_bound: float = 2.0,
+        y_bound: float = 1.5,
+        # Far end of the aisle: x >= this truncates (same as y OOB).
+        x_bound_max: float = 4.0,
         trajectory_regions: dict[str, dict[str, Any]] | None = None,
         trajectory_region_sequence: Sequence[str | tuple[str, ...]] | None = None,
         max_speed: float = 0.5,
@@ -147,23 +151,41 @@ class IsaacG1Wrapper:
                 float(getattr(args_cli, "bin_y", OBSTACLE_SPECS["blue_bin_0"]["spawn_xy"][1])),
             )
         self._blue_bin_xy = blue_bin_xy
+        # Buffer: keep this fixed pose. Training: resample on x=2, y∈[-y_bound,y_bound].
+        self._blue_bin_xy_fixed = (float(blue_bin_xy[0]), float(blue_bin_xy[1]))
+        self.randomize_obstacle = False
+        # Training-only: resample bin y on this interval (not y_bound).
+        self.obstacle_y_range = (-0.5, 0.5)
         self.env_prim_root = env_prim_root
         self.lidar_distance_threshold = lidar_distance_threshold
         self.collision_force_threshold = collision_force_threshold
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
-        self.trajectory_regions = (
-            trajectory_regions if trajectory_regions is not None else DEFAULT_TRAJECTORY_REGIONS
-        )
+        self.x_bound_max = float(getattr(args_cli, "x_bound_max", x_bound_max))
+        # Copy defaults (front = fixed (0,0)).
+        if trajectory_regions is not None:
+            self.trajectory_regions = trajectory_regions
+        else:
+            self.trajectory_regions = {
+                k: {
+                    **v,
+                    **(
+                        {"center": np.asarray(v["center"], dtype=np.float64).copy()}
+                        if "center" in v
+                        else {}
+                    ),
+                }
+                for k, v in DEFAULT_TRAJECTORY_REGIONS.items()
+            }
         self.trajectory_region_sequence = (
             trajectory_region_sequence
             if trajectory_region_sequence is not None
             else DEFAULT_TRAJECTORY_REGION_SEQUENCE
         )
-        # Buffer / reset: alternate left vs right pass instead of random choice.
+        # Buffer / reset: cycle left → right → middle (straight into bin).
         self.alternate_left_right = True
-        self._pass_side_toggle = 0  # even → left, odd → right
+        self._pass_side_toggle = 0  # indexes PASS_SIDE_CYCLE
         self.max_speed = max_speed
 
         if demos_dir is None:
@@ -248,7 +270,13 @@ class IsaacG1Wrapper:
         env_cfg.sim.render_interval = 1
         env_cfg.terminations.base_contact = None
 
-        add_blue_bin(env_cfg, pos=(2.0, 0.0, 0.5), index=0)
+        for i, name in enumerate(self._obstacle_names):
+            if name == "blue_bin_0":
+                xy = self._blue_bin_xy  # CLI bin_x/bin_y override
+            else:
+                xy = OBSTACLE_SPECS[name]["spawn_xy"]
+            z = OBSTACLE_SPECS[name]["default_z"]
+            add_blue_bin(env_cfg, pos=(float(xy[0]), float(xy[1]), float(z)), index=i)
 
         env_cfg.scene.robot_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*link.*",
@@ -303,6 +331,23 @@ class IsaacG1Wrapper:
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
         self.device = self.env.unwrapped.device
         self.sim_dt = float(self.env.unwrapped.cfg.sim.dt)
+
+        # GUI + FULL_RENDERING blocks the Kit UI thread during long collect/train
+        # loops → Windows "Isaac Sim (Not Responding)". Downgrade render mode.
+        sim = self.env.unwrapped.sim
+        if sim.has_gui():
+            if self.visual_mode == "rtx_rgb":
+                sim.set_render_mode(sim.RenderMode.PARTIAL_RENDERING)
+                print(
+                    "[WARN] GUI open: viewport set to PARTIAL_RENDERING. "
+                    "For training, kill and restart with --headless."
+                )
+            else:
+                sim.set_render_mode(sim.RenderMode.NO_RENDERING)
+                print(
+                    "[WARN] GUI open: viewport set to NO_RENDERING. "
+                    "For training, kill and restart with --headless."
+                )
 
         # Non-depth modes that did not pre-load lab (e.g. lidar_rgb).
         if self.visual_mode not in ("depth_rgb", "rtx_rgb"):
@@ -375,15 +420,15 @@ class IsaacG1Wrapper:
             )
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
-        """Sample front → left|right → back; left/right alternate across episodes."""
+        """Sample front → left|right|middle → back; cycle sides across episodes."""
         sequence: list[str | tuple[str, ...]] = []
         for entry in self.trajectory_region_sequence:
             if (
                 self.alternate_left_right
                 and isinstance(entry, tuple)
-                and set(entry) == {"left", "right"}
+                and set(entry) == set(PASS_SIDE_CYCLE)
             ):
-                side = "left" if (self._pass_side_toggle % 2 == 0) else "right"
+                side = PASS_SIDE_CYCLE[self._pass_side_toggle % len(PASS_SIDE_CYCLE)]
                 self._pass_side_toggle += 1
                 sequence.append(side)
             else:
@@ -436,11 +481,24 @@ class IsaacG1Wrapper:
         return False
 
     def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
-        """Reset sim, place blue_bin obstacle, region waypoints, spawn at first waypoint."""
+        """Reset sim, place bin, waypoints, spawn at fixed front (0, 0).
+
+        Obstacle: fixed at ``_blue_bin_xy_fixed`` when ``randomize_obstacle=False``
+        (buffer warm-up). When True (training), resample y on x=2 within
+        ``obstacle_y_range`` (default [-0.5, 0.5]); pose stays fixed in-episode.
+        """
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
         obs, _ = self.env.reset()
+
+        bin_x = float(self._blue_bin_xy_fixed[0])
+        if self.randomize_obstacle:
+            y0, y1 = self.obstacle_y_range
+            bin_y = float(self._rng.uniform(float(y0), float(y1)))
+        else:
+            bin_y = float(self._blue_bin_xy_fixed[1])
+        self._blue_bin_xy = (bin_x, bin_y)
 
         self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(self._rng)
         waypoint_list = waypoints_to_list(self.waypoints)
@@ -645,10 +703,28 @@ class IsaacG1Wrapper:
         base_quat = data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
         return base_pos, base_quat
 
-    def is_out_of_y_bounds(self) -> bool:
-        """True if base |y| exceeds the soft corridor (default ±2 m)."""
+    def get_robot_xy_local(self) -> np.ndarray:
+        """Robot XY relative to env origin (matches waypoint / bin coords)."""
         base_pos, _ = self.get_robot_base_pose()
-        return bool(abs(float(base_pos[1])) > self.y_bound)
+        origin = self.env.unwrapped.scene.env_origins[0].detach().cpu().numpy()
+        return np.asarray(
+            [float(base_pos[0] - origin[0]), float(base_pos[1] - origin[1])],
+            dtype=np.float64,
+        )
+
+    def is_out_of_y_bounds(self) -> bool:
+        """True if env-local |y| exceeds the soft corridor (default ±1.5 m)."""
+        xy = self.get_robot_xy_local()
+        return bool(abs(float(xy[1])) > self.y_bound)
+
+    def is_out_of_x_bounds(self) -> bool:
+        """True if env-local x exceeds the far boundary (default x >= 4)."""
+        xy = self.get_robot_xy_local()
+        return bool(float(xy[0]) >= self.x_bound_max)
+
+    def is_out_of_bounds(self) -> bool:
+        """Soft corridor: |y| > y_bound or x >= x_bound_max."""
+        return self.is_out_of_y_bounds() or self.is_out_of_x_bounds()
 
     def get_full_state(self) -> np.ndarray:
         """Flat state vector for offline dataset storage."""

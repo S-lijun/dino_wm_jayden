@@ -31,11 +31,11 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] python: ${ISAAC_PYTHON}"
-echo "[INFO] HJ anti-collapse: gamma=0.98, noise=0.3, actor-lr=1e-5, critic-warmup=1000, actor-bc=1000, new_expl=off, boundary-reg (no L2-to-zero)"
+echo "[INFO] HJ critic-only: gamma=0.98, noise=0.3, critic-warmup=1000, critic-action-samples=64 (no actor imitation)"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid.py \
   --headless \
-  --visual_mode depth_rgb \
+  --visual_mode rtx_rgb \
   --dino_ckpt_dir "${WM_CKPT_DIR}" \
   --dino_encoder "${WM_ENCODER}" \
   --with_proprio \
@@ -45,9 +45,9 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid.py \
   --test-num 1 \
   --gamma-pyhj 0.98 \
   --exploration-noise 0.3 \
-  --actor-lr 1e-5 \
   --critic_warmup_updates 1000 \
-  --actor_bc_warmup_updates 1000 \
+  --actor_bc_warmup_updates 0 \
+  --critic_action_samples 64 \
   --action_reg_coef 0.0 \
-  --boundary_reg_coef 0.5 \
+  --boundary_reg_coef 0.0 \
   "$@"

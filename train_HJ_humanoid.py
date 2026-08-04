@@ -66,6 +66,12 @@ parser.add_argument(
     help="Upload a rollout video to wandb every N finished episodes (0 disables).",
 )
 parser.add_argument(
+    "--y_bound",
+    type=float,
+    default=1.5,
+    help="Soft |y| corridor (meters). |y|>bound truncates episode; does not change h_s.",
+)
+parser.add_argument(
     "--critic_warmup_updates",
     type=int,
     default=1000,
@@ -77,11 +83,19 @@ parser.add_argument(
 parser.add_argument(
     "--actor_bc_warmup_updates",
     type=int,
-    default=1000,
+    default=0,
     help=(
-        "After critic warm-up, behavior-clone the actor to buffer actions "
-        "(waypoint demos) so joint training does not start from mid-action "
-        "collapse (vx≈0.4)."
+        "DEPRECATED: actor imitation of buffer actions. Default 0 — "
+        "actions are chosen by maximizing the critic over sampled candidates."
+    ),
+)
+parser.add_argument(
+    "--critic_action_samples",
+    type=int,
+    default=64,
+    help=(
+        "Number of uniform actions in [-1,1] to score with the critic when "
+        "selecting the safest action (train collect + Bellman target)."
     ),
 )
 parser.add_argument(
@@ -113,6 +127,12 @@ from visual_obs_utils import configure_app_for_visual, resolve_visual_mode
 _visual_mode = resolve_visual_mode(args_cli)
 configure_app_for_visual(args_cli, _visual_mode)
 torch_device = getattr(args_cli, "device", "cuda:0")
+if not bool(getattr(args_cli, "headless", False)):
+    print(
+        "[WARN] Running WITHOUT --headless. GUI + rtx_rgb will freeze as "
+        "'Not Responding' on Windows. Keep rtx_rgb, but MUST add --headless:\n"
+        "  python train_HJ_humanoid.py --headless --visual_mode rtx_rgb ..."
+    )
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -138,6 +158,8 @@ from PyHJ.utils import WandbLogger
 from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import Actor, Critic
 from PyHJ.policy import avoid_DDPGPolicy_annealing
+
+from env.isaac.critic_select import select_actions_max_q
 
 # Progress bar: only actor/critic. Reg / sat metrics still go to wandb via logger.
 _PROGRESS_BAR_LOSS_KEYS = ("loss/actor", "loss/critic")
@@ -360,68 +382,79 @@ def main():
         actor_gradient_steps=args.actor_gradient_steps,
     )
     # PyHJ default new_expl=True replaces acts with random when Q(rand)>=0;
-    # that biases the buffer and worsens actor collapse. Use standard Gaussian noise.
+    # that biases the buffer. Use standard Gaussian noise on critic-greedy acts.
     policy.new_expl = False
-    action_reg_coef = float(args.action_reg_coef)
-    boundary_reg_coef = float(args.boundary_reg_coef)
+    n_act_samples = int(getattr(args, "critic_action_samples", 64))
+    act_dim = int(np.prod(action_shape))
 
-    def learn_anti_tanh(batch, **kwargs):
-        """Actor: max Q + boundary reg (avoid ±1). No L2-to-zero (→ vx=0.4)."""
+    def _critic_greedy_forward(batch, state=None, model="actor", input="obs", **kwargs):
+        """Action = argmax over sampled candidates scored by the online critic."""
+        del state, model, kwargs
+        obs = batch[input]
+        best_act, _ = select_actions_max_q(
+            policy.critic,
+            obs,
+            act_dim=act_dim,
+            n_candidates=n_act_samples,
+            device=args.device,
+        )
+        return Batch(act=best_act, state=None)
+
+    def _target_q_critic_max(buffer, indices):
+        """Bellman next-action: max_a Q_target(s', a) via the same sampler."""
+        batch = buffer[indices]
+        best_act, _ = select_actions_max_q(
+            policy.critic_old,
+            batch.obs_next,
+            act_dim=act_dim,
+            n_candidates=n_act_samples,
+            device=args.device,
+        )
+        return policy.critic_old(batch.obs_next, best_act)
+
+    def learn_critic_only(batch, **kwargs):
+        """Train critic only. Actions at collect/eval come from critic sampling."""
         del kwargs
         td, critic_loss = policy._mse_optimizer(
             batch, policy.critic, policy.critic_optim
         )
         batch.weight = td
-        if not policy.warmup:
-            for _ in range(policy.actor_gradient_steps):
-                act = policy(batch, model="actor").act
-                safety_loss = -policy.critic(batch.obs, act).mean()
-                # Monitor-only mid-point energy; not used in loss by default.
-                action_reg = (act ** 2).mean()
-                boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
-                actor_loss = safety_loss + boundary_reg_coef * boundary_reg
-                # Optional: only if user explicitly sets action_reg_coef > 0.
-                if action_reg_coef > 0.0:
-                    actor_loss = actor_loss + action_reg_coef * action_reg
-                policy.actor_optim.zero_grad()
-                actor_loss.backward()
-                policy.actor_optim.step()
-            act_abs_mean = float(act.detach().abs().mean().item())
-            act_sat_frac = float((act.detach().abs() > 0.95).float().mean().item())
-        else:
-            actor_loss = torch.tensor(0.0)
-            action_reg = actor_loss
-            boundary_reg = actor_loss
-            act_abs_mean = 0.0
-            act_sat_frac = 0.0
         policy.sync_weight()
+        with torch.no_grad():
+            # Log what the sampler would pick on this batch (for wandb curves).
+            best_act, _ = select_actions_max_q(
+                policy.critic,
+                batch.obs,
+                act_dim=act_dim,
+                n_candidates=min(32, n_act_samples),
+                device=args.device,
+            )
+            act_abs_mean = float(best_act.abs().mean().item())
+            act_sat_frac = float((best_act.abs() > 0.95).float().mean().item())
         return {
-            "loss/actor": float(actor_loss.item()),
+            "loss/actor": 0.0,
             "loss/critic": float(critic_loss.item()),
-            "loss/action_reg": float(action_reg.item()) if not policy.warmup else 0.0,
-            "loss/boundary_reg": (
-                float(boundary_reg.item()) if not policy.warmup else 0.0
-            ),
+            "loss/action_reg": 0.0,
+            "loss/boundary_reg": 0.0,
             "train/actor_abs_mean": act_abs_mean,
             "train/actor_sat_frac": act_sat_frac,
         }
 
-    policy.learn = learn_anti_tanh  # type: ignore[method-assign]
-    if action_reg_coef > 0.0:
-        print(
-            f"[WARN] action_reg_coef={action_reg_coef} pulls actor to 0 → vx≈0.4. "
-            "Prefer --action_reg_coef 0 (default) + actor BC warmup + boundary_reg."
-        )
+    policy.forward = _critic_greedy_forward  # type: ignore[method-assign]
+    policy._target_q = _target_q_critic_max  # type: ignore[method-assign]
+    policy.learn = learn_critic_only  # type: ignore[method-assign]
+    policy._critic_action_samples = n_act_samples
+    # Keep actor in eval; not used for control or Bellman backup.
+    policy.actor.eval()
+    for p in policy.actor.parameters():
+        p.requires_grad = False
     print(
-        f"[INFO] anti-collapse: gamma={args.gamma_pyhj}, "
-        f"actor_lr={args.actor_lr}, "
+        f"[INFO] critic-only SF: gamma={args.gamma_pyhj}, "
         f"critic_warmup_updates={args.critic_warmup_updates}, "
-        f"actor_bc_warmup_updates={args.actor_bc_warmup_updates}, "
+        f"critic_action_samples={n_act_samples}, "
         f"exploration_noise_start={args.exploration_noise} "
-        f"(anneal → 0.1 over training), "
-        f"new_expl=False, "
-        f"action_reg_coef={action_reg_coef}, "
-        f"boundary_reg_coef={boundary_reg_coef}"
+        f"(anneal → 0.1; added on top of critic-greedy), "
+        f"actor frozen (no imitation / no actor RL)"
     )
     # Force every-episode video uploads (CLI 0 still disables).
     if int(getattr(args, "wandb_video_every", 1)) != 0:
@@ -525,8 +558,10 @@ def main():
     # Initial buffer: region waypoint nav (DataCollection style), not random actor.
     print(
         "[INFO] Collecting initial transitions with WaypointNavController "
-        "(front -> left|right -> back; obstacle at (2,0,0.5))..."
+        "(start fixed (0,0) -> left|right|middle(hit bin) -> back; "
+        "bin FIXED at (2,0) during buffer)..."
     )
+    train_envs.set_env_attr("randomize_obstacle", False)
     _actor_forward = policy.forward
     _expl_fn = policy.exploration_noise
 
@@ -557,10 +592,19 @@ def main():
 
     policy.forward = _waypoint_forward  # type: ignore[method-assign]
     policy.exploration_noise = _waypoint_expl  # type: ignore[method-assign]
+    print(
+        f"[INFO] Warm-up collect n_step=1000; "
+        f"wandb video every {int(args.wandb_video_every)} episode(s)."
+    )
     train_collector.collect(1000)
     policy.forward = _actor_forward  # type: ignore[method-assign]
     policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
-    print("[INFO] Initial waypoint collection done; restoring actor policy.")
+    # Training: resample bin y on x=2 each episode reset.
+    train_envs.set_env_attr("randomize_obstacle", True)
+    print(
+        "[INFO] Initial waypoint collection done; restoring critic-greedy actions. "
+        "Obstacle randomization ON for training (x=2, y∈[-0.5,0.5])."
+    )
 
     # Critic-only warm-up: fit Q before enabling actor (anti-collapse).
     n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))
@@ -590,44 +634,12 @@ def main():
     else:
         policy.warmup = False
 
-    # Behavior-clone actor to waypoint buffer acts before RL (anti mid-action collapse).
-    n_actor_bc = int(getattr(args, "actor_bc_warmup_updates", 1000))
-    if n_actor_bc > 0 and not args.resume_policy:
+    n_actor_bc = int(getattr(args, "actor_bc_warmup_updates", 0))
+    if n_actor_bc > 0:
         print(
-            f"[INFO] Actor BC warmup: {n_actor_bc} updates "
-            f"(imitate waypoint buffer actions)..."
+            f"[WARN] actor_bc_warmup_updates={n_actor_bc} ignored "
+            "(critic-only control; no actor imitation)."
         )
-        policy.warmup = False
-        for i in range(1, n_actor_bc + 1):
-            batch, _ = buffer.sample(args.batch_size_pyhj)
-            act_pred = policy(batch, model="actor").act
-            act_demo = torch.as_tensor(
-                batch.act, dtype=act_pred.dtype, device=act_pred.device
-            )
-            if act_demo.ndim == 1:
-                act_demo = act_demo.unsqueeze(0)
-            bc_loss = torch.nn.functional.mse_loss(act_pred, act_demo)
-            policy.actor_optim.zero_grad()
-            bc_loss.backward()
-            policy.actor_optim.step()
-            # Keep target actor in sync during BC (hard copy each step is fine).
-            policy.actor_old.load_state_dict(policy.actor.state_dict())
-            env_step = int(log_state.get("env_step", 0))
-            log_state["update"] = int(log_state.get("update", 0)) + 1
-            wandb.log(
-                {
-                    "trainer/env_step": float(env_step),
-                    "trainer/update": float(log_state["update"]),
-                    "loss/actor_bc": float(bc_loss.item()),
-                    "train/actor_bc_warmup": 1.0,
-                }
-            )
-            if i == 1 or i % 100 == 0 or i == n_actor_bc:
-                print(
-                    f"  actor_bc_warmup {i}/{n_actor_bc}: "
-                    f"loss/actor_bc={bc_loss.item():.4f}"
-                )
-        print("[INFO] Actor BC warmup done; enabling joint actor-critic training.")
 
     log_path = Path(f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}")
     if args.resume_policy:
