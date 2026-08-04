@@ -126,6 +126,8 @@ class IsaacG1Wrapper:
         collision_force_threshold: float = 0.1,
         stuck_contact_steps: int = 50,
         waypoint_stop_thresh: float = 0.1,
+        # Soft corridor about the bin at (2, 0): leave room to pass left/right.
+        y_bound: float = 2.0,
         trajectory_regions: dict[str, dict[str, Any]] | None = None,
         trajectory_region_sequence: Sequence[str | tuple[str, ...]] | None = None,
         max_speed: float = 0.5,
@@ -150,6 +152,7 @@ class IsaacG1Wrapper:
         self.collision_force_threshold = collision_force_threshold
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
+        self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
         self.trajectory_regions = (
             trajectory_regions if trajectory_regions is not None else DEFAULT_TRAJECTORY_REGIONS
         )
@@ -214,8 +217,12 @@ class IsaacG1Wrapper:
         self._obstacle_names = list(OBSTACLE_SPECS.keys())
         self._depth_cam_names: list[str] = []
 
-        if self.visual_mode == "depth_rgb":
+        # depth_rgb: lab meshes needed for RayCasterCamera.
+        # rtx_rgb: load lab BEFORE env (matches test_gs_rtx_smoke); loading after
+        # often leaves CameraCfg annotator with invalid overscan on first RGB read.
+        if self.visual_mode in ("depth_rgb", "rtx_rgb"):
             load_lab_scene_usd(demos_dir=self.demos_dir)
+        if self.visual_mode == "depth_rgb":
             self._lidar_mesh_paths = default_raycast_mesh_paths(
                 env_prim_root,
                 obstacle_names=tuple(self._obstacle_names),
@@ -254,9 +261,10 @@ class IsaacG1Wrapper:
         self.lidar_period_s = 1.0 / self.lidar_fps
 
         if self.visual_mode == "rtx_rgb":
+            # update_period=0 → refresh every sim step (avoids empty first annotator frame).
             env_cfg.scene.camera = build_rtx_camera_cfg(
                 img_res=img_res,
-                update_period_s=1.0 / 15.0,
+                update_period_s=0.0,
                 sim_utils=sim_utils,
                 camera_cfg_cls=CameraCfg,
             )
@@ -296,8 +304,17 @@ class IsaacG1Wrapper:
         self.device = self.env.unwrapped.device
         self.sim_dt = float(self.env.unwrapped.cfg.sim.dt)
 
-        if self.visual_mode != "depth_rgb":
+        # Non-depth modes that did not pre-load lab (e.g. lidar_rgb).
+        if self.visual_mode not in ("depth_rgb", "rtx_rgb"):
             load_lab_scene_usd(demos_dir=self.demos_dir)
+        else:
+            # G1FlatEnvCfg spawns /World/ground after any pre-env lab load.
+            # Remove it again so the default grid does not z-fight the GS floor.
+            stage = self._omni_usd.get_context().get_stage()
+            ground_path = "/World/ground"
+            if stage.GetPrimAtPath(ground_path):
+                stage.RemovePrim(ground_path)
+                print("[INFO] Removed default /World/ground under GS lab floor.")
 
         runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
         runner.load(checkpoint)
@@ -459,8 +476,17 @@ class IsaacG1Wrapper:
         self.commands.zero_()
 
         # Warm up physics/sensors after teleporting assets.
+        # RTX CameraCfg update_period is ~1/15s; with sim_dt=0.005 that needs
+        # ~14+ steps before annotator RGB is valid. Too few steps → overscan
+        # NoneType crash in omni.replicator (_resize_data_for_overscan).
         zero_actions = torch.zeros(1, self.num_joints, device=self.device)
-        for _ in range(3):
+        warmup_steps = 3
+        if self.visual_mode == "rtx_rgb":
+            cam_period = float(
+                getattr(self.camera.cfg, "update_period", 1.0 / 15.0) or (1.0 / 15.0)
+            )
+            warmup_steps = max(30, int(np.ceil(cam_period / max(self.sim_dt, 1e-6))) + 5)
+        for _ in range(warmup_steps):
             self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands
             obs, _, _, _ = self.env.step(zero_actions)
 
@@ -553,6 +579,34 @@ class IsaacG1Wrapper:
         self._update_lidar_stats()
         return float(self._last_lidar_stats["lidar_min_distance"])
 
+    def _read_rtx_rgb_hwc(self) -> np.ndarray:
+        """Read RTX camera RGB; step+retry if annotator overscan is not ready yet."""
+        last_exc: Exception | None = None
+        zero_actions = torch.zeros(1, self.num_joints, device=self.device)
+        for attempt in range(15):
+            try:
+                rgb_tensor = self.camera.data.output["rgb"][0]
+                rgb_np = rgb_tensor[..., :3].detach().cpu().numpy()
+                if rgb_np.dtype != np.uint8:
+                    rgb_np = (rgb_np * 255).clip(0, 255).astype(np.uint8)
+                return self._rotate_sensor_ccw_to_landscape(rgb_np)
+            except TypeError as exc:
+                # omni.replicator: datawindow_overscan_* is None on first bad frames.
+                last_exc = exc
+                self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = (
+                    self.commands
+                )
+                obs, _, _, _ = self.env.step(zero_actions)
+                self._last_policy_obs = obs
+                if attempt == 0 or attempt == 14:
+                    print(
+                        f"[WARN] rtx_rgb read failed (attempt {attempt + 1}/15): {exc}"
+                    )
+        raise RuntimeError(
+            "rtx_rgb camera never produced a valid RGB frame. "
+            "Try without --headless, or use --visual_mode depth_rgb."
+        ) from last_exc
+
     def get_raw_obs(self) -> dict[str, np.ndarray]:
         if not self.collect_visual:
             raise RuntimeError(
@@ -560,11 +614,7 @@ class IsaacG1Wrapper:
             )
 
         if self.visual_mode == "rtx_rgb":
-            rgb_tensor = self.camera.data.output["rgb"][0]
-            rgb_np = rgb_tensor[..., :3].detach().cpu().numpy()
-            if rgb_np.dtype != np.uint8:
-                rgb_np = (rgb_np * 255).clip(0, 255).astype(np.uint8)
-            visual = self._rotate_sensor_ccw_to_landscape(rgb_np)
+            visual = self._read_rtx_rgb_hwc()
         elif self.visual_mode == "depth_rgb":
             scene = self.env.unwrapped.scene
             depth_list = [
@@ -594,6 +644,11 @@ class IsaacG1Wrapper:
         base_pos = data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
         base_quat = data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
         return base_pos, base_quat
+
+    def is_out_of_y_bounds(self) -> bool:
+        """True if base |y| exceeds the soft corridor (default ±2 m)."""
+        base_pos, _ = self.get_robot_base_pose()
+        return bool(abs(float(base_pos[1])) > self.y_bound)
 
     def get_full_state(self) -> np.ndarray:
         """Flat state vector for offline dataset storage."""

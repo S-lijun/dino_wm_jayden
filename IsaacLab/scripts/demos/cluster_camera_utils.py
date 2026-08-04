@@ -48,20 +48,26 @@ def configure_headless_cameras(args_cli, *, verbose: bool = True) -> None:
         args_cli.rendering_mode = "performance"
         #args_cli.rendering_mode = None
 
-    use_hpc_gs = getattr(args_cli, "hpc_gs_rgb", True)
+    # HPC kit args (RaytracedLighting + multiGpu off) are for Linux cluster nodes.
+    # On Windows laptops they often break Replicator RGB (overscan NoneType).
+    default_hpc = os.name != "nt"
+    if hasattr(args_cli, "hpc_gs_rgb") and args_cli.hpc_gs_rgb is not None:
+        use_hpc_gs = bool(args_cli.hpc_gs_rgb)
+    else:
+        use_hpc_gs = default_hpc
     extra = HPC_GS_RGB_KIT_ARGS if use_hpc_gs else DEFAULT_HEADLESS_CAMERA_KIT_ARGS
-    
+
     existing = getattr(args_cli, "kit_args", "") or ""
     args_cli.kit_args = (existing + " " + extra).strip()
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cvd or "," in cvd:
+    if use_hpc_gs and (not cvd or "," in cvd):
         warnings.warn(
             "For rtx_rgb on shared H100 nodes, pin ONE free GPU before launch, e.g. "
             "GS_GPU=3 bash scripts/demos/run_gs_rgb_capture.sh --smoke",
             stacklevel=2,
         )
-    elif verbose:
+    elif verbose and cvd:
         print(f"[INFO] Using single GPU CUDA_VISIBLE_DEVICES={cvd!r}")
 
     if verbose:

@@ -36,6 +36,8 @@ class LatentHumanoidEnv(gym.Env):
     - all waypoints reached
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
     - sim-step count hits ``max_episode_steps`` (default 1500 control steps)
+    - soft Y corridor: |y| > y_bound (default 2.0). Truncates only — does **not**
+      change ``h_s`` (not treated as collision). Cuts sparse flee trajectories.
 
     Continuous LiDAR margin ``h_s = lidar_min_distance - 0.3`` is the step
     cost (<0 unsafe, >0 safe) but does **not** end the episode.
@@ -44,12 +46,13 @@ class LatentHumanoidEnv(gym.Env):
     metadata = {"render_modes": []}
 
     # Fixed info schema for PyHJ Batch (reset/step must use the same keys).
-    # 0=ongoing, 1=all_waypoints, 2=stuck, 3=max_steps
+    # 0=ongoing, 1=all_waypoints, 2=stuck, 3=max_steps, 4=out_of_bounds
     _END_REASON_CODE = {
         None: 0,
         "all_waypoints": 1,
         "stuck": 2,
         "max_steps": 3,
+        "out_of_bounds": 4,
     }
 
     def __init__(
@@ -124,6 +127,7 @@ class LatentHumanoidEnv(gym.Env):
             f"sim_dt={self.sim_dt:.6f} (~{1.0 / self.sim_dt:.1f} Hz), "
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
+            f"y_bound=±{self.wrapper.y_bound} (OOB → truncate only, no h_s penalty), "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
         print(
@@ -376,6 +380,10 @@ class LatentHumanoidEnv(gym.Env):
             if stuck:
                 end_reason = "stuck"
                 break
+            # Soft side walls: cut flee trajectories. Not a safety failure.
+            if self.wrapper.is_out_of_y_bounds():
+                end_reason = "out_of_bounds"
+                break
             if self._episode_sim_step >= self.max_episode_sim_steps:
                 end_reason = "max_steps"
                 break
@@ -388,14 +396,21 @@ class LatentHumanoidEnv(gym.Env):
         obs = self.wrapper.get_raw_obs()
         z_next = self.encode(obs)
         hj_val = self._hj_value(z_next)
+        # out_of_bounds: truncate only (stop collecting sparse flee data). Do NOT
+        # rewrite h_s — OOB is not a collision / not a safety failure label.
         self._log_rollout_metrics(h_s, hj_val, bump_env_step=True)
         self._append_frame(obs, hj_val=hj_val, l_val=h_s)
 
         terminated = False
         truncated = end_reason is not None
         if truncated:
+            extra = (
+                f" (|y|>{self.wrapper.y_bound}, truncate-only)"
+                if end_reason == "out_of_bounds"
+                else ""
+            )
             print(
-                f"[LatentHumanoidEnv] episode end reason={end_reason} "
+                f"[LatentHumanoidEnv] episode end reason={end_reason}{extra} "
                 f"visual_steps={self._episode_visual_step} "
                 f"sim_steps={self._episode_sim_step}"
             )

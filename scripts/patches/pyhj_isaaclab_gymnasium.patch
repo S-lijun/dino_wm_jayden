@@ -22,6 +22,69 @@ index a2a6c6a..44d3d9b 100644
  
  __version__ = "0.0.1" # we adapt this repo from Tianshou version 0.5.1
  
+diff --git a/PyHJ/data/__init__.py b/PyHJ/data/__init__.py
+index 8f0e0c1..b1c2d3e 100644
+--- a/PyHJ/data/__init__.py
++++ b/PyHJ/data/__init__.py
+@@ -15,8 +15,10 @@ from PyHJ.data.buffer.vecbuf import (
+     VectorReplayBuffer,
+ )
+ from PyHJ.data.buffer.cached import CachedReplayBuffer
+-from PyHJ.data.collector import Collector, AsyncCollector
+ 
++# Collector imports PyHJ.policy; keep it lazy so policy.base can import
++# Batch/ReplayBuffer without circular import (esp. Windows / newer Python).
++
+ __all__ = [
+     "Batch",
+     "to_numpy",
+@@ -33,3 +35,18 @@ __all__ = [
+     "Collector",
+     "AsyncCollector",
+ ]
++
++
++def __getattr__(name: str):
++    if name == "Collector":
++        from PyHJ.data.collector import Collector
++
++        return Collector
++    if name == "AsyncCollector":
++        from PyHJ.data.collector import AsyncCollector
++
++        return AsyncCollector
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+diff --git a/PyHJ/data/collector.py b/PyHJ/data/collector.py
+index 1111111..2222222 100644
+--- a/PyHJ/data/collector.py
++++ b/PyHJ/data/collector.py
+@@ -16,7 +16,9 @@ from PyHJ.data import (
+ )
+ from PyHJ.data.batch import _alloc_by_keys_diff
+ from PyHJ.env import BaseVectorEnv, DummyVectorEnv
+-from PyHJ.policy import BasePolicy
++# Import submodule directly to avoid circular import with PyHJ.policy.__init__.
++from PyHJ.policy.base import BasePolicy
+ 
+ 
+ class Collector(object):
+diff --git a/PyHJ/policy/base.py b/PyHJ/policy/base.py
+index 3333333..4444444 100644
+--- a/PyHJ/policy/base.py
++++ b/PyHJ/policy/base.py
+@@ -8,7 +8,10 @@ from gymnasium.spaces import Box, Discrete, MultiBinary, MultiDiscrete
+ from numba import njit
+ from torch import nn
+ 
+-from PyHJ.data import Batch, ReplayBuffer, to_numpy, to_torch_as
++# Leaf imports avoid circular import via PyHJ.data.__init__ → collector → policy.
++from PyHJ.data.batch import Batch
++from PyHJ.data.buffer.base import ReplayBuffer
++from PyHJ.data.utils.converter import to_numpy, to_torch_as
+ from PyHJ.utils import MultipleLRSchedulers
+ 
+ 
+ class BasePolicy(ABC, nn.Module):
 diff --git a/PyHJ/reach_rl_gym_envs/__init__.py b/PyHJ/reach_rl_gym_envs/__init__.py
 index be9fe26..2798247 100644
 --- a/PyHJ/reach_rl_gym_envs/__init__.py
