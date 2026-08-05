@@ -1,16 +1,15 @@
-"""Test HJ safety filter on Isaac G1 latent humanoid (switching / waypoint / safe-only).
+"""Test SAC HJ safety filter on Isaac G1 latent humanoid.
 
-Mirrors CarGoal ``test_cargoal_latent_specific_checkpoint.py`` but:
-  - nominal = WaypointNavController (not Dreamer)
-  - loads training ``policy.pth`` (actor+critic inside)
-  - critic-only gate: Q(z, a_nom) < threshold → SF takeover
-  - no WM dynamics rollout (can add later)
+Loads ``train_HJ_humanoid_sac.py`` checkpoints (ActorProb + twin critics).
+Modes: switching / waypoint_only / safe_only (same gate as DDPG test, but SAC actor).
 
-Usage (env_isaaclab)::
+Cannot reuse ``test_HJ_humanoid.py`` (DDPG Actor / single critic).
 
-  python test_HJ_humanoid.py --headless --visual_mode rtx_rgb \\
-    --dino_ckpt_dir C:\\ --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
-    --policy_path runs/ddpg_hj_humanoid/.../epoch_id_N/policy.pth \\
+Usage::
+
+  python test_HJ_humanoid_sac.py --headless --visual_mode rtx_rgb \\
+    --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
+    --policy_path runs/sac_hj_humanoid/.../epoch_id_N/policy.pth \\
     --mode switching --num_runs 5
 """
 
@@ -22,9 +21,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# ---------------------------------------------------------------------
-# Isaac Sim must start before isaaclab / env imports.
-# ---------------------------------------------------------------------
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 ISAACLAB_ROOT = os.path.join(REPO_ROOT, "IsaacLab")
 sys.path.insert(0, REPO_ROOT)
@@ -33,26 +29,24 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("Test HJ safety filter on latent Humanoid (Isaac G1)")
+parser = argparse.ArgumentParser("Test SAC HJ filter on latent Humanoid (Isaac G1)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument(
     "--dino_ckpt_dir",
     type=str,
-    default="C:\\",
-    help="Parent of encoder folder (e.g. C:\\ for C:\\wm_ckpt_18-27-17)",
+    default="/workspace",
+    help="Parent of encoder folder",
 )
 parser.add_argument(
     "--dino_encoder",
     type=str,
     default="wm_ckpt_18-27-17",
-    help="Encoder / WM run folder under dino_ckpt_dir",
 )
 parser.add_argument(
     "--config",
     type=str,
     default="train_HJ_configs.yaml",
-    help="Same YAML as training (net sizes, etc.)",
 )
 parser.add_argument("--with_proprio", action="store_true")
 parser.add_argument(
@@ -65,45 +59,25 @@ parser.add_argument(
     "--policy_path",
     type=str,
     required=True,
-    help="Path to training checkpoint .../epoch_id_N/policy.pth",
+    help="Path to SAC training checkpoint .../epoch_id_N/policy.pth",
 )
 parser.add_argument(
     "--mode",
     type=str,
     default="switching",
     choices=["switching", "waypoint_only", "safe_only"],
-    help="Controller mode (CarGoal: switching / pid_only / safe_only).",
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
     "--safety_threshold",
     type=float,
     default=0.0,
-    help="Switch to SF when Q(z, a_nom) < this (default 0).",
+    help="Switch to SF when min(Q1,Q2)(z, a_nom) < this.",
 )
-parser.add_argument(
-    "--max_visual_steps",
-    type=int,
-    default=400,
-    help="Hard cap on Gym/HJ visual steps per episode.",
-)
-parser.add_argument(
-    "--out_dir",
-    type=str,
-    default=None,
-    help="Where to save videos/summary (default: humanoid_test/<timestamp>).",
-)
-parser.add_argument(
-    "--save_video",
-    action="store_true",
-    default=True,
-    help="Save mp4 for each run (default on).",
-)
-parser.add_argument(
-    "--no_save_video",
-    action="store_true",
-    help="Disable video saving.",
-)
+parser.add_argument("--max_visual_steps", type=int, default=400)
+parser.add_argument("--out_dir", type=str, default=None)
+parser.add_argument("--save_video", action="store_true", default=True)
+parser.add_argument("--no_save_video", action="store_true")
 
 args_cli, remaining = parser.parse_known_args()
 
@@ -118,19 +92,15 @@ simulation_app = app_launcher.app
 
 sys.path.insert(0, REPO_ROOT)
 
-# ---------------------------------------------------------------------
-# Imports after AppLauncher
-# ---------------------------------------------------------------------
 import gym
 import numpy as np
 import torch
 import yaml
 from omegaconf import OmegaConf
 
-from PyHJ.exploration import GaussianNoise
-from PyHJ.policy import avoid_DDPGPolicy_annealing
+from PyHJ.policy import avoid_SACPolicy_annealing
 from PyHJ.utils.net.common import Net
-from PyHJ.utils.net.continuous import Actor, Critic
+from PyHJ.utils.net.continuous import ActorProb, Critic
 
 from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
@@ -198,26 +168,29 @@ def _video_frame(env: LatentHumanoidEnv, hj_val: float | None, l_val: float | No
 
 
 def build_policy(env: LatentHumanoidEnv, args, device: str):
-    """Rebuild avoid-DDPG policy to match training, then load policy.pth."""
     state_shape = env.observation_space.shape
     action_shape = env.action_space.shape
-    max_action = 1.0
     policy_action_space = gym.spaces.Box(
         low=np.asarray(env.action_space.low, dtype=np.float32),
         high=np.asarray(env.action_space.high, dtype=np.float32),
         dtype=np.float32,
     )
 
-    critic_net = Net(
-        state_shape,
-        action_shape,
-        hidden_sizes=args.critic_net,
-        activation=getattr(torch.nn, args.critic_activation),
-        concat=True,
-        device=device,
-    )
-    critic = Critic(critic_net, device=device).to(device)
-    critic_optim = torch.optim.AdamW(critic.parameters(), lr=float(args.critic_lr))
+    def _make_critic():
+        net = Net(
+            state_shape,
+            action_shape,
+            hidden_sizes=args.critic_net,
+            activation=getattr(torch.nn, args.critic_activation),
+            concat=True,
+            device=device,
+        )
+        critic = Critic(net, device=device).to(device)
+        optim = torch.optim.AdamW(critic.parameters(), lr=float(args.critic_lr))
+        return critic, optim
+
+    critic1, critic1_optim = _make_critic()
+    critic2, critic2_optim = _make_critic()
 
     actor_net = Net(
         state_shape,
@@ -225,25 +198,28 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
         activation=getattr(torch.nn, args.actor_activation),
         device=device,
     )
-    actor = Actor(
-        actor_net, action_shape, max_action=max_action, device=device
+    actor1 = ActorProb(
+        actor_net, action_shape, max_action=1.0, unbounded=True, device=device
     ).to(device)
-    actor_optim = torch.optim.AdamW(actor.parameters(), lr=float(args.actor_lr))
+    actor1_optim = torch.optim.AdamW(actor1.parameters(), lr=float(args.actor_lr))
 
-    policy = avoid_DDPGPolicy_annealing(
-        critic=critic,
-        critic_optim=critic_optim,
+    policy = avoid_SACPolicy_annealing(
+        critic1=critic1,
+        critic1_optim=critic1_optim,
+        critic2=critic2,
+        critic2_optim=critic2_optim,
         tau=float(args.tau),
         gamma=float(args.gamma_pyhj),
-        exploration_noise=GaussianNoise(sigma=0.0),
+        alpha=0.2,
+        exploration_noise=None,
+        deterministic_eval=True,
         reward_normalization=bool(args.rew_norm),
         estimation_step=int(args.n_step),
         action_space=policy_action_space,
-        actor=actor,
-        actor_optim=actor_optim,
-        actor_gradient_steps=int(args.actor_gradient_steps),
+        actor1=actor1,
+        actor1_optim=actor1_optim,
     )
-    policy.new_expl = False
+    policy.critic = policy.critic1
     return policy
 
 
@@ -252,41 +228,46 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"--policy_path not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    policy.load_state_dict(state, strict=True)
-    policy.actor.eval()
-    policy.critic.eval()
-    print(f"[INFO] Loaded policy from {ckpt_path}")
+    # Auto-alpha buffers may be absent / differ; load matching keys strictly for nets.
+    missing, unexpected = policy.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[WARN] missing keys (ok if alpha-only): {missing}")
+    if unexpected:
+        print(f"[WARN] unexpected keys: {unexpected}")
+    policy.eval()
+    policy.actor1.eval()
+    policy.critic1.eval()
+    policy.critic2.eval()
+    print(f"[INFO] Loaded SAC policy from {ckpt_path}")
 
 
 @torch.no_grad()
 def q_value(policy, z: np.ndarray, act_policy: np.ndarray, device: str) -> float:
-    """Q(z, a) with a in policy space [-1, 1]."""
+    """min(Q1, Q2)(z, a) in policy space."""
     z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
     if z_t.ndim == 1:
         z_t = z_t.unsqueeze(0)
     a_t = torch.as_tensor(act_policy, dtype=torch.float32, device=device)
     if a_t.ndim == 1:
         a_t = a_t.unsqueeze(0)
-    q = policy.critic(z_t, a_t)
+    q1 = policy.critic1(z_t, a_t)
+    q2 = policy.critic2(z_t, a_t)
+    q = torch.min(q1, q2)
     return float(q.reshape(-1)[0].item())
 
 
 @torch.no_grad()
-def safe_action_env(
-    policy,
-    z: np.ndarray,
-    device: str,
-    n_candidates: int = 64,
-) -> np.ndarray:
-    """Actor SF → env-space (vx, vy, yaw=0). Matches training yaw freeze."""
-    del n_candidates  # kept for CLI compat; actor policy does not sample
+def safe_action_env(policy, z: np.ndarray, device: str) -> np.ndarray:
+    """Deterministic SAC actor (mean) → env-space, yaw=0."""
     from PyHJ.data import Batch
 
+    was_training = policy.training
+    policy.eval()
     z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
     if z_t.ndim == 1:
         z_t = z_t.unsqueeze(0)
     batch = Batch(obs=z_t, info=Batch())
-    act_pol = policy(batch, model="actor").act
+    act_pol = policy(batch).act
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
     act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
@@ -294,6 +275,7 @@ def safe_action_env(
         act_pol[2] = 0.0
     act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
     act_env[2] = 0.0
+    policy.train(was_training)
     return act_env
 
 
@@ -328,20 +310,20 @@ def simulate_one(
         a_nom_pol = np.asarray(
             policy.map_action_inverse(a_nom_env), dtype=np.float32
         ).reshape(-1)
+        if a_nom_pol.size >= 3:
+            a_nom_pol[2] = 0.0
 
         if mode == "waypoint_only":
             action = a_nom_env
-            using_hj = False
             q_nom = q_value(policy, z, a_nom_pol, device)
         elif mode == "safe_only":
             action = safe_action_env(policy, z, device)
-            using_hj = True
             q_nom = q_value(policy, z, a_nom_pol, device)
+            hj_interventions += 1
         else:  # switching
             q_nom = q_value(policy, z, a_nom_pol, device)
             if q_nom < safety_threshold:
                 action = safe_action_env(policy, z, device)
-                using_hj = True
                 hj_interventions += 1
                 if last_controller == "waypoint":
                     total_switches += 1
@@ -353,7 +335,6 @@ def simulate_one(
                     )
             else:
                 action = a_nom_env
-                using_hj = False
                 if last_controller == "hj":
                     total_switches += 1
                 last_controller = "waypoint"
@@ -372,7 +353,6 @@ def simulate_one(
             frames.append(_video_frame(env, hj_exec, h_s_last))
 
         if terminated or truncated:
-            # info["end_reason"] is int code
             code = int(info.get("end_reason", 0))
             end_reason = {
                 0: "ongoing",
@@ -431,7 +411,7 @@ def main():
         torch.cuda.manual_seed_all(int(getattr(args, "seed", 0)))
 
     stamp = datetime.now().strftime("%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test") / stamp
+    out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac") / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] mode={args.mode} policy={args.policy_path}")
@@ -439,13 +419,14 @@ def main():
     ckpt_dir = Path(args.dino_ckpt_dir)
     hydra_cfg = ckpt_dir / "hydra.yaml"
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
+    if not hydra_cfg.is_file():
+        raise FileNotFoundError(f"WM hydra.yaml not found: {hydra_cfg}")
     train_cfg = OmegaConf.load(str(hydra_cfg))
     wm = load_model(snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device)
     wm.eval()
     for p in wm.parameters():
         p.requires_grad = False
 
-    # No wandb video spam during closed-loop test.
     env = LatentHumanoidEnv(
         args,
         wm,
@@ -455,9 +436,8 @@ def main():
         latent_h=False,
         wandb_video_every=0,
     )
-    # Eval: goals = left|right of bin only (no middle / no behind-bin back).
     env.wrapper.include_middle_pass = False
-    env.wrapper.y_bound = 0.0  # disable |y| corridor
+    env.wrapper.y_bound = 0.0
     policy = build_policy(env, args, args.device)
     load_policy_checkpoint(policy, args.policy_path, args.device)
     env.policy_for_log = policy
@@ -490,6 +470,7 @@ def main():
     lines = [
         f"mode={args.mode}",
         f"policy={args.policy_path}",
+        f"algo=SAC",
         f"runs={n}",
         f"success={n_ok}/{n} ({100.0 * n_ok / max(n, 1):.1f}%)",
         f"stuck={n_stuck}",

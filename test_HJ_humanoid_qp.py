@@ -1,17 +1,17 @@
-"""Test HJ safety filter on Isaac G1 latent humanoid (switching / waypoint / safe-only).
+"""Test QP safety filter on Isaac G1 latent humanoid.
 
-Mirrors CarGoal ``test_cargoal_latent_specific_checkpoint.py`` but:
-  - nominal = WaypointNavController (not Dreamer)
-  - loads training ``policy.pth`` (actor+critic inside)
-  - critic-only gate: Q(z, a_nom) < threshold → SF takeover
-  - no WM dynamics rollout (can add later)
+Loads critic from ``train_HJ_humanoid_qp.py`` checkpoints. Control uses
+WaypointNavController as nominal + discrete QP filter (closest safe action to
+a_nom with Q >= threshold). Yaw free by default (match retrained Q).
+
+Cannot reuse ``test_HJ_humanoid.py`` (actor switching / safe_only).
 
 Usage (env_isaaclab)::
 
-  python test_HJ_humanoid.py --headless --visual_mode rtx_rgb \\
-    --dino_ckpt_dir C:\\ --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
-    --policy_path runs/ddpg_hj_humanoid/.../epoch_id_N/policy.pth \\
-    --mode switching --num_runs 5
+  python test_HJ_humanoid_qp.py --headless --visual_mode rtx_rgb \\
+    --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
+    --policy_path runs/qp_hj_humanoid/.../epoch_id_N/policy.pth \\
+    --mode QP --num_runs 5
 """
 
 from __future__ import annotations
@@ -33,14 +33,14 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("Test HJ safety filter on latent Humanoid (Isaac G1)")
+parser = argparse.ArgumentParser("Test QP HJ filter on latent Humanoid (Isaac G1)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument(
     "--dino_ckpt_dir",
     type=str,
-    default="C:\\",
-    help="Parent of encoder folder (e.g. C:\\ for C:\\wm_ckpt_18-27-17)",
+    default="/workspace",
+    help="Parent of encoder folder (e.g. /workspace for /workspace/wm_ckpt_18-27-17)",
 )
 parser.add_argument(
     "--dino_encoder",
@@ -65,21 +65,32 @@ parser.add_argument(
     "--policy_path",
     type=str,
     required=True,
-    help="Path to training checkpoint .../epoch_id_N/policy.pth",
+    help="Path to QP training checkpoint .../epoch_id_N/policy.pth",
 )
 parser.add_argument(
     "--mode",
     type=str,
-    default="switching",
-    choices=["switching", "waypoint_only", "safe_only"],
-    help="Controller mode (CarGoal: switching / pid_only / safe_only).",
+    default="QP",
+    choices=["QP", "waypoint_only"],
+    help="QP = discrete filter on critic; waypoint_only = no filter.",
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
     "--safety_threshold",
     type=float,
     default=0.0,
-    help="Switch to SF when Q(z, a_nom) < this (default 0).",
+    help="QP: intervene when Q(z, a_nom) < this (default 0).",
+)
+parser.add_argument(
+    "--qp_n_grid",
+    type=int,
+    default=21,
+    help="Grid resolution per axis for discrete QP (21³ if yaw free; 21² if --freeze_yaw).",
+)
+parser.add_argument(
+    "--freeze_yaw",
+    action="store_true",
+    help="Freeze yaw=0 in a_nom / QP grid (legacy). Default: yaw free.",
 )
 parser.add_argument(
     "--max_visual_steps",
@@ -88,10 +99,16 @@ parser.add_argument(
     help="Hard cap on Gym/HJ visual steps per episode.",
 )
 parser.add_argument(
+    "--goal_radius",
+    type=float,
+    default=0.05,
+    help="Reach goal when dist(robot, goal_xy) <= this (meters). Also stops robot.",
+)
+parser.add_argument(
     "--out_dir",
     type=str,
     default=None,
-    help="Where to save videos/summary (default: humanoid_test/<timestamp>).",
+    help="Where to save videos/summary (default: humanoid_test_qp/<timestamp>).",
 )
 parser.add_argument(
     "--save_video",
@@ -134,6 +151,7 @@ from PyHJ.utils.net.continuous import Actor, Critic
 
 from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
+from env.isaac.qp_filter import qp_filter_action_policy
 
 
 def args_type(default):
@@ -193,12 +211,98 @@ def _visual_to_uint8_hwc(visual) -> np.ndarray:
 
 
 def _video_frame(env: LatentHumanoidEnv, hj_val: float | None, l_val: float | None) -> np.ndarray:
+    """Full-res visual with top-left HJ / l overlay."""
     hwc = _visual_to_uint8_hwc(env.wrapper.get_raw_obs()["visual"])
     return env._overlay_metrics_hwc(hwc, hj_val, l_val)
 
 
+def _goal_xy(env: LatentHumanoidEnv) -> np.ndarray:
+    """Terminal goal = last waypoint (left/right of bin)."""
+    wps = np.asarray(env.wrapper.waypoints, dtype=np.float64)
+    if wps.ndim == 1:
+        return wps.reshape(2)
+    return wps[-1].reshape(2)
+
+
+def _robot_xy(env: LatentHumanoidEnv) -> np.ndarray:
+    return np.asarray(env.wrapper.get_robot_xy_local(), dtype=np.float64).reshape(2)
+
+
+def _obstacle_xy(env: LatentHumanoidEnv) -> np.ndarray:
+    xy = getattr(env.wrapper, "_blue_bin_xy", (3.5, 0.0))
+    return np.asarray([float(xy[0]), float(xy[1])], dtype=np.float64)
+
+
+def _dist_to_goal(env: LatentHumanoidEnv) -> float:
+    r = _robot_xy(env)
+    g = _goal_xy(env)
+    return float(np.hypot(r[0] - g[0], r[1] - g[1]))
+
+
+def _save_topdown_traj(
+    *,
+    out_path: Path,
+    traj: np.ndarray,
+    obstacle_xy: np.ndarray,
+    goal_xy: np.ndarray,
+    start_xy: np.ndarray | None = None,
+    goal_radius: float = 0.05,
+    title: str = "",
+) -> None:
+    """Top-down x–y plot: blue obstacle, goal, robot trajectory → PNG."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    traj = np.asarray(traj, dtype=np.float64).reshape(-1, 2)
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+    if traj.shape[0] > 0:
+        ax.plot(traj[:, 0], traj[:, 1], "-", color="0.25", linewidth=1.5, label="robot traj")
+        ax.scatter(traj[0, 0], traj[0, 1], c="green", s=40, zorder=3, label="start")
+        ax.scatter(traj[-1, 0], traj[-1, 1], c="orange", s=40, zorder=3, label="end")
+    if start_xy is not None:
+        ax.scatter(
+            float(start_xy[0]), float(start_xy[1]), c="green", s=40, zorder=3, marker="o"
+        )
+    ax.scatter(
+        float(obstacle_xy[0]),
+        float(obstacle_xy[1]),
+        c="blue",
+        s=80,
+        zorder=4,
+        label="obstacle",
+    )
+    ax.add_patch(
+        Circle(
+            (float(goal_xy[0]), float(goal_xy[1])),
+            float(goal_radius),
+            fill=False,
+            edgecolor="red",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"goal r={goal_radius:.2f}",
+        )
+    )
+    ax.scatter(
+        float(goal_xy[0]), float(goal_xy[1]), c="red", s=50, marker="*", zorder=4, label="goal"
+    )
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[INFO] Saved top-down traj: {out_path}")
+
+
 def build_policy(env: LatentHumanoidEnv, args, device: str):
-    """Rebuild avoid-DDPG policy to match training, then load policy.pth."""
+    """Rebuild avoid-DDPG shell to load policy.pth (critic used; actor unused)."""
     state_shape = env.observation_space.shape
     action_shape = env.action_space.shape
     max_action = 1.0
@@ -258,45 +362,6 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     print(f"[INFO] Loaded policy from {ckpt_path}")
 
 
-@torch.no_grad()
-def q_value(policy, z: np.ndarray, act_policy: np.ndarray, device: str) -> float:
-    """Q(z, a) with a in policy space [-1, 1]."""
-    z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
-    if z_t.ndim == 1:
-        z_t = z_t.unsqueeze(0)
-    a_t = torch.as_tensor(act_policy, dtype=torch.float32, device=device)
-    if a_t.ndim == 1:
-        a_t = a_t.unsqueeze(0)
-    q = policy.critic(z_t, a_t)
-    return float(q.reshape(-1)[0].item())
-
-
-@torch.no_grad()
-def safe_action_env(
-    policy,
-    z: np.ndarray,
-    device: str,
-    n_candidates: int = 64,
-) -> np.ndarray:
-    """Actor SF → env-space (vx, vy, yaw=0). Matches training yaw freeze."""
-    del n_candidates  # kept for CLI compat; actor policy does not sample
-    from PyHJ.data import Batch
-
-    z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
-    if z_t.ndim == 1:
-        z_t = z_t.unsqueeze(0)
-    batch = Batch(obs=z_t, info=Batch())
-    act_pol = policy(batch, model="actor").act
-    if isinstance(act_pol, torch.Tensor):
-        act_pol = act_pol.detach().cpu().numpy()
-    act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
-    if act_pol.size >= 3:
-        act_pol[2] = 0.0
-    act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
-    act_env[2] = 0.0
-    return act_env
-
-
 def simulate_one(
     env: LatentHumanoidEnv,
     policy,
@@ -304,7 +369,10 @@ def simulate_one(
     mode: str,
     device: str,
     safety_threshold: float,
+    qp_n_grid: int,
+    freeze_yaw: bool,
     max_visual_steps: int,
+    goal_radius: float,
     save_video: bool,
     out_dir: Path,
     run_id: int,
@@ -316,45 +384,94 @@ def simulate_one(
     if save_video:
         frames.append(_video_frame(env, hj_exec, h_s_last))
 
+    goal_xy = _goal_xy(env)
+    obstacle_xy = _obstacle_xy(env)
+    start_xy = _robot_xy(env)
+    traj: list[np.ndarray] = [start_xy.copy()]
+    zero_action = np.zeros(3, dtype=np.float32)
+
     hj_interventions = 0
     total_switches = 0
     constraint_violations = 0
+    fallback_maxq = 0
     min_hj_nom = float("inf")
     last_controller = None
     end_reason = None
+    step = -1
+
+    print(
+        f"[INFO] goal={goal_xy} obstacle={obstacle_xy} "
+        f"goal_radius={goal_radius:.3f} start={start_xy}"
+    )
 
     for step in range(max_visual_steps):
+        # Already inside goal ball → force stop and end (do not let QP keep pushing).
+        if _dist_to_goal(env) <= goal_radius:
+            action = zero_action
+            z, h_s, terminated, truncated, info = env.step(action)
+            h_s_last = float(h_s)
+            traj.append(_robot_xy(env))
+            if save_video:
+                hj_exec = env._hj_value(z, action_env=action.astype(np.float64))
+                frames.append(_video_frame(env, hj_exec, h_s_last))
+            end_reason = "all_waypoints"
+            print(
+                f"  step {step}: GOAL reached dist={_dist_to_goal(env):.3f} "
+                f"<= {goal_radius:.3f}; stop action=[0,0,0]"
+            )
+            break
+
         a_nom_env = env.compute_waypoint_nav_action()
         a_nom_pol = np.asarray(
             policy.map_action_inverse(a_nom_env), dtype=np.float32
         ).reshape(-1)
+        if freeze_yaw and a_nom_pol.size >= 3:
+            a_nom_pol[2] = 0.0
+        a_nom_env_use = np.asarray(policy.map_action(a_nom_pol), dtype=np.float32).reshape(3)
+        if freeze_yaw:
+            a_nom_env_use[2] = 0.0
 
         if mode == "waypoint_only":
-            action = a_nom_env
-            using_hj = False
-            q_nom = q_value(policy, z, a_nom_pol, device)
-        elif mode == "safe_only":
-            action = safe_action_env(policy, z, device)
-            using_hj = True
-            q_nom = q_value(policy, z, a_nom_pol, device)
-        else:  # switching
-            q_nom = q_value(policy, z, a_nom_pol, device)
-            if q_nom < safety_threshold:
-                action = safe_action_env(policy, z, device)
-                using_hj = True
+            action = a_nom_env_use
+            q_nom = float("nan")
+            with torch.no_grad():
+                z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
+                if z_t.ndim == 1:
+                    z_t = z_t.unsqueeze(0)
+                a_t = torch.as_tensor(a_nom_pol, dtype=torch.float32, device=device).unsqueeze(0)
+                q_nom = float(policy.critic(z_t, a_t).reshape(-1)[0].item())
+        else:  # QP
+            act_pol, qp_info = qp_filter_action_policy(
+                policy.critic,
+                z,
+                a_nom_pol,
+                safety_threshold=safety_threshold,
+                n_grid=qp_n_grid,
+                freeze_yaw=freeze_yaw,
+                yaw=0.0,
+                device=device,
+            )
+            q_nom = float(qp_info["q_nom"])
+            using_hj = bool(qp_info["intervened"])
+            if qp_info.get("fallback_maxq"):
+                fallback_maxq += 1
+            if using_hj:
+                action = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
+                if freeze_yaw:
+                    action[2] = 0.0
                 hj_interventions += 1
                 if last_controller == "waypoint":
                     total_switches += 1
-                last_controller = "hj"
+                last_controller = "qp"
                 if step < 30 or hj_interventions <= 5:
                     print(
-                        f"  step {step}: SF intervene Q(a_nom)={q_nom:.3f} "
-                        f"a_nom={a_nom_env} a_sf={action}"
+                        f"  step {step}: QP intervene Q(a_nom)={q_nom:.3f} "
+                        f"n_safe={qp_info['n_safe']} fallback={qp_info.get('fallback_maxq')} "
+                        f"a_nom={a_nom_env_use} a_qp={action}"
                     )
             else:
-                action = a_nom_env
-                using_hj = False
-                if last_controller == "hj":
+                action = a_nom_env_use
+                if last_controller == "qp":
                     total_switches += 1
                 last_controller = "waypoint"
 
@@ -362,6 +479,7 @@ def simulate_one(
 
         z, h_s, terminated, truncated, info = env.step(action)
         h_s_last = float(h_s)
+        traj.append(_robot_xy(env))
         if h_s < 0:
             constraint_violations += 1
 
@@ -371,8 +489,22 @@ def simulate_one(
             )
             frames.append(_video_frame(env, hj_exec, h_s_last))
 
+        # Reached goal this step → settle with zero cmd then end.
+        if _dist_to_goal(env) <= goal_radius:
+            z, h_s, _, _, info = env.step(zero_action)
+            h_s_last = float(h_s)
+            traj.append(_robot_xy(env))
+            if save_video:
+                hj_exec = env._hj_value(z, action_env=zero_action.astype(np.float64))
+                frames.append(_video_frame(env, hj_exec, h_s_last))
+            end_reason = "all_waypoints"
+            print(
+                f"  step {step}: GOAL reached dist={_dist_to_goal(env):.3f}; "
+                f"stop action=[0,0,0]"
+            )
+            break
+
         if terminated or truncated:
-            # info["end_reason"] is int code
             code = int(info.get("end_reason", 0))
             end_reason = {
                 0: "ongoing",
@@ -381,9 +513,29 @@ def simulate_one(
                 3: "max_steps",
                 4: "out_of_bounds",
             }.get(code, f"code_{code}")
+            # Env reported goal — still send a stop for video / residual velocity.
+            if end_reason == "all_waypoints":
+                z, h_s, _, _, info = env.step(zero_action)
+                h_s_last = float(h_s)
+                traj.append(_robot_xy(env))
+                if save_video:
+                    hj_exec = env._hj_value(z, action_env=zero_action.astype(np.float64))
+                    frames.append(_video_frame(env, hj_exec, h_s_last))
             break
     else:
         end_reason = "max_visual_steps"
+
+    traj_arr = np.stack(traj, axis=0) if traj else np.zeros((0, 2))
+    traj_path = out_dir / f"{mode}_run{run_id:02d}_traj.png"
+    _save_topdown_traj(
+        out_path=traj_path,
+        traj=traj_arr,
+        obstacle_xy=obstacle_xy,
+        goal_xy=goal_xy,
+        start_xy=start_xy,
+        goal_radius=goal_radius,
+        title=f"{mode} run{run_id:02d} end={end_reason}",
+    )
 
     video_path = None
     if save_video and frames:
@@ -406,15 +558,19 @@ def simulate_one(
         "hj_interventions": hj_interventions,
         "total_switches": total_switches,
         "constraint_violations": constraint_violations,
+        "fallback_maxq": fallback_maxq,
         "min_q_nom": min_hj_nom if np.isfinite(min_hj_nom) else None,
         "final_h_s": h_s_last,
+        "final_dist_goal": _dist_to_goal(env),
         "stuck": float(info.get("stuck", 0.0)),
         "video": video_path,
+        "traj_png": str(traj_path),
     }
     print(
         f"[RUN {run_id}] mode={mode} end={end_reason} success={success} "
         f"steps={result['visual_steps']} interventions={hj_interventions} "
-        f"violations={constraint_violations} minQ={result['min_q_nom']}"
+        f"violations={constraint_violations} fallback_maxq={fallback_maxq} "
+        f"minQ={result['min_q_nom']} dist_goal={result['final_dist_goal']:.3f}"
     )
     return result
 
@@ -431,7 +587,7 @@ def main():
         torch.cuda.manual_seed_all(int(getattr(args, "seed", 0)))
 
     stamp = datetime.now().strftime("%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test") / stamp
+    out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test_qp") / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] mode={args.mode} policy={args.policy_path}")
@@ -445,7 +601,6 @@ def main():
     for p in wm.parameters():
         p.requires_grad = False
 
-    # No wandb video spam during closed-loop test.
     env = LatentHumanoidEnv(
         args,
         wm,
@@ -458,6 +613,10 @@ def main():
     # Eval: goals = left|right of bin only (no middle / no behind-bin back).
     env.wrapper.include_middle_pass = False
     env.wrapper.y_bound = 0.0  # disable |y| corridor
+    goal_radius = float(args.goal_radius)
+    env.wrapper.waypoint_stop_thresh = goal_radius
+    env.waypoint_nav.stop_thresh = goal_radius
+    print(f"[INFO] goal_radius={goal_radius} (env stop_thresh synced)")
     policy = build_policy(env, args, args.device)
     load_policy_checkpoint(policy, args.policy_path, args.device)
     env.policy_for_log = policy
@@ -472,7 +631,10 @@ def main():
                 mode=args.mode,
                 device=args.device,
                 safety_threshold=float(args.safety_threshold),
+                qp_n_grid=int(args.qp_n_grid),
+                freeze_yaw=bool(args.freeze_yaw),
                 max_visual_steps=int(args.max_visual_steps),
+                goal_radius=goal_radius,
                 save_video=save_video,
                 out_dir=out_dir,
                 run_id=run_id,
@@ -485,6 +647,7 @@ def main():
     n_oob = sum(1 for r in results if r["end_reason"] == "out_of_bounds")
     mean_int = float(np.mean([r["hj_interventions"] for r in results])) if n else 0.0
     mean_viol = float(np.mean([r["constraint_violations"] for r in results])) if n else 0.0
+    mean_fb = float(np.mean([r["fallback_maxq"] for r in results])) if n else 0.0
 
     summary_path = out_dir / f"summary_{args.mode}.txt"
     lines = [
@@ -494,8 +657,10 @@ def main():
         f"success={n_ok}/{n} ({100.0 * n_ok / max(n, 1):.1f}%)",
         f"stuck={n_stuck}",
         f"out_of_bounds={n_oob}",
-        f"mean_hj_interventions={mean_int:.2f}",
+        f"mean_qp_interventions={mean_int:.2f}",
         f"mean_constraint_violations={mean_viol:.2f}",
+        f"mean_fallback_maxq={mean_fb:.2f}",
+        f"goal_radius={float(args.goal_radius)}",
         "",
         "per-run:",
     ]
@@ -503,7 +668,9 @@ def main():
         lines.append(
             f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
             f"steps={r['visual_steps']} int={r['hj_interventions']} "
-            f"viol={r['constraint_violations']} minQ={r['min_q_nom']}"
+            f"viol={r['constraint_violations']} fallback={r['fallback_maxq']} "
+            f"minQ={r['min_q_nom']} dist_goal={r.get('final_dist_goal')} "
+            f"traj={r.get('traj_png')}"
         )
     text = "\n".join(lines) + "\n"
     summary_path.write_text(text, encoding="utf-8")

@@ -16,6 +16,7 @@ from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     PASS_SIDE_CYCLE,
+    PASS_SIDE_TRAIN,
     generate_random_waypoint_sequence,
     waypoints_to_list,
 )
@@ -26,7 +27,7 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
     "blue_bin_0": {
         "default_z": 0.5,
         "rot": (0.5, 0.5, 0.5, 0.5),
-        "spawn_xy": (2.0, 0.0),
+        "spawn_xy": (3.5, 0.0),
     },
 }
 
@@ -128,10 +129,11 @@ class IsaacG1Wrapper:
         collision_force_threshold: float = 0.1,
         stuck_contact_steps: int = 50,
         waypoint_stop_thresh: float = 0.1,
-        # Soft corridor about the bin at (2, 0): leave room to pass left/right.
-        y_bound: float = 1.5,
+        # Soft corridor about the bin at (3.5, 0): leave room to pass left/right.
+        y_bound: float = 0.0,
         # Far end of the aisle: x >= this truncates (same as y OOB).
-        x_bound_max: float = 4.0,
+        # Bin at x=3.5 → keep ~2m margin past bin (was 4.0 when bin was at 2.0).
+        x_bound_max: float = 5.5,
         trajectory_regions: dict[str, dict[str, Any]] | None = None,
         trajectory_region_sequence: Sequence[str | tuple[str, ...]] | None = None,
         max_speed: float = 0.5,
@@ -151,19 +153,19 @@ class IsaacG1Wrapper:
                 float(getattr(args_cli, "bin_y", OBSTACLE_SPECS["blue_bin_0"]["spawn_xy"][1])),
             )
         self._blue_bin_xy = blue_bin_xy
-        # Buffer: keep this fixed pose. Training: resample on x=2, y∈[-y_bound,y_bound].
+        # Buffer: keep bin fixed. Training: resample y on bin x (3.5) within obstacle_y_range.
         self._blue_bin_xy_fixed = (float(blue_bin_xy[0]), float(blue_bin_xy[1]))
         self.randomize_obstacle = False
-        # Training-only: resample bin y on this interval (not y_bound).
         self.obstacle_y_range = (-0.5, 0.5)
         self.env_prim_root = env_prim_root
         self.lidar_distance_threshold = lidar_distance_threshold
         self.collision_force_threshold = collision_force_threshold
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
+        # y_bound <= 0 disables the soft |y| corridor (default: disabled).
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
         self.x_bound_max = float(getattr(args_cli, "x_bound_max", x_bound_max))
-        # Copy defaults (front = fixed (0,0)).
+        # Copy defaults (start=(0,0), front=(1.5,0), then left|right|middle).
         if trajectory_regions is not None:
             self.trajectory_regions = trajectory_regions
         else:
@@ -183,9 +185,11 @@ class IsaacG1Wrapper:
             if trajectory_region_sequence is not None
             else DEFAULT_TRAJECTORY_REGION_SEQUENCE
         )
-        # Buffer / reset: cycle left → right → middle (straight into bin).
+        # Buffer: cycle left → right → middle. Train/test: left/right goals only.
         self.alternate_left_right = True
-        self._pass_side_toggle = 0  # indexes PASS_SIDE_CYCLE
+        # True only during buffer warm-up collision demos; test should set False.
+        self.include_middle_pass = True
+        self._pass_side_toggle = 0  # indexes pass-side cycle
         self.max_speed = max_speed
 
         if demos_dir is None:
@@ -376,8 +380,8 @@ class IsaacG1Wrapper:
         self._setup_contact_indices()
 
         self.commands = torch.zeros(1, 3, device=self.device)
-        self.waypoint = np.array([2.0, 1.0], dtype=np.float64)
-        self.waypoints = np.array([[2.0, 1.0]], dtype=np.float64)
+        self.waypoint = np.array([3.5, 1.0], dtype=np.float64)
+        self.waypoints = np.array([[3.5, 1.0]], dtype=np.float64)
         self.waypoint_region_names: list[str] = []
         self.current_waypoint_idx = 0
         self._link_stuck_counters: np.ndarray | None = None
@@ -420,16 +424,33 @@ class IsaacG1Wrapper:
             )
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
-        """Sample front → left|right|middle → back; cycle sides across episodes."""
+        """Sample start → front → left|right|(middle) (no behind-bin goal).
+
+        - ``include_middle_pass=True`` (QP critic / buffer): left|right|middle.
+          Random when ``randomize_obstacle`` else cycle (buffer).
+        - ``include_middle_pass=False`` (actor train / test): left|right only.
+        """
         sequence: list[str | tuple[str, ...]] = []
         for entry in self.trajectory_region_sequence:
             if (
                 self.alternate_left_right
                 and isinstance(entry, tuple)
-                and set(entry) == set(PASS_SIDE_CYCLE)
+                and set(entry) >= set(PASS_SIDE_TRAIN)
             ):
-                side = PASS_SIDE_CYCLE[self._pass_side_toggle % len(PASS_SIDE_CYCLE)]
-                self._pass_side_toggle += 1
+                if self.include_middle_pass:
+                    # Critic-only: collision demos (middle) are useful; no actor to spoil.
+                    if self.randomize_obstacle:
+                        side = str(rng.choice(PASS_SIDE_CYCLE))
+                    else:
+                        side = PASS_SIDE_CYCLE[
+                            self._pass_side_toggle % len(PASS_SIDE_CYCLE)
+                        ]
+                        self._pass_side_toggle += 1
+                elif self.randomize_obstacle:
+                    side = str(rng.choice(PASS_SIDE_TRAIN))
+                else:
+                    side = PASS_SIDE_TRAIN[self._pass_side_toggle % len(PASS_SIDE_TRAIN)]
+                    self._pass_side_toggle += 1
                 sequence.append(side)
             else:
                 sequence.append(entry)
@@ -481,11 +502,11 @@ class IsaacG1Wrapper:
         return False
 
     def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
-        """Reset sim, place bin, waypoints, spawn at fixed front (0, 0).
+        """Reset sim, place bin, waypoints; spawn at first waypoint (default start=(0,0)).
 
         Obstacle: fixed at ``_blue_bin_xy_fixed`` when ``randomize_obstacle=False``
-        (buffer warm-up). When True (training), resample y on x=2 within
-        ``obstacle_y_range`` (default [-0.5, 0.5]); pose stays fixed in-episode.
+        (buffer warm-up). When True (training), resample y on bin x (default 3.5)
+        within ``obstacle_y_range`` (default [-0.5, 0.5]); pose stays fixed in-episode.
         """
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -713,7 +734,9 @@ class IsaacG1Wrapper:
         )
 
     def is_out_of_y_bounds(self) -> bool:
-        """True if env-local |y| exceeds the soft corridor (default ±1.5 m)."""
+        """True if env-local |y| exceeds soft corridor. Disabled when y_bound <= 0."""
+        if self.y_bound <= 0.0:
+            return False
         xy = self.get_robot_xy_local()
         return bool(abs(float(xy[1])) > self.y_bound)
 
@@ -723,7 +746,7 @@ class IsaacG1Wrapper:
         return bool(float(xy[0]) >= self.x_bound_max)
 
     def is_out_of_bounds(self) -> bool:
-        """Soft corridor: |y| > y_bound or x >= x_bound_max."""
+        """Soft bounds: optional |y| corridor and/or x >= x_bound_max."""
         return self.is_out_of_y_bounds() or self.is_out_of_x_bounds()
 
     def get_full_state(self) -> np.ndarray:

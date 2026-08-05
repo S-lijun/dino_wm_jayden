@@ -32,17 +32,31 @@ fi
 
 cd "${PYHJ_ROOT}"
 
-# Idempotent: if already patched, skip; else apply.
-if grep -q "LatentHumanoidEnv" PyHJ/__init__.py 2>/dev/null; then
+is_fully_patched() {
+  # All markers must be present; a partial apply must NOT count as done.
+  grep -q "LatentHumanoidEnv" PyHJ/__init__.py 2>/dev/null \
+    && grep -q "def __getattr__" PyHJ/data/__init__.py 2>/dev/null \
+    && grep -q "from PyHJ.policy.base import BasePolicy" PyHJ/data/collector.py 2>/dev/null \
+    && grep -q "from PyHJ.data.batch import Batch" PyHJ/policy/base.py 2>/dev/null \
+    && grep -q "load_plugin_envs.*removed" PyHJ/reach_rl_gym_envs/__init__.py 2>/dev/null
+}
+
+if is_fully_patched; then
   echo "[INFO] Patch already present; skipping apply."
 else
-  echo "[INFO] Applying ${PATCH_FILE}"
-  # Prefer git apply; fall back to patch(1).
-  if git apply --check "${PATCH_FILE}" 2>/dev/null; then
-    git apply "${PATCH_FILE}"
-  else
-    patch -p1 < "${PATCH_FILE}"
+  # Recover from a previous partial apply (e.g. malformed patch left __init__ only).
+  if grep -q "LatentHumanoidEnv" PyHJ/__init__.py 2>/dev/null; then
+    echo "[WARN] Partial patch detected; resetting tracked PyHJ files to HEAD."
+    git checkout -- PyHJ
   fi
+
+  echo "[INFO] Applying ${PATCH_FILE}"
+  if ! git apply --check "${PATCH_FILE}"; then
+    echo "[ERROR] Patch does not apply cleanly to ${PYHJ_ROOT}."
+    echo "        Re-clone or update the patch, then re-run."
+    exit 1
+  fi
+  git apply "${PATCH_FILE}"
 fi
 
 echo "[INFO] pip install -e . --no-deps"

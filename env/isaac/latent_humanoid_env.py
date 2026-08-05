@@ -18,7 +18,7 @@ from env.isaac.waypoint_utils import (
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
 DEFAULT_VISUAL_FPS = 15.0
-# 1500 sim steps @ dt=0.005 ≈ 7.5s — too short to finish front→side→back on foot.
+# 1500 sim steps @ dt=0.005 ≈ 7.5s — too short to finish front→left/right on foot.
 # ~8000 ≈ 40s wall-clock sim time at 0.5 m/s with turns.
 DEFAULT_MAX_EPISODE_SIM_STEPS = 8000
 DEFAULT_WANDB_VIDEO_EVERY = 1
@@ -34,15 +34,16 @@ class LatentHumanoidEnv(gym.Env):
       sample time, then encode visual+proprio once (1:1 with WM timeline).
 
     Episode ends (not based on safety cost ``h_s``):
-    - all waypoints reached
+    - all waypoints reached (goal = left or right of the bin; no behind-bin goal)
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
     - sim-step count hits ``max_episode_steps`` (default 8000 control steps)
-    - soft Y corridor: |y| > y_bound (default 1.5). Truncates only — does **not**
-      change ``h_s`` (not treated as collision). Cuts sparse flee trajectories.
-    - soft X far wall: x >= x_bound_max (default 4.0). Same truncate-only behavior.
+    - optional soft Y corridor: |y| > y_bound when y_bound > 0 (default disabled).
+      Truncates only — does **not** change ``h_s``.
+    - soft X far wall: x >= x_bound_max (default 5.5). Same truncate-only behavior.
 
-    Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` is the step
+    Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` (m) is the step
     cost (<0 unsafe, >0 safe) but does **not** end the episode.
+    Waypoints: start=(0,0) → front=(1.5,0) → left|right|(middle); bin at (3.5,0).
     """
 
     metadata = {"render_modes": []}
@@ -97,6 +98,13 @@ class LatentHumanoidEnv(gym.Env):
         self.policy_for_log = None
         # Shared dict with trainer: {"env_step": int, "update": int}
         self.log_state = None
+        # Per-step wandb scalars (safety/l, safety/hj). Disable during buffer
+        # warm-up — wandb.log can stall Isaac's first RTX step when the service
+        # is wedged after a killed run.
+        self.log_rollout_to_wandb = True
+        # Print timing for the first few visual steps (diagnose "stuck" collects).
+        self.debug_step_timing = False
+        self._debug_steps_left = 0
 
         self._episode_sim_step = 0
         self._episode_visual_step = 0
@@ -129,7 +137,8 @@ class LatentHumanoidEnv(gym.Env):
             f"sim_dt={self.sim_dt:.6f} (~{1.0 / self.sim_dt:.1f} Hz), "
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
-            f"y_bound=±{self.wrapper.y_bound}, x_bound_max={self.wrapper.x_bound_max} "
+            f"y_bound={'disabled' if self.wrapper.y_bound <= 0 else f'±{self.wrapper.y_bound}'}, "
+            f"x_bound_max={self.wrapper.x_bound_max} "
             f"(OOB → truncate only, no h_s penalty), "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
@@ -144,9 +153,13 @@ class LatentHumanoidEnv(gym.Env):
         print(
             "[LatentHumanoidEnv] trajectory regions "
             f"{ {k: _region_summary(v) for k, v in self.wrapper.trajectory_regions.items()} }; "
-            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE}; "
+            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE} "
+            f"(goal=left|right|middle; no back); "
+            f"pass-side: include_middle_pass→left|right|middle "
+            f"(QP critic train/buffer), else left|right (actor/test); "
             f"bin FIXED in buffer, randomized in training "
-            f"(x=2, y∈{tuple(self.wrapper.obstacle_y_range)})"
+            f"(x={float(self.wrapper._blue_bin_xy_fixed[0]):.1f}, "
+            f"y∈{tuple(self.wrapper.obstacle_y_range)})"
         )
 
         self.observation_space = Box(
@@ -166,6 +179,14 @@ class LatentHumanoidEnv(gym.Env):
     @randomize_obstacle.setter
     def randomize_obstacle(self, value: bool) -> None:
         self.wrapper.randomize_obstacle = bool(value)
+
+    @property
+    def include_middle_pass(self) -> bool:
+        return bool(self.wrapper.include_middle_pass)
+
+    @include_middle_pass.setter
+    def include_middle_pass(self, value: bool) -> None:
+        self.wrapper.include_middle_pass = bool(value)
 
     def _reset_timers(self) -> None:
         self._episode_sim_step = 0
@@ -211,23 +232,38 @@ class LatentHumanoidEnv(gym.Env):
             arr = np.repeat(arr, 3, axis=-1)
         return arr[..., :3]
 
-    def _hj_value(self, z: np.ndarray) -> float | None:
-        """Q(z, a*) with a* = argmax over critic-sampled candidates (no actor)."""
+    def _hj_value(
+        self,
+        z: np.ndarray,
+        action_env: np.ndarray | None = None,
+    ) -> float | None:
+        """Overlay HJ = Q(z, a) with a single critic forward (cheap).
+
+        Prefer the action actually sent to the env (env-space → policy-space).
+        Do **not** run critic action-sampling here — that path is for control /
+        Bellman only, and calling it every video frame OOMs Isaac RTX on 24GB.
+        """
         policy = self.policy_for_log
         if policy is None:
             return None
         try:
-            from env.isaac.critic_select import select_action_max_q_numpy
-
-            n = int(getattr(policy, "_critic_action_samples", 64))
-            _, q = select_action_max_q_numpy(
-                policy.critic,
-                z,
-                act_dim=3,
-                n_candidates=n,
-                device=self.device,
-            )
-            return float(q)
+            with torch.no_grad():
+                z_t = torch.as_tensor(z, dtype=torch.float32, device=self.device)
+                if z_t.ndim == 1:
+                    z_t = z_t.unsqueeze(0)
+                if action_env is not None:
+                    act_env = np.asarray(action_env, dtype=np.float64).reshape(1, -1)
+                    act_pol = policy.map_action_inverse(act_env)
+                    act_t = torch.as_tensor(
+                        act_pol, dtype=torch.float32, device=self.device
+                    )
+                else:
+                    # Reset frame: no action yet — score the zero policy action.
+                    act_t = torch.zeros(
+                        z_t.shape[0], 3, device=self.device, dtype=torch.float32
+                    )
+                q = policy.critic(z_t, act_t)
+                return float(q.reshape(-1)[0].item())
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] HJ value compute failed: {exc}")
             return None
@@ -240,15 +276,18 @@ class LatentHumanoidEnv(gym.Env):
         bump_env_step: bool = True,
     ) -> None:
         """One wandb.log per env transition; x-axis is trainer/env_step."""
+        # Always bump the shared step counter (trainer x-axis), even if wandb is off.
+        if self.log_state is None:
+            self.log_state = {"env_step": 0, "update": 0}
+        if bump_env_step:
+            self.log_state["env_step"] = int(self.log_state.get("env_step", 0)) + 1
+        if not self.log_rollout_to_wandb:
+            return
         try:
             import wandb
 
             if wandb.run is None:
                 return
-            if self.log_state is None:
-                self.log_state = {"env_step": 0, "update": 0}
-            if bump_env_step:
-                self.log_state["env_step"] = int(self.log_state.get("env_step", 0)) + 1
             step = int(self.log_state["env_step"])
             payload: dict[str, float] = {
                 "trainer/env_step": float(step),
@@ -272,8 +311,8 @@ class LatentHumanoidEnv(gym.Env):
     def _overlay_metrics_hwc(
         self, hwc: np.ndarray, hj_val: float | None, l_val: float | None
     ) -> np.ndarray:
-        """Burn HJ / l text into an HxWxC uint8 frame (no opaque background)."""
-        from PIL import ImageDraw
+        """Burn HJ / l text into top-left of an HxWxC uint8 frame."""
+        from PIL import ImageDraw, ImageFont
 
         img = Image.fromarray(hwc)
         draw = ImageDraw.Draw(img)
@@ -284,13 +323,25 @@ class LatentHumanoidEnv(gym.Env):
             lines.append(f"l {l_val:.2f}")
         if not lines:
             return hwc
-        y = 2
+        # Scale font with frame height (small wandb thumbs vs full RTX test videos).
+        font_size = max(14, int(round(hwc.shape[0] * 0.045)))
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
+            )
+        except OSError:
+            try:
+                font = ImageFont.load_default(size=font_size)
+            except TypeError:
+                font = ImageFont.load_default()
+        line_h = font_size + max(2, font_size // 6)
+        y = 4
+        x = 4
         for line in lines:
-            # Thin dark outline for readability; leave pixels behind visible.
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                draw.text((2 + dx, y + dy), line, fill=(0, 0, 0))
-            draw.text((2, y), line, fill=(255, 60, 60))
-            y += 12
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1)):
+                draw.text((x + dx, y + dy), line, fill=(0, 0, 0), font=font)
+            draw.text((x, y), line, fill=(255, 60, 60), font=font)
+            y += line_h
         return np.asarray(img, dtype=np.uint8)
 
     def _resize_frame_chw(
@@ -310,8 +361,12 @@ class LatentHumanoidEnv(gym.Env):
 
     def _start_episode_recording(self) -> None:
         self._episode_frames = []
-        # Always record when video logging is enabled (every episode).
-        self._record_this_episode = self.wandb_video_every > 0
+        # Record every N finished-episode boundaries (N=self.wandb_video_every).
+        # e.g. N=5 → episodes starting at finished=0,5,10,...
+        every = int(self.wandb_video_every)
+        self._record_this_episode = every > 0 and (
+            int(self._finished_episodes) % every == 0
+        )
 
     def _append_frame(
         self,
@@ -382,19 +437,36 @@ class LatentHumanoidEnv(gym.Env):
 
     def step(self, action):
         """Hold ``action`` across sim substeps until the next 15 fps visual sample."""
+        import time as _time
+
         # Continuous margin: smaller = more dangerous → aggregate with min.
         h_s = float("inf")
         stuck = False
         end_reason = None
         step_info: dict[str, Any] = {}
+        dbg = bool(self.debug_step_timing) and int(self._debug_steps_left) > 0
+        t_enter = _time.time() if dbg else 0.0
+        if dbg:
+            print(
+                f"[LatentHumanoidEnv] step enter visual={self._episode_visual_step} "
+                f"sim={self._episode_sim_step}",
+                flush=True,
+            )
 
         # Run control-rate physics until we hit the next visual sample time
         # (same gating idea as collect_humanoid_dataset.subsample_frame_indices).
         while True:
+            if dbg and self._episode_sim_step == 0:
+                print("[LatentHumanoidEnv] first apply_velocity_command...", flush=True)
             _, _isaac_terminated, _, step_info = self.wrapper.apply_velocity_command(action)
             del _isaac_terminated
             self._episode_sim_step += 1
             sim_time_s = self._episode_sim_step * self.sim_dt
+            if dbg and self._episode_sim_step == 1:
+                print(
+                    f"[LatentHumanoidEnv] first sim step done in {_time.time() - t_enter:.1f}s",
+                    flush=True,
+                )
 
             h_s = min(h_s, float(self.wrapper.calculate_cost()))
             stuck = stuck or bool(step_info.get("stuck", False))
@@ -418,13 +490,27 @@ class LatentHumanoidEnv(gym.Env):
                 break
 
         self._episode_visual_step += 1
+        if dbg:
+            print(
+                f"[LatentHumanoidEnv] physics done sim={self._episode_sim_step} "
+                f"({_time.time() - t_enter:.1f}s); reading RTX+encode...",
+                flush=True,
+            )
         obs = self.wrapper.get_raw_obs()
         z_next = self.encode(obs)
-        hj_val = self._hj_value(z_next)
+        # Q(z, a_executed) — same cost as the old actor-based overlay.
+        hj_val = self._hj_value(z_next, action_env=np.asarray(action, dtype=np.float64))
         # out_of_bounds: truncate only (stop collecting sparse flee data). Do NOT
         # rewrite h_s — OOB is not a collision / not a safety failure label.
         self._log_rollout_metrics(h_s, hj_val, bump_env_step=True)
         self._append_frame(obs, hj_val=hj_val, l_val=h_s)
+        if dbg:
+            print(
+                f"[LatentHumanoidEnv] step exit in {_time.time() - t_enter:.1f}s "
+                f"h_s={h_s:.3f}",
+                flush=True,
+            )
+            self._debug_steps_left = max(0, int(self._debug_steps_left) - 1)
 
         terminated = False
         truncated = end_reason is not None

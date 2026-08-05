@@ -1,4 +1,11 @@
-"""DDPG HJ safety-filter training on Isaac G1 latent space."""
+"""Critic-only HJ training for QP safety filter on Isaac G1 latent space.
+
+Does NOT train a DDPG actor for control. Collects with WaypointNavController,
+fits the avoid critic, and saves ``policy.pth`` (critic used at test time by
+``test_HJ_humanoid_qp.py`` discrete QP filter).
+
+Does not modify ``train_HJ_humanoid.py`` (DDPG actor path).
+"""
 
 import argparse
 import os
@@ -17,14 +24,14 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("DDPG HJ on DINO latent Humanoid (Isaac G1)")
+parser = argparse.ArgumentParser("QP/critic HJ on DINO latent Humanoid (Isaac G1)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument(
     "--dino_ckpt_dir",
     type=str,
-    default="/storage1/sibai/Active/ihab/research_new/checkpt_dino/outputs2/cargoal",
-    help="Where to find the DINO-WM checkpoints",
+    default="/workspace",
+    help="Parent dir of the WM run folder (joins with --dino_encoder)",
 )
 parser.add_argument(
     "--config",
@@ -40,8 +47,8 @@ parser.add_argument(
 parser.add_argument(
     "--dino_encoder",
     type=str,
-    default="dino",
-    help="Encoder subfolder under dino_ckpt_dir",
+    default="wm_ckpt_18-27-17",
+    help="Encoder / WM run folder under dino_ckpt_dir",
 )
 parser.add_argument("--latent_h", default=False, action="store_true")
 parser.add_argument(
@@ -63,8 +70,11 @@ parser.add_argument(
 parser.add_argument(
     "--wandb_video_every",
     type=int,
-    default=1,
-    help="Upload a rollout video to wandb every N finished episodes (0 disables).",
+    default=5,
+    help=(
+        "Upload a rollout video to wandb every N finished episodes after buffer "
+        "warm-up (0=off; default 5). Buffer warm-up never records video."
+    ),
 )
 parser.add_argument(
     "--y_bound",
@@ -78,41 +88,25 @@ parser.add_argument(
     default=1000,
     help=(
         "After buffer warm-up collect, run this many critic-only updates "
-        "(policy.warmup=True, actor frozen) before joint training."
-    ),
-)
-parser.add_argument(
-    "--actor_bc_warmup_updates",
-    type=int,
-    default=0,
-    help=(
-        "Optional: after critic warm-up, behavior-clone the actor to buffer "
-        "actions for this many updates before joint RL. Default 0 (off)."
+        "before the epoch loop (actor stays frozen throughout)."
     ),
 )
 parser.add_argument(
     "--critic_action_samples",
     type=int,
     default=64,
-    help="Deprecated (critic-sample control removed). Kept for CLI compat; ignored.",
+    help="Candidates for Bellman next-action max_a Q (full vx,vy,yaw unless --freeze_yaw).",
 )
 parser.add_argument(
-    "--action_reg_coef",
+    "--train_collect_noise",
     type=float,
-    default=0.0,
-    help=(
-        "Weight λ_nom for MSE(actor, waypoint a_nom) in policy space [-1,1]. "
-        "0 disables. Start around 0.1; pulls SF toward nominal vx/vy/yaw."
-    ),
+    default=0.1,
+    help="Gaussian noise sigma on waypoint cmds during post-buffer collect (policy space).",
 )
 parser.add_argument(
-    "--boundary_reg_coef",
-    type=float,
-    default=0.5,
-    help=(
-        "Extra penalty when |act| > 0.8 (near tanh corners ±1). "
-        "Set 0 to disable."
-    ),
+    "--freeze_yaw",
+    action="store_true",
+    help="Freeze yaw=0 in collect + Bellman max_a (legacy). Default: yaw free.",
 )
 # --device is already registered by AppLauncher.add_app_launcher_args()
 
@@ -128,7 +122,7 @@ if not bool(getattr(args_cli, "headless", False)):
     print(
         "[WARN] Running WITHOUT --headless. GUI + rtx_rgb will freeze as "
         "'Not Responding' on Windows. Keep rtx_rgb, but MUST add --headless:\n"
-        "  python train_HJ_humanoid.py --headless --visual_mode rtx_rgb ..."
+        "  python train_HJ_humanoid_qp.py --headless --visual_mode rtx_rgb ..."
     )
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -156,8 +150,10 @@ from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import Actor, Critic
 from PyHJ.policy import avoid_DDPGPolicy_annealing
 
-# Progress bar: only actor/critic. Reg / sat metrics still go to wandb via logger.
-_PROGRESS_BAR_LOSS_KEYS = ("loss/actor", "loss/critic")
+from env.isaac.critic_select import select_actions_max_q
+
+# Progress bar: critic only (actor unused for QP deployment).
+_PROGRESS_BAR_LOSS_KEYS = ("loss/critic",)
 
 
 def _log_update_data_bar_filter(self, data, losses):
@@ -252,6 +248,15 @@ def main():
     args.total_episodes = int(args.total_episodes)
     args.batch_size_pyhj = int(args.batch_size_pyhj)
     args.buffer_size = int(args.buffer_size)
+    # Latent dim ~74k; buffer_size=40k ⇒ tens of GiB and looks "hung" on first add.
+    # Critic-only QP does not need a huge buffer.
+    if args.buffer_size > 10000:
+        print(
+            f"[INFO] Capping buffer_size {args.buffer_size} → 10000 "
+            "(large latent; first buffer.add otherwise allocates ~20GiB+ and stalls).",
+            flush=True,
+        )
+        args.buffer_size = 10000
     args.dino_ckpt_dir = os.path.join(args.dino_ckpt_dir, args.dino_encoder)
     args.device = torch_device
 
@@ -274,19 +279,20 @@ def main():
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
     wandb.init(
-        project="ddpg-hj-latent-humanoid",
-        name=f"ddpg-{args.dino_encoder}-{timestamp}",
+        project="qp-hj-latent-humanoid",
+        name=f"qp-critic-{args.dino_encoder}-{timestamp}",
         config=vars(args),
     )
-    # All rollout + loss curves share env_step as x-axis.
+    # Rollout curves vs env_step; loss curves vs update (env_step freezes during
+    # critic-only warmup — binding loss to env_step makes wandb Charts look empty).
     wandb.define_metric("trainer/env_step")
     wandb.define_metric("trainer/update")
     wandb.define_metric("safety/*", step_metric="trainer/env_step")
     wandb.define_metric("actor_action/*", step_metric="trainer/env_step")
     wandb.define_metric("rollout/*", step_metric="trainer/env_step")
-    wandb.define_metric("loss/*", step_metric="trainer/env_step")
-    wandb.define_metric("train/*", step_metric="trainer/env_step")
-    writer = SummaryWriter(log_dir=f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}/logs")
+    wandb.define_metric("loss/*", step_metric="trainer/update")
+    wandb.define_metric("train/*", step_metric="trainer/update")
+    writer = SummaryWriter(log_dir=f"runs/qp_hj_humanoid/{args.dino_encoder}-{timestamp}/logs")
     # update_interval=1: log every grad step (default 1000 would skip almost everything).
     wb_logger = WandbLogger(update_interval=1, train_interval=10**9, test_interval=10**9)
     wb_logger.load(writer)
@@ -295,6 +301,16 @@ def main():
     ckpt_dir = Path(args.dino_ckpt_dir)
     hydra_cfg = ckpt_dir / "hydra.yaml"
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
+    if not hydra_cfg.is_file():
+        raise FileNotFoundError(
+            f"WM hydra.yaml not found: {hydra_cfg}\n"
+            f"  Expected layout: <dino_ckpt_dir>/<dino_encoder>/hydra.yaml\n"
+            f"  On this machine use e.g. --dino_ckpt_dir /workspace "
+            f"--dino_encoder wm_ckpt_18-27-17"
+        )
+    if not snapshot.is_file():
+        raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
+    print(f"[INFO] Loading WM from {ckpt_dir}")
     train_cfg = OmegaConf.load(str(hydra_cfg))
     wm = load_model(snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device)
     for p in wm.parameters():
@@ -376,15 +392,15 @@ def main():
         actor_optim=actor_optim,
         actor_gradient_steps=args.actor_gradient_steps,
     )
-    # PyHJ default new_expl=True replaces acts with random when Q(rand)>=0;
-    # that biases the buffer and worsens actor collapse. Use standard Gaussian noise.
+    # Critic-only training for QP deployment (actor kept in ckpt but frozen).
     policy.new_expl = False
-    action_reg_coef = float(args.action_reg_coef)  # λ_nom: MSE to waypoint a_nom
-    boundary_reg_coef = float(args.boundary_reg_coef)
-    policy._attach_act_nom = False  # True only inside collector.collect
+    n_act_samples = int(getattr(args, "critic_action_samples", 64))
+    act_dim = int(np.prod(action_shape))
+    train_collect_noise = float(getattr(args, "train_collect_noise", 0.1))
+    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
+    bellman_fixed_dims = {2: 0.0} if freeze_yaw else None
 
     def _zero_yaw_act(act):
-        """Force yaw (dim 2) to 0 in policy-space actions (tensor or ndarray)."""
         if isinstance(act, torch.Tensor):
             if act.shape[-1] < 3:
                 return act
@@ -397,7 +413,6 @@ def main():
         return out
 
     def _waypoint_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
-        """Current waypoint cmds in policy space, shape (n_env, 3)."""
         fns = train_envs.get_env_attr("compute_waypoint_nav_action")
         acts_env = np.stack(
             [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
@@ -408,97 +423,54 @@ def main():
             acts = _zero_yaw_act(acts)
         return acts
 
-    def _batch_act_nom_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor:
-        """Nominal from buffer.policy.act_nom; fallback batch.act. Train: yaw→0."""
-        act_nom = None
-        pol = getattr(batch, "policy", None)
-        if pol is not None and hasattr(pol, "act_nom"):
-            act_nom = pol.act_nom
-        if act_nom is None:
-            act_nom = batch.act
-        act_nom_t = torch.as_tensor(
-            act_nom, dtype=act_ref.dtype, device=act_ref.device
+    def _target_q_sample_max(buffer, indices):
+        """Bellman next-action: max_a Q_target(s', a); yaw free unless --freeze_yaw."""
+        batch = buffer[indices]
+        best_act, _ = select_actions_max_q(
+            policy.critic_old,
+            batch.obs_next,
+            act_dim=act_dim,
+            n_candidates=n_act_samples,
+            device=args.device,
+            fixed_dims=bellman_fixed_dims,
         )
-        if act_nom_t.ndim == 1:
-            act_nom_t = act_nom_t.unsqueeze(0)
-        # Joint-train / BC: never imitate yaw (buffer may still store controller yaw).
-        return _zero_yaw_act(act_nom_t)
+        return policy.critic_old(batch.obs_next, best_act)
 
-    _orig_policy_forward = policy.forward
-
-    def _actor_forward_maybe_nom(batch, state=None, model="actor", input="obs", **kwargs):
-        """Actor forward with yaw=0; during collect store a_nom (yaw=0) too."""
-        out = _orig_policy_forward(
-            batch, state=state, model=model, input=input, **kwargs
-        )
-        out.act = _zero_yaw_act(out.act)
-        if getattr(policy, "_attach_act_nom", False):
-            # Training nominal: same waypoint vx/vy, yaw forced to 0.
-            act_nom = _waypoint_acts_policy(zero_yaw=True)
-            out.policy = Batch(act_nom=act_nom)
-        return out
-
-    policy.forward = _actor_forward_maybe_nom  # type: ignore[method-assign]
-
-    def learn_anti_tanh(batch, **kwargs):
-        """Joint critic + actor: max Q + λ_nom||π - a_nom||² + boundary reg (yaw=0)."""
+    def learn_critic_only(batch, **kwargs):
         del kwargs
         td, critic_loss = policy._mse_optimizer(
             batch, policy.critic, policy.critic_optim
         )
         batch.weight = td
-        if not policy.warmup:
-            for _ in range(policy.actor_gradient_steps):
-                act = policy(batch, model="actor").act  # yaw already 0
-                safety_loss = -policy.critic(batch.obs, act).mean()
-                act_nom = _batch_act_nom_tensor(batch, act)  # yaw 0
-                nom_reg = torch.nn.functional.mse_loss(act, act_nom)
-                boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
-                actor_loss = safety_loss + boundary_reg_coef * boundary_reg
-                if action_reg_coef > 0.0:
-                    actor_loss = actor_loss + action_reg_coef * nom_reg
-                policy.actor_optim.zero_grad()
-                actor_loss.backward()
-                policy.actor_optim.step()
-            act_abs_mean = float(act.detach().abs().mean().item())
-            act_sat_frac = float((act.detach().abs() > 0.95).float().mean().item())
-        else:
-            actor_loss = torch.tensor(0.0)
-            nom_reg = actor_loss
-            boundary_reg = actor_loss
-            act_abs_mean = 0.0
-            act_sat_frac = 0.0
         policy.sync_weight()
         return {
-            "loss/actor": float(actor_loss.item()),
+            "loss/actor": 0.0,
             "loss/critic": float(critic_loss.item()),
-            "loss/action_reg": float(nom_reg.item()) if not policy.warmup else 0.0,
-            "loss/nom_reg": float(nom_reg.item()) if not policy.warmup else 0.0,
-            "loss/boundary_reg": (
-                float(boundary_reg.item()) if not policy.warmup else 0.0
-            ),
-            "train/actor_abs_mean": act_abs_mean,
-            "train/actor_sat_frac": act_sat_frac,
         }
 
-    policy.learn = learn_anti_tanh  # type: ignore[method-assign]
+    policy._target_q = _target_q_sample_max  # type: ignore[method-assign]
+    policy.learn = learn_critic_only  # type: ignore[method-assign]
+    policy.actor.eval()
+    for p in policy.actor.parameters():
+        p.requires_grad = False
     print(
-        f"[INFO] actor+critic SF: gamma={args.gamma_pyhj}, "
-        f"actor_lr={args.actor_lr}, "
+        f"[INFO] QP/critic-only train: gamma={args.gamma_pyhj}, "
         f"critic_warmup_updates={args.critic_warmup_updates}, "
-        f"actor_bc_warmup_updates={args.actor_bc_warmup_updates}, "
-        f"exploration_noise_start={args.exploration_noise} "
-        f"(anneal → 0.1 over training), "
-        f"new_expl=False, "
-        f"action_reg_coef(λ_nom)={action_reg_coef}, "
-        f"boundary_reg_coef={boundary_reg_coef}, "
-        f"train yaw frozen to 0 (SF + a_nom); buffer unchanged"
+        f"critic_action_samples={n_act_samples}, "
+        f"train_collect_noise={train_collect_noise}, "
+        f"freeze_yaw={freeze_yaw}, "
+        f"Bellman=max_a Q (yaw={'0' if freeze_yaw else 'free'}); "
+        f"actor frozen; deploy via test_HJ_humanoid_qp.py"
     )
-    # Force every-episode video uploads (CLI 0 still disables).
-    if int(getattr(args, "wandb_video_every", 1)) != 0:
-        args.wandb_video_every = 1
+    # Video every episode is extremely expensive on RTX (resize+GIF encode can
+    # make the first collect chunk look hung for 20–40 min). Default: off during
+    # buffer warm-up; restore after. CLI --wandb_video_every 0 keeps video off.
+    video_every_train = int(getattr(args, "wandb_video_every", 0))
+    if video_every_train < 0:
+        video_every_train = 0
     log_state = {"env_step": 0, "update": 0}
-    train_envs.set_env_attr("wandb_video_every", int(args.wandb_video_every))
+    # Buffer warm-up: no rollout video (scalars still log).
+    train_envs.set_env_attr("wandb_video_every", 0)
     train_envs.set_env_attr("log_state", log_state)
     # Enable per-frame HJ overlay + safety/l, safety/hj wandb scalars in the env.
     train_envs.set_env_attr("policy_for_log", policy)
@@ -529,228 +501,239 @@ def main():
     _orig_log_update = logger.log_update_data
 
     def log_update_data_synced(update_result, step):
-        # Smoothed losses (same MovAvg as the progress bar), x-axis = env_step.
         log_state["update"] = int(step)
         env_step = int(log_state.get("env_step", 0))
         payload = {
             "trainer/env_step": float(env_step),
             "trainer/update": float(step),
-            "loss/actor": float(update_result["loss/actor"]),
             "loss/critic": float(update_result["loss/critic"]),
+            "loss/actor": float(update_result.get("loss/actor", 0.0)),
         }
-        for key in (
-            "loss/action_reg",
-            "loss/nom_reg",
-            "loss/boundary_reg",
-            "train/actor_abs_mean",
-            "train/actor_sat_frac",
-        ):
-            if key in update_result:
-                payload[key] = float(update_result[key])
         wandb.log(payload)
         return _orig_log_update(update_result, step)
 
     logger.log_update_data = log_update_data_synced  # type: ignore[method-assign]
 
-    # Stash deterministic SF action (pre-noise) for env-side logging; do not wandb.log here.
-    orig_exploration_noise = policy.exploration_noise
-
-    def exploration_noise_stash_clean(act, batch):
-        act = _zero_yaw_act(act)
+    def _stash_act(act, batch):
+        del batch
         try:
             if isinstance(act, torch.Tensor):
                 act_np = act.detach().cpu().numpy()
             else:
                 act_np = np.asarray(act)
             act_env = policy.map_action(np.array(act_np, dtype=np.float64, copy=True))
-            row = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
-            row = np.asarray(row, dtype=np.float64).reshape(-1)
-            if row.size >= 3:
-                row[2] = 0.0
-            policy.last_clean_act_env = row
+            policy.last_clean_act_env = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
         except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] noiseless actor stash failed: {exc}")
-            policy.last_clean_act_env = None
-        return _zero_yaw_act(orig_exploration_noise(act, batch))
-
-    policy.exploration_noise = exploration_noise_stash_clean
-
-    def train_fn(epoch: int, step_idx: int):
-        # Linearly anneal exploration noise: start (e.g. 0.3) → 0.1 by last epoch.
-        del step_idx
-        start_sigma = float(args.exploration_noise)
-        end_sigma = 0.1
-        if end_epoch <= start_epoch:
-            sigma = end_sigma
-        else:
-            frac = (epoch - start_epoch) / float(end_epoch - start_epoch)
-            frac = min(1.0, max(0.0, frac))
-            sigma = start_sigma + (end_sigma - start_sigma) * frac
-        if getattr(policy, "_noise", None) is not None:
-            policy._noise._sigma = float(sigma)
-        wandb.log(
-            {
-                "trainer/env_step": float(log_state.get("env_step", 0)),
-                "train/exploration_sigma": float(sigma),
-            }
-        )
-
-    buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
-    # Only query waypoint a_nom during env collect (not during learn / target_q).
-    _orig_collect = train_collector.collect
-
-    def _collect_with_act_nom(*args, **kwargs):
-        policy._attach_act_nom = True
-        try:
-            return _orig_collect(*args, **kwargs)
-        finally:
-            policy._attach_act_nom = False
-
-    train_collector.collect = _collect_with_act_nom  # type: ignore[method-assign]
-
-    # Replay buffer is not restored; collect a fresh warm-up even when resuming weights.
-    # Initial buffer: region waypoint nav (DataCollection style), not random actor.
-    print(
-        "[INFO] Collecting initial transitions with WaypointNavController "
-        "(front -> cycle left|right|middle as goal; bin FIXED; "
-        "middle = collision demos; no behind-bin back)..."
-    )
-    train_envs.set_env_attr("randomize_obstacle", False)
-    train_envs.set_env_attr("include_middle_pass", True)
-    _actor_forward = policy.forward
-    _expl_fn = policy.exploration_noise
-
-    def _waypoint_forward(batch, state=None, **kwargs):
-        del batch, state, kwargs
-        # Buffer unchanged: full controller yaw kept in act / act_nom.
-        acts = _waypoint_acts_policy(zero_yaw=False)
-        return Batch(act=acts, state=None, policy=Batch(act_nom=acts.copy()))
-
-    def _waypoint_expl(act, batch):
-        # Stash env cmd for actor_action/* logs; do not add Gaussian noise.
-        try:
-            if isinstance(act, torch.Tensor):
-                act_np = act.detach().cpu().numpy()
-            else:
-                act_np = np.asarray(act)
-            act_env = policy.map_action(np.array(act_np, dtype=np.float64, copy=True))
-            row = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
-            policy.last_clean_act_env = row
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] waypoint act stash failed: {exc}")
+            print(f"[WARN] act stash failed: {exc}")
             policy.last_clean_act_env = None
         return act
 
-    policy.forward = _waypoint_forward  # type: ignore[method-assign]
-    policy.exploration_noise = _waypoint_expl  # type: ignore[method-assign]
+    def train_fn(epoch: int, step_idx: int):
+        del epoch, step_idx
+        wandb.log(
+            {
+                "trainer/env_step": float(log_state.get("env_step", 0)),
+                "trainer/update": float(log_state.get("update", 0)),
+                "train/collect_noise": float(train_collect_noise),
+            }
+        )
+
+    def _waypoint_forward_buffer(batch, state=None, **kwargs):
+        del batch, state, kwargs
+        acts = _waypoint_acts_policy(zero_yaw=False)
+        return Batch(act=acts, state=None)
+
+    def _waypoint_forward_train(batch, state=None, **kwargs):
+        """Training collect: waypoint goals; yaw free unless --freeze_yaw."""
+        del batch, state, kwargs
+        acts = _waypoint_acts_policy(zero_yaw=freeze_yaw)
+        if train_collect_noise > 0:
+            noise = np.random.randn(*acts.shape).astype(np.float32) * train_collect_noise
+            if freeze_yaw:
+                noise[..., 2] = 0.0
+            acts = np.clip(acts + noise, -1.0, 1.0)
+            if freeze_yaw:
+                acts = _zero_yaw_act(acts)
+        return Batch(act=acts, state=None)
+
+    def _gpu_compute_pids() -> list[int]:
+        """Return PIDs currently holding GPU compute contexts (best-effort)."""
+        try:
+            import subprocess
+
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid",
+                    "--format=csv,noheader",
+                ],
+                text=True,
+                timeout=5,
+            )
+            pids = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pids.append(int(line))
+            return pids
+        except Exception:  # noqa: BLE001
+            return []
+
+    # Avoid building Collector before waypoint forward is installed (reset is fine
+    # either way, but keep action path consistent from the first collect).
+    policy.forward = _waypoint_forward_buffer  # type: ignore[method-assign]
+    policy.exploration_noise = _stash_act  # type: ignore[method-assign]
+
+    print(
+        "[INFO] Collecting initial transitions with WaypointNavController "
+        "(start=(0,0) -> front=(1.5,0) -> left|right|middle; bin FIXED at (3.5,0); "
+        "middle = collision demos for critic)..."
+    )
+    train_envs.set_env_attr("randomize_obstacle", False)
+    train_envs.set_env_attr("include_middle_pass", True)
+    train_envs.set_env_attr("wandb_video_every", 0)
+    # Keep safety/l + safety/hj during buffer (needed for wandb Charts).
+    train_envs.set_env_attr("log_rollout_to_wandb", True)
+    train_envs.set_env_attr("debug_step_timing", True)
+    train_envs.set_env_attr("_debug_steps_left", 3)
+
+    # nvidia-smi PIDs may be host-namespace; ignore if only our process holds GPU.
+    other_gpu = [p for p in _gpu_compute_pids() if p != os.getpid()]
+    if other_gpu:
+        try:
+            import subprocess
+
+            mem_mib = int(
+                subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                    timeout=5,
+                )
+                .splitlines()[0]
+                .strip()
+            )
+        except Exception:  # noqa: BLE001
+            mem_mib = -1
+        # False positive: Isaac often appears as a different PID in nvidia-smi.
+        if mem_mib > 8000:
+            print(
+                f"[WARN] GPU busy (~{mem_mib} MiB); nvidia pids={other_gpu}. "
+                "If warm-up hangs, pkill -9 -f train_HJ_humanoid_qp.py and rerun.",
+                flush=True,
+            )
+
+    obs_dim = int(np.prod(state_space.shape))
+    est_gb = args.buffer_size * obs_dim * 4 * 2 / (1024**3)
+    print(
+        f"[INFO] Replay buffer size={args.buffer_size}, obs_dim={obs_dim} "
+        f"(~{est_gb:.1f} GiB for obs+obs_next; allocated on first collect).",
+        flush=True,
+    )
+    buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
+    print("[INFO] Creating collector (env reset)...", flush=True)
+    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
+    print("[INFO] Collector ready.", flush=True)
+
     warmup_n_step = 1000
-    warmup_chunk = 50  # print progress every N env steps (Isaac RTX is slow)
+    # Print every env step — RTX can take several seconds/step; large chunks look hung.
+    warmup_chunk = 1
     print(
         f"[INFO] Warm-up collect n_step={warmup_n_step} "
-        f"(progress every {warmup_chunk} steps); "
-        f"wandb video every {int(args.wandb_video_every)} episode(s); "
-        f"HJ overlay=Q(z, a_controller); store policy.act_nom.",
+        f"(progress every {warmup_chunk} step; video OFF + wandb scalars OFF during buffer).",
         flush=True,
     )
     collected = 0
     ep_total = 0
     t0 = time.time()
+    print(
+        "[INFO] buffer warm-up: starting first collect step "
+        "(RTX step ~1s after warm; then buffer may allocate for ~10–60s — "
+        "wait for '1/1000' print)...",
+        flush=True,
+    )
     while collected < warmup_n_step:
         n = min(warmup_chunk, warmup_n_step - collected)
+        chunk_t0 = time.time()
+        if collected == 0:
+            print(
+                "[INFO] buffer warm-up: calling collector.collect(1) "
+                "(after step exits, first buffer.add may pause — not RTX stuck)...",
+                flush=True,
+            )
         stats = train_collector.collect(n)
         collected += int(stats.get("n/st", n))
         ep_total += int(stats.get("n/ep", 0))
         elapsed = time.time() - t0
+        chunk_dt = time.time() - chunk_t0
         sps = collected / max(elapsed, 1e-6)
-        print(
-            f"[INFO] buffer warm-up: {collected}/{warmup_n_step} steps "
-            f"({100.0 * collected / warmup_n_step:.0f}%), "
-            f"episodes={ep_total}, "
-            f"{sps:.2f} steps/s, elapsed={elapsed:.0f}s",
-            flush=True,
-        )
+        # Throttle console a bit after the first few steps.
+        if collected <= 5 or collected % 10 == 0 or collected >= warmup_n_step:
+            print(
+                f"[INFO] buffer warm-up: {collected}/{warmup_n_step} steps "
+                f"({100.0 * collected / warmup_n_step:.0f}%), "
+                f"episodes={ep_total}, {sps:.2f} steps/s, "
+                f"last_step={chunk_dt:.1f}s, elapsed={elapsed:.0f}s",
+                flush=True,
+            )
     print(
         f"[INFO] Warm-up collect done: {collected} steps, {ep_total} episodes, "
         f"{time.time() - t0:.0f}s total.",
         flush=True,
     )
-    policy.forward = _actor_forward  # type: ignore[method-assign]
-    policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
-    # Training: resample bin y on bin x (3.5) each episode reset.
+
+    # Training collect: still waypoint only (no actor). Keep middle so critic
+    # sees collisions; random left|right|middle + randomized bin y.
     train_envs.set_env_attr("randomize_obstacle", True)
-    train_envs.set_env_attr("include_middle_pass", False)
+    train_envs.set_env_attr("include_middle_pass", True)
+    train_envs.set_env_attr("wandb_video_every", video_every_train)
+    train_envs.set_env_attr("log_rollout_to_wandb", True)
+    train_envs.set_env_attr("debug_step_timing", False)
+    if video_every_train > 0:
+        print(
+            f"[INFO] Restored wandb_video_every={video_every_train} after buffer "
+            "(expensive on RTX; use --wandb_video_every 0 to keep off).",
+            flush=True,
+        )
+    policy.forward = _waypoint_forward_train  # type: ignore[method-assign]
+    policy.exploration_noise = _stash_act  # type: ignore[method-assign]
     print(
-        "[INFO] Initial waypoint collection done; restoring actor policy "
-        "(train: a_nom & SF yaw=0; goal=random left|right of bin). "
-        "Obstacle randomization ON (x=3.5, y∈[-0.5,0.5]); y_bound disabled."
+        "[INFO] Buffer done; training collect=waypoint "
+        f"(goal=random left|right|middle, freeze_yaw={freeze_yaw}, "
+        f"noise={train_collect_noise}). "
+        "Middle kept for critic collision demos (no actor). "
+        "Obstacle randomization ON; y_bound disabled."
     )
 
-    # Critic-only warm-up on buffer (policy.warmup=True → actor loss skipped).
     n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))
     if n_critic_wu > 0 and not args.resume_policy:
-        print(f"[INFO] Critic-only warmup: {n_critic_wu} updates (actor frozen)...")
-        policy.warmup = True
+        print(f"[INFO] Critic-only warmup: {n_critic_wu} updates...")
         for i in range(1, n_critic_wu + 1):
             metrics = policy.update(args.batch_size_pyhj, buffer)
-            env_step = int(log_state.get("env_step", 0))
             log_state["update"] = int(log_state.get("update", 0)) + 1
             wandb.log(
                 {
-                    "trainer/env_step": float(env_step),
+                    "trainer/env_step": float(log_state.get("env_step", 0)),
                     "trainer/update": float(log_state["update"]),
-                    "loss/actor": float(metrics.get("loss/actor", 0.0)),
                     "loss/critic": float(metrics["loss/critic"]),
                     "train/critic_warmup": 1.0,
-                }
+                },
+                commit=True,
             )
             if i == 1 or i % 100 == 0 or i == n_critic_wu:
                 print(
                     f"  critic_warmup {i}/{n_critic_wu}: "
                     f"loss/critic={metrics['loss/critic']:.4f}"
                 )
-        policy.warmup = False
         print("[INFO] Critic-only warmup done.")
-    else:
-        policy.warmup = False
 
-    # Optional: BC actor to waypoint buffer acts before joint RL.
-    n_actor_bc = int(getattr(args, "actor_bc_warmup_updates", 0))
-    if n_actor_bc > 0 and not args.resume_policy:
-        print(
-            f"[INFO] Actor BC warmup: {n_actor_bc} updates "
-            f"(imitate waypoint act_nom / buffer acts)..."
-        )
-        for i in range(1, n_actor_bc + 1):
-            batch, _ = buffer.sample(args.batch_size_pyhj)
-            act_pred = policy(batch, model="actor").act
-            act_demo = _batch_act_nom_tensor(batch, act_pred)
-            bc_loss = torch.nn.functional.mse_loss(act_pred, act_demo)
-            policy.actor_optim.zero_grad()
-            bc_loss.backward()
-            policy.actor_optim.step()
-            policy.actor_old.load_state_dict(policy.actor.state_dict())
-            env_step = int(log_state.get("env_step", 0))
-            log_state["update"] = int(log_state.get("update", 0)) + 1
-            wandb.log(
-                {
-                    "trainer/env_step": float(env_step),
-                    "trainer/update": float(log_state["update"]),
-                    "loss/actor_bc": float(bc_loss.item()),
-                    "train/actor_bc_warmup": 1.0,
-                }
-            )
-            if i == 1 or i % 100 == 0 or i == n_actor_bc:
-                print(
-                    f"  actor_bc_warmup {i}/{n_actor_bc}: "
-                    f"loss/actor_bc={bc_loss.item():.4f}"
-                )
-        print("[INFO] Actor BC warmup done; enabling joint actor-critic training.")
-
-    log_path = Path(f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}")
+    log_path = Path(f"runs/qp_hj_humanoid/{args.dino_encoder}-{timestamp}")
     if args.resume_policy:
         log_path = Path(
-            f"runs/ddpg_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+            f"runs/qp_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
         )
     print(
         f"[INFO] Training epochs {start_epoch}..{end_epoch}; ckpts -> {log_path}"

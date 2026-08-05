@@ -6,28 +6,30 @@ from typing import Any, Sequence
 
 import numpy as np
 
-# Obstacle: FIXED at (2,0) during buffer; training resamples y∈[-0.5,0.5] on x=2.
-# front: fixed start at (0, 0) — no sampling range.
-# left / right: pass beside the bin; middle: straight into the bin (collision demos).
-# back: depart along +x.
+# Scene shifted +1.5m in x (avoid GS issues near old origin).
+# Obstacle: FIXED at (3.5,0) during buffer; training resamples y∈[-0.5,0.5] on x=3.5.
+# start: spawn / first waypoint at (0, 0), then through front (1.5,0), then fork.
+# left / right: terminal goals beside the bin.
+# middle: collision demos for critic (QP has no actor to corrupt).
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
-    "front": {"mode": "point", "xy": (0.0, 0.0)},
-    "back": {"center": np.array([3.0, 0.0], dtype=np.float64), "r": 0.3},
-    "left": {"center": np.array([2.0, 1.0], dtype=np.float64), "r": 0.3},
-    "right": {"center": np.array([2.0, -1.0], dtype=np.float64), "r": 0.3},
-    # On the bin — buffer demos that walk straight into the obstacle.
-    "middle": {"mode": "point", "xy": (2.0, 0.0)},
+    "start": {"mode": "point", "xy": (0.0, 0.0)},
+    "front": {"mode": "point", "xy": (1.5, 0.0)},
+    "left": {"center": np.array([3.5, 1.0], dtype=np.float64), "r": 0.3},
+    "right": {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.3},
+    "middle": {"mode": "point", "xy": (3.5, 0.0)},
 }
 
-# front -> left|right|middle -> back.
-# IsaacG1Wrapper cycles left / right / middle across episodes (not random).
+# (0,0) -> (1.5,0) -> left|right|middle. No behind-bin back.
+# QP critic-only: buffer + train may include middle (collision demos).
+# Actor pipelines / test: disable middle via include_middle_pass=False.
 DEFAULT_TRAJECTORY_REGION_SEQUENCE: list[str | tuple[str, ...]] = [
+    "start",
     "front",
     ("left", "right", "middle"),
-    "back",
 ]
 
 PASS_SIDE_CYCLE: tuple[str, ...] = ("left", "right", "middle")
+PASS_SIDE_TRAIN: tuple[str, ...] = ("left", "right")
 
 
 def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
