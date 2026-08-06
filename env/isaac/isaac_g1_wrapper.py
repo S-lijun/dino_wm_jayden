@@ -132,8 +132,8 @@ class IsaacG1Wrapper:
         # Soft corridor about the bin at (3.5, 0): leave room to pass left/right.
         y_bound: float = 0.0,
         # Far end of the aisle: x >= this truncates (same as y OOB).
-        # Bin at x=3.5 → keep ~2m margin past bin (was 4.0 when bin was at 2.0).
-        x_bound_max: float = 5.5,
+        # Bin at x=3.5 → default wall at 4.5 (~1m past bin).
+        x_bound_max: float = 4.5,
         trajectory_regions: dict[str, dict[str, Any]] | None = None,
         trajectory_region_sequence: Sequence[str | tuple[str, ...]] | None = None,
         max_speed: float = 0.5,
@@ -157,6 +157,9 @@ class IsaacG1Wrapper:
         self._blue_bin_xy_fixed = (float(blue_bin_xy[0]), float(blue_bin_xy[1]))
         self.randomize_obstacle = False
         self.obstacle_y_range = (-0.5, 0.5)
+        # Independent of y-jitter: with this prob hide the bin entirely on reset.
+        self.obstacle_absent_prob = 0.0
+        self.obstacle_present = True
         self.env_prim_root = env_prim_root
         self.lidar_distance_threshold = lidar_distance_threshold
         self.collision_force_threshold = collision_force_threshold
@@ -165,7 +168,7 @@ class IsaacG1Wrapper:
         # y_bound <= 0 disables the soft |y| corridor (default: disabled).
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
         self.x_bound_max = float(getattr(args_cli, "x_bound_max", x_bound_max))
-        # Copy defaults (start=(0,0), front=(1.5,0), then left|right|middle).
+        # Copy defaults (start disk r=1, front disk r=0.5, left|right r=0.5, middle point).
         if trajectory_regions is not None:
             self.trajectory_regions = trajectory_regions
         else:
@@ -319,7 +322,9 @@ class IsaacG1Wrapper:
             pattern_cfg=patterns.LidarPatternCfg(
                 channels=45,
                 vertical_fov_range=(-90, 90),
-                horizontal_fov_range=(-180, 180),
+                # Front hemisphere only — rear rays off so passed obstacles
+                # do not keep pulling l negative against a forward camera.
+                horizontal_fov_range=(-90, 90),
                 horizontal_res=2.0,
             ),
             debug_vis=False,
@@ -502,11 +507,13 @@ class IsaacG1Wrapper:
         return False
 
     def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
-        """Reset sim, place bin, waypoints; spawn at first waypoint (default start=(0,0)).
+        """Reset sim, place bin, waypoints; spawn at sampled start (disk around origin).
 
-        Obstacle: fixed at ``_blue_bin_xy_fixed`` when ``randomize_obstacle=False``
-        (buffer warm-up). When True (training), resample y on bin x (default 3.5)
-        within ``obstacle_y_range`` (default [-0.5, 0.5]); pose stays fixed in-episode.
+        Obstacle: fixed at ``_blue_bin_xy_fixed`` when ``randomize_obstacle=False``.
+        When True, resample y on bin x within ``obstacle_y_range``.
+        Independently, with ``obstacle_absent_prob`` park the bin behind the
+        robot spawn (facing +x → behind = smaller x) so front camera/LiDAR
+        cannot see it; LiDAR hits are also ignored so l stays clean.
         """
         if seed is not None:
             self._rng = np.random.default_rng(seed)
@@ -520,6 +527,9 @@ class IsaacG1Wrapper:
         else:
             bin_y = float(self._blue_bin_xy_fixed[1])
         self._blue_bin_xy = (bin_x, bin_y)
+
+        absent_p = float(self.obstacle_absent_prob)
+        self.obstacle_present = bool(absent_p <= 0.0 or self._rng.random() >= absent_p)
 
         self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(self._rng)
         waypoint_list = waypoints_to_list(self.waypoints)
@@ -540,17 +550,29 @@ class IsaacG1Wrapper:
             )
         self._reset_stuck_counters()
 
-        self._active_obstacles = list(self._obstacle_names)
         obstacle_positions: dict[str, tuple[float, float, float]] = {}
-
-        for name in self._obstacle_names:
-            if name == "blue_bin_0":
-                x, y = self._blue_bin_xy
-            else:
-                x, y = OBSTACLE_SPECS[name]["spawn_xy"]
-            z = OBSTACLE_SPECS[name]["default_z"]
-            self._set_obstacle_pose(name, (x, y, z))
-            obstacle_positions[name] = (x, y, z)
+        if self.obstacle_present:
+            self._active_obstacles = list(self._obstacle_names)
+            for name in self._obstacle_names:
+                if name == "blue_bin_0":
+                    x, y = self._blue_bin_xy
+                else:
+                    x, y = OBSTACLE_SPECS[name]["spawn_xy"]
+                z = OBSTACLE_SPECS[name]["default_z"]
+                self._set_obstacle_pose(name, (x, y, z))
+                obstacle_positions[name] = (x, y, z)
+        else:
+            # Robot faces +x; park bin ~2.5m behind spawn (same y) — out of front view.
+            self._active_obstacles = []
+            behind_xy = (
+                float(robot_xy[0]) - 2.5,
+                float(robot_xy[1]),
+            )
+            for name in self._obstacle_names:
+                z = OBSTACLE_SPECS[name]["default_z"]
+                pos = (behind_xy[0], behind_xy[1], z)
+                self._set_obstacle_pose(name, pos)
+                obstacle_positions[name] = pos
 
         self.commands.zero_()
 
@@ -574,6 +596,7 @@ class IsaacG1Wrapper:
 
         return {
             "active_obstacles": list(self._active_obstacles),
+            "obstacle_present": bool(self.obstacle_present),
             "robot_xy": robot_xy,
             "obstacle_positions": obstacle_positions,
             "waypoint": self.waypoint.copy(),
@@ -584,6 +607,16 @@ class IsaacG1Wrapper:
         }
 
     def get_lidar_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+        # Despawned obstacle: ignore mesh hits entirely so l is not polluted.
+        if not bool(getattr(self, "obstacle_present", True)):
+            stats = {
+                "lidar_min_distance": float("nan"),
+                "lidar_min_distance_xy": float("nan"),
+            }
+            empty = np.zeros((0, 3), dtype=np.float64)
+            empty_r = np.zeros((0,), dtype=np.float64)
+            return empty, empty_r, empty_r, stats
+
         scene = self.env.unwrapped.scene
         lidars = [scene[name] for name in self._lidar_sensor_names]
         hits_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
@@ -626,7 +659,7 @@ class IsaacG1Wrapper:
 
         ``h_s`` is the continuous PyHJ avoid cost:
         ``lidar_min_distance - lidar_distance_threshold`` (<0 unsafe, >0 safe).
-        If no valid LiDAR hit, treat as far/safe (large positive).
+        If no valid forward-LiDAR hit (front 180° empty), set ``h_s = 2.0``.
         Contact is logged but does not enter ``h_s``.
         """
         self._update_lidar_stats()
@@ -639,8 +672,8 @@ class IsaacG1Wrapper:
         if np.isfinite(lidar_dist):
             h_s = float(lidar_dist - self.lidar_distance_threshold)
         else:
-            # No valid hit: treat as safely far (do not poison training with NaN).
-            h_s = 1.0
+            # Front 180° clear / no hit: fixed safe margin for HJ (not NaN).
+            h_s = 2.0
         return {
             "lidar_min_distance": float(lidar_dist),
             "lidar_min_distance_xy": float(lidar_xy),

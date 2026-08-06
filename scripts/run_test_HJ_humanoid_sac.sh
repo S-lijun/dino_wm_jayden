@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Test SAC HJ safety filter.
+# Test SAC HJ safety filter (compare waypoint_only / SF-only / switching).
+#
+# Each trial freezes the same scene (start→front→left|right@r=0.2→back),
+# runs all three controllers, writes 3 videos + 1 overlay traj PNG.
 #
 # Usage:
 #   bash scripts/run_test_HJ_humanoid_sac.sh runs/sac_hj_humanoid/.../epoch_id_N/policy.pth
-#   MODE=waypoint_only bash scripts/run_test_HJ_humanoid_sac.sh <policy.pth>
+#   bash scripts/run_test_HJ_humanoid_sac.sh <policy.pth> --num_runs 3
 
 set -euo pipefail
 
@@ -16,7 +19,6 @@ shift || true
 
 WM_CKPT_DIR="${WM_CKPT_DIR:-/workspace}"
 WM_ENCODER="${WM_ENCODER:-wm_ckpt_18-27-17}"
-MODE="${MODE:-switching}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -26,7 +28,7 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] policy: ${POLICY_PATH}"
-echo "[INFO] mode: ${MODE}"
+echo "[INFO] compare modes: waypoint_only / safe_only / switching"
 
 exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac.py \
   --headless \
@@ -37,6 +39,5 @@ exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac.py \
   --config train_HJ_configs.yaml \
   --device cuda:0 \
   --policy_path "${POLICY_PATH}" \
-  --mode "${MODE}" \
   --num_runs 5 \
   "$@"

@@ -17,6 +17,7 @@ shift || true
 WM_CKPT_DIR="${WM_CKPT_DIR:-/workspace}"
 WM_ENCODER="${WM_ENCODER:-wm_ckpt_18-27-17}"
 MODE="${MODE:-QP}"
+PASS_SIDE="${PASS_SIDE:-back}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
@@ -27,6 +28,7 @@ cd "${REPO_ROOT}"
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] policy: ${POLICY_PATH}"
 echo "[INFO] mode: ${MODE}"
+echo "[INFO] pass_side: ${PASS_SIDE}"
 
 exec "${ISAAC_PYTHON}" test_HJ_humanoid_qp.py \
   --headless \
@@ -38,5 +40,6 @@ exec "${ISAAC_PYTHON}" test_HJ_humanoid_qp.py \
   --device cuda:0 \
   --policy_path "${POLICY_PATH}" \
   --mode "${MODE}" \
+  --pass_side "${PASS_SIDE}" \
   --num_runs 5 \
   "$@"

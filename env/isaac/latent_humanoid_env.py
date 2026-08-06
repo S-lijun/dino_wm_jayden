@@ -39,11 +39,13 @@ class LatentHumanoidEnv(gym.Env):
     - sim-step count hits ``max_episode_steps`` (default 8000 control steps)
     - optional soft Y corridor: |y| > y_bound when y_bound > 0 (default disabled).
       Truncates only — does **not** change ``h_s``.
-    - soft X far wall: x >= x_bound_max (default 5.5). Same truncate-only behavior.
+    - soft X far wall: x >= x_bound_max (default 4.5). Same truncate-only behavior.
 
-    Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` (m) is the step
-    cost (<0 unsafe, >0 safe) but does **not** end the episode.
-    Waypoints: start=(0,0) → front=(1.5,0) → left|right|(middle); bin at (3.5,0).
+    Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` (m) from the
+    **front 180°** LiDAR (<0 unsafe, >0 safe); no forward hit → ``h_s = 2.0``.
+    Does **not** end the episode.
+    Waypoints: start disk (0,0) r=1 → front (1.5,0) r=0.5 → left|right r=0.5
+    (or middle point); bin at (3.5,0). Spawn = sampled start (buffer and train).
     """
 
     metadata = {"render_modes": []}
@@ -187,6 +189,28 @@ class LatentHumanoidEnv(gym.Env):
     @include_middle_pass.setter
     def include_middle_pass(self, value: bool) -> None:
         self.wrapper.include_middle_pass = bool(value)
+
+    @property
+    def start_region(self) -> dict:
+        return self.wrapper.trajectory_regions["start"]
+
+    @start_region.setter
+    def start_region(self, value: dict) -> None:
+        """Override spawn disk, e.g. train: center=(1.5,0), r=1.5."""
+        cfg = dict(value)
+        if "center" in cfg:
+            cfg["center"] = np.asarray(cfg["center"], dtype=np.float64).copy()
+        cfg.pop("mode", None)  # disk sampling is the default
+        self.wrapper.trajectory_regions["start"] = cfg
+
+    @property
+    def obstacle_absent_prob(self) -> float:
+        return float(self.wrapper.obstacle_absent_prob)
+
+    @obstacle_absent_prob.setter
+    def obstacle_absent_prob(self, value: float) -> None:
+        """P(hide bin on each reset). Applies to buffer and formal train."""
+        self.wrapper.obstacle_absent_prob = float(value)
 
     def _reset_timers(self) -> None:
         self._episode_sim_step = 0
@@ -431,6 +455,7 @@ class LatentHumanoidEnv(gym.Env):
         if reset_info is not None:
             print(
                 f"[LatentHumanoidEnv] reset robot_xy={reset_info.get('robot_xy')} "
+                f"obstacle_present={reset_info.get('obstacle_present')} "
                 f"waypoints={reset_info.get('waypoints')}"
             )
         return z, self._pyhj_info(end_reason=None, stuck=False)

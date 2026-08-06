@@ -258,7 +258,7 @@ def q_value(policy, z: np.ndarray, act_policy: np.ndarray, device: str) -> float
 
 @torch.no_grad()
 def safe_action_env(policy, z: np.ndarray, device: str) -> np.ndarray:
-    """Deterministic SAC actor (mean) → env-space, yaw=0."""
+    """Deterministic SAC actor (mean) → env-space (vx, vy, yaw free)."""
     from PyHJ.data import Batch
 
     was_training = policy.training
@@ -271,10 +271,7 @@ def safe_action_env(policy, z: np.ndarray, device: str) -> np.ndarray:
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
     act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
-    if act_pol.size >= 3:
-        act_pol[2] = 0.0
     act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
-    act_env[2] = 0.0
     policy.train(was_training)
     return act_env
 
@@ -310,8 +307,6 @@ def simulate_one(
         a_nom_pol = np.asarray(
             policy.map_action_inverse(a_nom_env), dtype=np.float32
         ).reshape(-1)
-        if a_nom_pol.size >= 3:
-            a_nom_pol[2] = 0.0
 
         if mode == "waypoint_only":
             action = a_nom_env

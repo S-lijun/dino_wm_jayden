@@ -8,15 +8,17 @@ import numpy as np
 
 # Scene shifted +1.5m in x (avoid GS issues near old origin).
 # Obstacle: FIXED at (3.5,0) during buffer; training resamples y∈[-0.5,0.5] on x=3.5.
-# start: spawn / first waypoint at (0, 0), then through front (1.5,0), then fork.
-# left / right: terminal goals beside the bin.
-# middle: collision demos for critic (QP has no actor to corrupt).
+# start: spawn disk around (0,0), r=1; then front disk (1.5,0) r=0.5; then fork.
+# left / right: terminal goals beside the bin, disks r=0.5 at (3.5, ±1).
+# middle: collision demos for critic (fixed point on the bin).
+# back: past the bin on the centerline (straight ahead behind obstacle).
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
-    "start": {"mode": "point", "xy": (0.0, 0.0)},
-    "front": {"mode": "point", "xy": (1.5, 0.0)},
-    "left": {"center": np.array([3.5, 1.0], dtype=np.float64), "r": 0.3},
-    "right": {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.3},
+    "start": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 1.0},
+    "front": {"center": np.array([1.5, 0.0], dtype=np.float64), "r": 0.5},
+    "left": {"center": np.array([3.5, 1.0], dtype=np.float64), "r": 0.5},
+    "right": {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.5},
     "middle": {"mode": "point", "xy": (3.5, 0.0)},
+    "back": {"mode": "point", "xy": (5.0, 0.0)},
 }
 
 # (0,0) -> (1.5,0) -> left|right|middle. No behind-bin back.

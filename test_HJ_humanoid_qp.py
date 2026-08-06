@@ -1,8 +1,13 @@
 """Test QP safety filter on Isaac G1 latent humanoid.
 
 Loads critic from ``train_HJ_humanoid_qp.py`` checkpoints. Control uses
-WaypointNavController as nominal + discrete QP filter (closest safe action to
-a_nom with Q >= threshold). Yaw free by default (match retrained Q).
+WaypointNavController as nominal + QP filter (closest safe action to a_nom
+with Q >= threshold). Default QP search is stratified continuous sampling
+(one uniform draw per action-space bin). Yaw free by default.
+
+Default ``--pass_side back`` puts the terminal goal past the bin on the
+centerline (5.0, 0). Use ``middle`` to aim at the bin, or ``left_right`` for
+the previous left|right eval.
 
 Cannot reuse ``test_HJ_humanoid.py`` (actor switching / safe_only).
 
@@ -11,7 +16,7 @@ Usage (env_isaaclab)::
   python test_HJ_humanoid_qp.py --headless --visual_mode rtx_rgb \\
     --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
     --policy_path runs/qp_hj_humanoid/.../epoch_id_N/policy.pth \\
-    --mode QP --num_runs 5
+    --mode QP --num_runs 5 --pass_side back
 """
 
 from __future__ import annotations
@@ -72,7 +77,7 @@ parser.add_argument(
     type=str,
     default="QP",
     choices=["QP", "waypoint_only"],
-    help="QP = discrete filter on critic; waypoint_only = no filter.",
+    help="QP = stratified continuous filter on critic; waypoint_only = no filter.",
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
@@ -85,7 +90,25 @@ parser.add_argument(
     "--qp_n_grid",
     type=int,
     default=21,
-    help="Grid resolution per axis for discrete QP (21³ if yaw free; 21² if --freeze_yaw).",
+    help=(
+        "Bins per axis for QP search (21³ if yaw free; 21² if --freeze_yaw). "
+        "Default stratified mode draws one continuous action uniformly in each bin."
+    ),
+)
+parser.add_argument(
+    "--qp_sample_mode",
+    type=str,
+    default="stratified",
+    choices=["stratified", "fixed"],
+    help=(
+        "stratified: one continuous uniform sample per axis-aligned bin (default). "
+        "fixed: legacy linspace lattice (actions stick to discrete levels)."
+    ),
+)
+parser.add_argument(
+    "--no_vy_yaw_same_sign",
+    action="store_true",
+    help="Disable QP constraint that candidates must have sign(vy)==sign(yaw).",
 )
 parser.add_argument(
     "--freeze_yaw",
@@ -103,6 +126,18 @@ parser.add_argument(
     type=float,
     default=0.05,
     help="Reach goal when dist(robot, goal_xy) <= this (meters). Also stops robot.",
+)
+parser.add_argument(
+    "--pass_side",
+    type=str,
+    default="back",
+    choices=["back", "middle", "left", "right", "left_right"],
+    help=(
+        "Terminal goal after front. "
+        "back = past bin on centerline (5.0,0); "
+        "middle = aim at bin (3.5,0); "
+        "left_right = cycle left|right only."
+    ),
 )
 parser.add_argument(
     "--out_dir",
@@ -370,6 +405,8 @@ def simulate_one(
     device: str,
     safety_threshold: float,
     qp_n_grid: int,
+    qp_sample_mode: str,
+    require_vy_yaw_same_sign: bool,
     freeze_yaw: bool,
     max_visual_steps: int,
     goal_radius: float,
@@ -450,8 +487,13 @@ def simulate_one(
                 freeze_yaw=freeze_yaw,
                 yaw=0.0,
                 device=device,
+                sample_mode=qp_sample_mode,  # type: ignore[arg-type]
+                require_vy_yaw_same_sign=require_vy_yaw_same_sign,
             )
             q_nom = float(qp_info["q_nom"])
+            q_qp = qp_info.get("q_chosen")
+            if q_qp is not None:
+                q_qp = float(q_qp)
             using_hj = bool(qp_info["intervened"])
             if qp_info.get("fallback_maxq"):
                 fallback_maxq += 1
@@ -459,14 +501,38 @@ def simulate_one(
                 action = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
                 if freeze_yaw:
                     action[2] = 0.0
+                # If filter omitted q_chosen, evaluate critic on chosen policy action.
+                if q_qp is None:
+                    with torch.no_grad():
+                        z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
+                        if z_t.ndim == 1:
+                            z_t = z_t.unsqueeze(0)
+                        a_t = torch.as_tensor(
+                            act_pol, dtype=torch.float32, device=device
+                        ).unsqueeze(0)
+                        q_qp = float(policy.critic(z_t, a_t).reshape(-1)[0].item())
                 hj_interventions += 1
                 if last_controller == "waypoint":
                     total_switches += 1
                 last_controller = "qp"
-                if step < 30 or hj_interventions <= 5:
+                # Always log fallbacks; also early steps / first few interventions.
+                if (
+                    step < 30
+                    or hj_interventions <= 5
+                    or qp_info.get("fallback_maxq")
+                    or step % 20 == 0
+                ):
                     print(
-                        f"  step {step}: QP intervene Q(a_nom)={q_nom:.3f} "
-                        f"n_safe={qp_info['n_safe']} fallback={qp_info.get('fallback_maxq')} "
+                        f"  step {step}: QP intervene "
+                        f"Q(a_nom)={q_nom:.6f} Q(a_qp)={q_qp:.6f} "
+                        f"Δ={float(q_qp) - q_nom:+.6f} "
+                        f"Q[min,max,std]="
+                        f"[{qp_info.get('q_min'):.6f},"
+                        f"{qp_info.get('q_max'):.6f},"
+                        f"{qp_info.get('q_std'):.6f}] "
+                        f"n_cand={qp_info.get('n_candidates')} "
+                        f"n_safe={qp_info['n_safe']} "
+                        f"fallback={qp_info.get('fallback_maxq')} "
                         f"a_nom={a_nom_env_use} a_qp={action}"
                     )
             else:
@@ -610,13 +676,35 @@ def main():
         latent_h=False,
         wandb_video_every=0,
     )
-    # Eval: goals = left|right of bin only (no middle / no behind-bin back).
-    env.wrapper.include_middle_pass = False
+    # Terminal goal after front. Default back = past bin on centerline (5.0, 0).
+    pass_side = str(getattr(args, "pass_side", "back"))
+    if pass_side == "left_right":
+        env.wrapper.include_middle_pass = False
+        # Keep default sequence tuple → cycles/samples left|right only.
+    else:
+        env.wrapper.include_middle_pass = pass_side == "middle"
+        env.wrapper.trajectory_region_sequence = ["start", "front", pass_side]
+        if pass_side == "back" and "back" not in env.wrapper.trajectory_regions:
+            env.wrapper.trajectory_regions["back"] = {
+                "mode": "point",
+                "xy": (5.0, 0.0),
+            }
     env.wrapper.y_bound = 0.0  # disable |y| corridor
     goal_radius = float(args.goal_radius)
     env.wrapper.waypoint_stop_thresh = goal_radius
     env.waypoint_nav.stop_thresh = goal_radius
-    print(f"[INFO] goal_radius={goal_radius} (env stop_thresh synced)")
+    back_xy = env.wrapper.trajectory_regions.get("back", {}).get("xy", (5.0, 0.0))
+    print(
+        f"[INFO] pass_side={pass_side} "
+        f"sequence={env.wrapper.trajectory_region_sequence} "
+        f"regions.back={back_xy} "
+        f"goal_radius={goal_radius} (env stop_thresh synced)"
+    )
+    if pass_side == "back":
+        print(
+            f"[INFO] Terminal goal should be behind obstacle at {tuple(back_xy)} "
+            f"(bin stays at {tuple(env.wrapper._blue_bin_xy_fixed)})"
+        )
     policy = build_policy(env, args, args.device)
     load_policy_checkpoint(policy, args.policy_path, args.device)
     env.policy_for_log = policy
@@ -632,6 +720,10 @@ def main():
                 device=args.device,
                 safety_threshold=float(args.safety_threshold),
                 qp_n_grid=int(args.qp_n_grid),
+                qp_sample_mode=str(getattr(args, "qp_sample_mode", "stratified")),
+                require_vy_yaw_same_sign=not bool(
+                    getattr(args, "no_vy_yaw_same_sign", False)
+                ),
                 freeze_yaw=bool(args.freeze_yaw),
                 max_visual_steps=int(args.max_visual_steps),
                 goal_radius=goal_radius,
@@ -661,6 +753,7 @@ def main():
         f"mean_constraint_violations={mean_viol:.2f}",
         f"mean_fallback_maxq={mean_fb:.2f}",
         f"goal_radius={float(args.goal_radius)}",
+        f"pass_side={getattr(args, 'pass_side', 'back')}",
         "",
         "per-run:",
     ]

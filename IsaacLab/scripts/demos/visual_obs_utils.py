@@ -25,7 +25,8 @@ DEFAULT_VISUAL_MODE = "depth_rgb"  # cluster-safe; DataCollection_test defaults 
 IMG_RES_LANDSCAPE = (480, 640)  # (height, width) = 640×480 landscape
 LIDAR_CHANNELS = 45
 LIDAR_HORIZONTAL_RES = 2.0
-LIDAR_H_FOV = (-180.0, 180.0)
+# Match isaac_g1_wrapper front-hemisphere LiDAR (rear off).
+LIDAR_H_FOV = (-90.0, 90.0)
 
 
 def resolve_visual_mode(args_cli) -> str:
@@ -74,7 +75,10 @@ def configure_app_for_visual(args_cli, visual_mode: str, *, verbose: bool = True
 def lidar_range_image_shape() -> tuple[int, int]:
     """(vertical_channels, horizontal_bins) for default LidarPatternCfg."""
     h_span = LIDAR_H_FOV[1] - LIDAR_H_FOV[0]
-    n_h = int(np.ceil(h_span / LIDAR_HORIZONTAL_RES)) - 1  # 360° excludes overlap
+    n_h = int(np.ceil(h_span / LIDAR_HORIZONTAL_RES))
+    # Full 360° drops the duplicate endpoint; front-180° keeps all bins.
+    if abs(abs(h_span) - 360.0) < 1e-6:
+        n_h -= 1
     return LIDAR_CHANNELS, n_h
 
 

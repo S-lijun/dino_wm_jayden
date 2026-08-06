@@ -5,7 +5,7 @@ NOT DDPG. Separate from ``train_HJ_humanoid.py`` / ``train_HJ_humanoid_qp.py``.
 
 Pipeline mirrors DDPG humanoid:
   waypoint buffer → critic warmup → joint SAC actor+critics
-  train/collect: yaw forced to 0; buffer pass-side cycle includes middle.
+  train/collect: yaw free (vx, vy, yaw all trained); buffer pass-side cycle includes middle.
 """
 
 import argparse
@@ -73,8 +73,14 @@ parser.add_argument(
 parser.add_argument(
     "--y_bound",
     type=float,
-    default=0.0,
-    help="Soft |y| corridor (meters). <=0 disables (default). >0 truncates when |y|>bound.",
+    default=1.5,
+    help="Soft |y| corridor (meters). |y|>bound truncates+reset. <=0 disables.",
+)
+parser.add_argument(
+    "--x_bound_max",
+    type=float,
+    default=4.5,
+    help="Soft far wall: x >= this truncates+reset (meters). Default 4.5.",
 )
 parser.add_argument(
     "--critic_warmup_updates",
@@ -399,28 +405,13 @@ def main():
     action_reg_coef = float(args.action_reg_coef)
     boundary_reg_coef = float(args.boundary_reg_coef)
 
-    def _zero_yaw_act(act):
-        if isinstance(act, torch.Tensor):
-            if act.shape[-1] < 3:
-                return act
-            out = act.clone()
-            out[..., 2] = 0.0
-            return out
-        out = np.array(act, dtype=np.float32, copy=True)
-        if out.ndim >= 1 and out.shape[-1] >= 3:
-            out[..., 2] = 0.0
-        return out
-
-    def _waypoint_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
+    def _waypoint_acts_policy() -> np.ndarray:
         fns = train_envs.get_env_attr("compute_waypoint_nav_action")
         acts_env = np.stack(
             [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
             axis=0,
         )
-        acts = np.asarray(policy.map_action_inverse(acts_env), dtype=np.float32)
-        if zero_yaw:
-            acts = _zero_yaw_act(acts)
-        return acts
+        return np.asarray(policy.map_action_inverse(acts_env), dtype=np.float32)
 
     def _batch_act_nom_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor:
         act_nom = None
@@ -434,23 +425,22 @@ def main():
         )
         if act_nom_t.ndim == 1:
             act_nom_t = act_nom_t.unsqueeze(0)
-        return _zero_yaw_act(act_nom_t)
+        return act_nom_t
 
     _orig_policy_forward = policy.forward
 
-    def _sac_forward_yaw0(batch, state=None, input="obs", **kwargs):
-        """SAC forward; force yaw=0; optionally stash a_nom during collect."""
+    def _sac_forward(batch, state=None, input="obs", **kwargs):
+        """SAC forward (yaw free); optionally stash a_nom during collect."""
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
-        out.act = _zero_yaw_act(out.act)
         if getattr(policy, "_attach_act_nom", False):
-            act_nom = _waypoint_acts_policy(zero_yaw=True)
+            act_nom = _waypoint_acts_policy()
             out.policy = Batch(act_nom=act_nom)
         return out
 
-    policy.forward = _sac_forward_yaw0  # type: ignore[method-assign]
+    policy.forward = _sac_forward  # type: ignore[method-assign]
 
     def learn_sac_humanoid(batch, **kwargs):
-        """Twin-critic HJ update + SAC actor (no drone rot_cost; yaw=0)."""
+        """Twin-critic HJ update + SAC actor (yaw free; no drone rot_cost)."""
         del kwargs
         td1, critic1_loss = policy._mse_optimizer(
             batch, policy.critic1, policy.critic1_optim
@@ -469,7 +459,7 @@ def main():
 
         if not policy.warmup:
             obs_result = policy(batch)
-            act = obs_result.act  # yaw already 0
+            act = obs_result.act
             q = torch.min(
                 policy.critic1(batch.obs, act).flatten(),
                 policy.critic2(batch.obs, act).flatten(),
@@ -526,7 +516,7 @@ def main():
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
         f"λ_nom={action_reg_coef}, boundary={boundary_reg_coef}, "
-        f"yaw frozen to 0 (train SF + a_nom)"
+        f"yaw free (train SF + a_nom)"
     )
 
     if int(getattr(args, "wandb_video_every", 1)) != 0:
@@ -584,18 +574,17 @@ def main():
     logger.log_update_data = log_update_data_synced  # type: ignore[method-assign]
 
     def exploration_noise_stash(act, batch):
-        """SAC explores via rsample; do not replace actions. Stash + yaw=0."""
+        """SAC explores via rsample; do not replace actions. Stash env act (yaw free)."""
         del batch
-        act = _zero_yaw_act(act)
         try:
             if isinstance(act, torch.Tensor):
                 act_np = act.detach().cpu().numpy()
             else:
                 act_np = np.asarray(act)
             act_env = policy.map_action(np.array(act_np, dtype=np.float64, copy=True))
-            row = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
-            row[2] = 0.0
-            policy.last_clean_act_env = row
+            policy.last_clean_act_env = np.asarray(act_env, dtype=np.float64).reshape(
+                -1, 3
+            )[0]
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] act stash failed: {exc}")
             policy.last_clean_act_env = None
@@ -632,9 +621,13 @@ def main():
 
     train_collector.collect = _collect_with_act_nom  # type: ignore[method-assign]
 
+    # Buffer + train: with p=0.1 hide bin far away; LiDAR ignored so l→2.
+    obstacle_absent_p = 0.1
+    train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
     print(
         "[INFO] Collecting initial transitions with WaypointNavController "
-        "(front -> cycle left|right|middle as goal; bin FIXED; no behind-bin back)..."
+        "(start disk r=1 → front r=0.5 → cycle left|right|middle r=0.5; "
+        f"bin at (3.5,0) or absent p={obstacle_absent_p}; no behind-bin back)..."
     )
     train_envs.set_env_attr("randomize_obstacle", False)
     train_envs.set_env_attr("include_middle_pass", True)
@@ -643,7 +636,7 @@ def main():
 
     def _waypoint_forward(batch, state=None, **kwargs):
         del batch, state, kwargs
-        acts = _waypoint_acts_policy(zero_yaw=False)
+        acts = _waypoint_acts_policy()
         return Batch(act=acts, state=None, policy=Batch(act_nom=acts.copy()))
 
     def _waypoint_expl(act, batch):
@@ -692,12 +685,22 @@ def main():
     )
     policy.forward = _actor_forward  # type: ignore[method-assign]
     policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
-    train_envs.set_env_attr("randomize_obstacle", True)
+    # Keep bin XY fixed when present; absent-prob stays on for formal train.
+    train_envs.set_env_attr("randomize_obstacle", False)
     train_envs.set_env_attr("include_middle_pass", False)
+    train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
+    # Formal train: larger spawn disk around front corridor (not buffer's origin disk).
+    train_envs.set_env_attr(
+        "start_region",
+        {"center": np.array([1.5, 0.0], dtype=np.float64), "r": 1.5},
+    )
+    yb = float(getattr(args, "y_bound", 0.0))
     print(
         "[INFO] Buffer done; restoring SAC actor "
-        "(train: yaw=0; goal=random left|right of bin). "
-        "Obstacle randomization ON; y_bound disabled."
+        "(train: SAC controls; yaw free; spawn disk center=(1.5,0) r=1.5; "
+        "goal=cycle left|right r=0.5). "
+        f"Bin at (3.5,0) or absent p={obstacle_absent_p}; "
+        f"y_bound={'disabled' if yb <= 0 else f'±{yb} (OOB truncate+reset)'}."
     )
 
     n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))
