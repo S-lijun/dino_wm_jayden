@@ -6,6 +6,7 @@ plan_outputs
 ##i added this
 __pycache__/
 cargoal_test/
+humanoid_test_sac/
 *.pyo
 runs/
 # Ignore virtual environments
