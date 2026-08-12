@@ -37,15 +37,15 @@ class LatentHumanoidEnv(gym.Env):
     - all waypoints reached (goal = left or right of the bin; no behind-bin goal)
     - stuck contact on a non-ankle_roll link for ``stuck_contact_steps``
     - sim-step count hits ``max_episode_steps`` (default 8000 control steps)
-    - optional soft Y corridor: |y| > y_bound when y_bound > 0 (default disabled).
+    - optional soft Y corridor: |y - y_center| > y_bound when y_bound > 0 (default disabled).
       Truncates only — does **not** change ``h_s``.
     - soft X far wall: x >= x_bound_max (default 4.5). Same truncate-only behavior.
 
     Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` (m) from the
     **front 180°** LiDAR (<0 unsafe, >0 safe); no forward hit → ``h_s = 2.0``.
     Does **not** end the episode.
-    Waypoints: start disk (0,0) r=1 → front (1.5,0) r=0.5 → left|right r=0.5
-    (or middle point); bin at (3.5,0). Spawn = sampled start (buffer and train).
+    Waypoints: start disk (0,-2) r=1 → front (1.5,-2) r=0.5 → left|right r=0.5
+    (or middle point); bin at (3.5,-2). Spawn = sampled start (buffer and train).
     """
 
     metadata = {"render_modes": []}
@@ -139,7 +139,7 @@ class LatentHumanoidEnv(gym.Env):
             f"sim_dt={self.sim_dt:.6f} (~{1.0 / self.sim_dt:.1f} Hz), "
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
-            f"y_bound={'disabled' if self.wrapper.y_bound <= 0 else f'±{self.wrapper.y_bound}'}, "
+            f"y_bound={'disabled' if self.wrapper.y_bound <= 0 else f'{self.wrapper.y_center}±{self.wrapper.y_bound}'}, "
             f"x_bound_max={self.wrapper.x_bound_max} "
             f"(OOB → truncate only, no h_s penalty), "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
@@ -191,17 +191,80 @@ class LatentHumanoidEnv(gym.Env):
         self.wrapper.include_middle_pass = bool(value)
 
     @property
+    def force_pass_side(self) -> str | None:
+        return getattr(self.wrapper, "force_pass_side", None)
+
+    @force_pass_side.setter
+    def force_pass_side(self, value: str | None) -> None:
+        """Force pass-side waypoint to this region name, or None to restore cycle."""
+        if value is None or value == "" or str(value).lower() in ("none", "null"):
+            self.wrapper.force_pass_side = None
+        else:
+            self.wrapper.force_pass_side = str(value)
+
+    @property
+    def spawn_hemisphere_pass(self) -> bool:
+        return bool(getattr(self.wrapper, "spawn_hemisphere_pass", False))
+
+    @spawn_hemisphere_pass.setter
+    def spawn_hemisphere_pass(self, value: bool) -> None:
+        """Couple spawn half-disk with matching left/right pass (formal train)."""
+        self.wrapper.spawn_hemisphere_pass = bool(value)
+
+    @property
     def start_region(self) -> dict:
         return self.wrapper.trajectory_regions["start"]
 
     @start_region.setter
     def start_region(self, value: dict) -> None:
-        """Override spawn disk, e.g. train: center=(1.5,0), r=1.5."""
+        """Override spawn disk, e.g. train: center=(1.5,-2), r=1."""
+        self.set_region("start", value)
+
+    @property
+    def front_region(self) -> dict:
+        return self.wrapper.trajectory_regions["front"]
+
+    @front_region.setter
+    def front_region(self, value: dict) -> None:
+        """Override front waypoint disk (buffer: start → front → pass-side)."""
+        self.set_region("front", value)
+
+    @property
+    def trajectory_region_sequence(self):
+        return self.wrapper.trajectory_region_sequence
+
+    @trajectory_region_sequence.setter
+    def trajectory_region_sequence(self, value) -> None:
+        """Override waypoint region order, e.g. ['start', ('left','right')]."""
+        self.wrapper.trajectory_region_sequence = list(value)
+
+    def set_region(self, name: str, value: dict) -> None:
+        """Set a named trajectory region (disk or point)."""
         cfg = dict(value)
         if "center" in cfg:
             cfg["center"] = np.asarray(cfg["center"], dtype=np.float64).copy()
-        cfg.pop("mode", None)  # disk sampling is the default
-        self.wrapper.trajectory_regions["start"] = cfg
+        if "xy" in cfg:
+            xy = cfg["xy"]
+            cfg["xy"] = (float(xy[0]), float(xy[1]))
+        if "mode" not in cfg and "xy" not in cfg:
+            cfg.pop("mode", None)  # disk sampling is the default
+        self.wrapper.trajectory_regions[str(name)] = cfg
+
+    @property
+    def left_region(self) -> dict:
+        return self.wrapper.trajectory_regions["left"]
+
+    @left_region.setter
+    def left_region(self, value: dict) -> None:
+        self.set_region("left", value)
+
+    @property
+    def right_region(self) -> dict:
+        return self.wrapper.trajectory_regions["right"]
+
+    @right_region.setter
+    def right_region(self, value: dict) -> None:
+        self.set_region("right", value)
 
     @property
     def obstacle_absent_prob(self) -> float:
@@ -441,7 +504,8 @@ class LatentHumanoidEnv(gym.Env):
             self._record_this_episode = False
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
-        reset_info = self.wrapper.reset_scene(seed=seed)
+        fixed_layout = None if options is None else options.get("fixed_layout")
+        reset_info = self.wrapper.reset_scene(seed=seed, fixed_layout=fixed_layout)
         self._reset_timers()
         self.waypoint_nav.reset()
         self._start_episode_recording()
@@ -458,7 +522,16 @@ class LatentHumanoidEnv(gym.Env):
                 f"obstacle_present={reset_info.get('obstacle_present')} "
                 f"waypoints={reset_info.get('waypoints')}"
             )
-        return z, self._pyhj_info(end_reason=None, stuck=False)
+        info = self._pyhj_info(end_reason=None, stuck=False)
+        # Keep layout on the side for multi-mode eval (not in PyHJ Batch schema).
+        self._last_reset_layout = {
+            "blue_bin_xy": reset_info.get("blue_bin_xy"),
+            "obstacle_present": bool(reset_info.get("obstacle_present", True)),
+            "waypoints": np.asarray(reset_info["waypoints"], dtype=np.float64).copy(),
+            "waypoint_region_names": list(reset_info.get("waypoint_region_names", [])),
+            "robot_xy": np.asarray(reset_info["robot_xy"], dtype=np.float64).copy(),
+        }
+        return z, info
 
     def step(self, action):
         """Hold ``action`` across sim substeps until the next 15 fps visual sample."""
@@ -547,8 +620,10 @@ class LatentHumanoidEnv(gym.Env):
                         f" (x={xy[0]:.3f}>={self.wrapper.x_bound_max}, truncate-only)"
                     )
                 else:
+                    dy = abs(float(xy[1]) - float(self.wrapper.y_center))
                     extra = (
-                        f" (|y|={abs(xy[1]):.3f}>{self.wrapper.y_bound}, truncate-only)"
+                        f" (|y-({self.wrapper.y_center})|={dy:.3f}"
+                        f">{self.wrapper.y_bound}, truncate-only)"
                     )
             else:
                 extra = f" robot_xy=[{xy[0]:.3f},{xy[1]:.3f}]"

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Test SAC HJ safety filter (compare waypoint_only / SF-only / switching).
+# Test SAC HJ safety filter (default: compare SF-only / waypoint / switching).
 #
-# Each trial freezes the same scene (start→front→left|right@r=0.2→back),
+# Each trial freezes the same scene:
+#   start → front → left|right in danger disk (bin center, r=0.3) → back disk (5.5,0) r=1
 # runs all three controllers, writes 3 videos + 1 overlay traj PNG.
 #
 # Usage:
 #   bash scripts/run_test_HJ_humanoid_sac.sh runs/sac_hj_humanoid/.../epoch_id_N/policy.pth
 #   bash scripts/run_test_HJ_humanoid_sac.sh <policy.pth> --num_runs 3
+#   bash scripts/run_test_HJ_humanoid_sac.sh <policy.pth> --mode switching   # single mode
 
 set -euo pipefail
 
@@ -28,7 +30,8 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] policy: ${POLICY_PATH}"
-echo "[INFO] compare modes: waypoint_only / safe_only / switching"
+echo "[INFO] compare modes: safe_only / waypoint_only / switching"
+echo "[INFO] waypoints: danger pass r=0.3 @ bin, back=(5.5,-2) r=1"
 
 exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac.py \
   --headless \
@@ -39,5 +42,11 @@ exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac.py \
   --config train_HJ_configs.yaml \
   --device cuda:0 \
   --policy_path "${POLICY_PATH}" \
+  --mode compare \
   --num_runs 5 \
+  --pass_radius 0.3 \
+  --back_center_x 5.5 \
+  --back_center_y -2.0 \
+  --back_radius 1.0 \
+  --goal_radius 0.1 \
   "$@"

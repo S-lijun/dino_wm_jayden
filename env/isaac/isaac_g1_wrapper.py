@@ -18,6 +18,8 @@ from env.isaac.waypoint_utils import (
     PASS_SIDE_CYCLE,
     PASS_SIDE_TRAIN,
     generate_random_waypoint_sequence,
+    sample_point_in_half_disk,
+    sample_point_in_region,
     waypoints_to_list,
 )
 
@@ -27,7 +29,7 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
     "blue_bin_0": {
         "default_z": 0.5,
         "rot": (0.5, 0.5, 0.5, 0.5),
-        "spawn_xy": (3.5, 0.0),
+        "spawn_xy": (3.5, -2.0),
     },
 }
 
@@ -129,8 +131,9 @@ class IsaacG1Wrapper:
         collision_force_threshold: float = 0.1,
         stuck_contact_steps: int = 50,
         waypoint_stop_thresh: float = 0.1,
-        # Soft corridor about the bin at (3.5, 0): leave room to pass left/right.
+        # Soft corridor about aisle centerline y_center (waypoints/bin at y=-2).
         y_bound: float = 0.0,
+        y_center: float = -2.0,
         # Far end of the aisle: x >= this truncates (same as y OOB).
         # Bin at x=3.5 → default wall at 4.5 (~1m past bin).
         x_bound_max: float = 4.5,
@@ -156,7 +159,7 @@ class IsaacG1Wrapper:
         # Buffer: keep bin fixed. Training: resample y on bin x (3.5) within obstacle_y_range.
         self._blue_bin_xy_fixed = (float(blue_bin_xy[0]), float(blue_bin_xy[1]))
         self.randomize_obstacle = False
-        self.obstacle_y_range = (-0.5, 0.5)
+        self.obstacle_y_range = (-2.5, -1.5)
         # Independent of y-jitter: with this prob hide the bin entirely on reset.
         self.obstacle_absent_prob = 0.0
         self.obstacle_present = True
@@ -165,8 +168,9 @@ class IsaacG1Wrapper:
         self.collision_force_threshold = collision_force_threshold
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
-        # y_bound <= 0 disables the soft |y| corridor (default: disabled).
+        # y_bound <= 0 disables the soft |y - y_center| corridor (default: disabled).
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
+        self.y_center = float(getattr(args_cli, "y_center", y_center))
         self.x_bound_max = float(getattr(args_cli, "x_bound_max", x_bound_max))
         # Copy defaults (start disk r=1, front disk r=0.5, left|right r=0.5, middle point).
         if trajectory_regions is not None:
@@ -192,7 +196,13 @@ class IsaacG1Wrapper:
         self.alternate_left_right = True
         # True only during buffer warm-up collision demos; test should set False.
         self.include_middle_pass = True
+        # If set to "left"/"right"/"middle", always use that pass side (skip cycle).
+        self.force_pass_side: str | None = None
+        # Formal-train option: alternate spawn half-disk and couple pass side.
+        # left hemisphere (y>=center) → left region; right (y<=center) → right.
+        self.spawn_hemisphere_pass: bool = False
         self._pass_side_toggle = 0  # indexes pass-side cycle
+        self._hemisphere_toggle = 0  # indexes left/right hemisphere alternation
         self.max_speed = max_speed
 
         if demos_dir is None:
@@ -385,8 +395,8 @@ class IsaacG1Wrapper:
         self._setup_contact_indices()
 
         self.commands = torch.zeros(1, 3, device=self.device)
-        self.waypoint = np.array([3.5, 1.0], dtype=np.float64)
-        self.waypoints = np.array([[3.5, 1.0]], dtype=np.float64)
+        self.waypoint = np.array([3.5, -0.5], dtype=np.float64)
+        self.waypoints = np.array([[3.5, -0.5]], dtype=np.float64)
         self.waypoint_region_names: list[str] = []
         self.current_waypoint_idx = 0
         self._link_stuck_counters: np.ndarray | None = None
@@ -429,12 +439,17 @@ class IsaacG1Wrapper:
             )
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
-        """Sample start → front → left|right|(middle) (no behind-bin goal).
+        """Sample waypoint sequence from ``trajectory_region_sequence``.
 
-        - ``include_middle_pass=True`` (QP critic / buffer): left|right|middle.
-          Random when ``randomize_obstacle`` else cycle (buffer).
-        - ``include_middle_pass=False`` (actor train / test): left|right only.
+        - Buffer (``include_middle_pass=True``): start → front → left|right|middle
+          (cycle unless ``force_pass_side`` / ``randomize_obstacle``).
+        - Formal train (``include_middle_pass=False``): start → left|right.
+        - ``spawn_hemisphere_pass=True`` (formal train only): alternate spawn
+          half-disk coupled to matching left/right (no front/middle).
         """
+        if bool(getattr(self, "spawn_hemisphere_pass", False)):
+            return self._sample_hemisphere_coupled_sequence(rng)
+
         sequence: list[str | tuple[str, ...]] = []
         for entry in self.trajectory_region_sequence:
             if (
@@ -442,7 +457,15 @@ class IsaacG1Wrapper:
                 and isinstance(entry, tuple)
                 and set(entry) >= set(PASS_SIDE_TRAIN)
             ):
-                if self.include_middle_pass:
+                forced = getattr(self, "force_pass_side", None)
+                if forced:
+                    side = str(forced)
+                    if side not in self.trajectory_regions:
+                        raise KeyError(
+                            f"force_pass_side={side!r} not in trajectory_regions "
+                            f"{list(self.trajectory_regions)}"
+                        )
+                elif self.include_middle_pass:
                     # Critic-only: collision demos (middle) are useful; no actor to spoil.
                     if self.randomize_obstacle:
                         side = str(rng.choice(PASS_SIDE_CYCLE))
@@ -464,6 +487,25 @@ class IsaacG1Wrapper:
             trajectory_regions=self.trajectory_regions,
             trajectory_region_sequence=sequence,
         )
+
+    def _sample_hemisphere_coupled_sequence(
+        self, rng: np.random.Generator
+    ) -> tuple[np.ndarray, list[str]]:
+        """Alternate L/R spawn half-disk; pass-side region matches that half."""
+        side = PASS_SIDE_TRAIN[self._hemisphere_toggle % len(PASS_SIDE_TRAIN)]
+        self._hemisphere_toggle += 1
+        if "start" not in self.trajectory_regions:
+            raise KeyError("spawn_hemisphere_pass requires a 'start' region")
+        if side not in self.trajectory_regions:
+            raise KeyError(
+                f"spawn_hemisphere_pass side={side!r} missing from "
+                f"{list(self.trajectory_regions)}"
+            )
+        start_pt = sample_point_in_half_disk(
+            self.trajectory_regions["start"], rng, side=side
+        )
+        goal_pt = sample_point_in_region(self.trajectory_regions[side], rng)
+        return np.stack([start_pt, goal_pt], axis=0), ["start", side]
 
     def _reset_stuck_counters(self) -> None:
         n = len(self._collision_link_indices)
@@ -493,20 +535,75 @@ class IsaacG1Wrapper:
         target = self.waypoint
         return float(np.hypot(target[0] - base_pos[0], target[1] - base_pos[1]))
 
-    def advance_waypoint_if_reached(self) -> bool:
-        """Move to next region waypoint when within stop threshold. Returns True if all done."""
-        if self.distance_to_current_waypoint() >= self.waypoint_stop_thresh:
-            return False
+    def _robot_xy_world(self) -> np.ndarray:
+        base_pos, _ = self.get_robot_base_pose()
+        return np.asarray([float(base_pos[0]), float(base_pos[1])], dtype=np.float64)
 
-        self.current_waypoint_idx += 1
+    def _passed_current_waypoint(self, robot_xy: np.ndarray) -> bool:
+        """True if robot is geometrically past the current via along prev→curr.
+
+        Needed for switching: SF may drive past a via without entering
+        ``waypoint_stop_thresh``; when nominal resumes it must not turn back.
+        Terminal goal is never skipped this way (proximity only).
+        """
         waypoint_list = waypoints_to_list(self.waypoints)
-        if self.current_waypoint_idx >= len(waypoint_list):
+        i = int(self.current_waypoint_idx)
+        # Last waypoint = goal: only "reached", never "passed".
+        if i < 0 or i >= len(waypoint_list) - 1:
+            return False
+        curr = np.asarray(waypoint_list[i], dtype=np.float64).reshape(2)
+        prev = (
+            np.asarray(waypoint_list[i - 1], dtype=np.float64).reshape(2)
+            if i > 0
+            else curr - np.array([1.0, 0.0], dtype=np.float64)
+        )
+        seg = curr - prev
+        seg_norm2 = float(np.dot(seg, seg))
+        if seg_norm2 < 1e-8:
+            # Degenerate segment: fall back to plane facing the next via.
+            nxt = np.asarray(waypoint_list[i + 1], dtype=np.float64).reshape(2)
+            fwd = nxt - curr
+            fwd_norm = float(np.linalg.norm(fwd))
+            if fwd_norm < 1e-8:
+                return False
+            return float(np.dot(robot_xy - curr, fwd / fwd_norm)) > 0.05
+        # Parametric progress along prev→curr; t>=1 means at/past curr.
+        t = float(np.dot(robot_xy - prev, seg) / seg_norm2)
+        return t >= 1.0
+
+    def advance_waypoint_if_reached(self) -> bool:
+        """Advance when within stop thresh OR past the via (SF overshoot).
+
+        Returns True if all waypoints are done.
+        """
+        waypoint_list = waypoints_to_list(self.waypoints)
+        if not waypoint_list:
             return True
 
-        self.waypoint = waypoint_list[self.current_waypoint_idx]
+        robot_xy = self._robot_xy_world()
+        advanced = False
+        while self.current_waypoint_idx < len(waypoint_list):
+            dist = self.distance_to_current_waypoint()
+            reached = dist < self.waypoint_stop_thresh
+            passed = self._passed_current_waypoint(robot_xy)
+            if not (reached or passed):
+                break
+            advanced = True
+            self.current_waypoint_idx += 1
+            if self.current_waypoint_idx >= len(waypoint_list):
+                return True
+            self.waypoint = waypoint_list[self.current_waypoint_idx]
+            # Loop: SF may have overshot several vias in one step.
+        if advanced:
+            # Refresh cached current waypoint after multi-skip.
+            self.waypoint = waypoint_list[self.current_waypoint_idx]
         return False
 
-    def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
+    def reset_scene(
+        self,
+        seed: int | None = None,
+        fixed_layout: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Reset sim, place bin, waypoints; spawn at sampled start (disk around origin).
 
         Obstacle: fixed at ``_blue_bin_xy_fixed`` when ``randomize_obstacle=False``.
@@ -514,24 +611,44 @@ class IsaacG1Wrapper:
         Independently, with ``obstacle_absent_prob`` park the bin behind the
         robot spawn (facing +x → behind = smaller x) so front camera/LiDAR
         cannot see it; LiDAR hits are also ignored so l stays clean.
+
+        If ``fixed_layout`` is provided (from a prior reset return / capture),
+        reuse that bin pose + waypoint sequence instead of resampling — used by
+        multi-mode eval so SF / waypoint / switching see the same scene.
         """
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
         obs, _ = self.env.reset()
 
-        bin_x = float(self._blue_bin_xy_fixed[0])
-        if self.randomize_obstacle:
-            y0, y1 = self.obstacle_y_range
-            bin_y = float(self._rng.uniform(float(y0), float(y1)))
+        if fixed_layout is not None:
+            bin_xy = fixed_layout.get("blue_bin_xy", fixed_layout.get("bin_xy"))
+            if bin_xy is None:
+                raise ValueError("fixed_layout requires blue_bin_xy")
+            self._blue_bin_xy = (float(bin_xy[0]), float(bin_xy[1]))
+            self.obstacle_present = bool(fixed_layout.get("obstacle_present", True))
+            self.waypoints = np.asarray(fixed_layout["waypoints"], dtype=np.float64).copy()
+            self.waypoint_region_names = list(
+                fixed_layout.get("waypoint_region_names", [])
+            )
         else:
-            bin_y = float(self._blue_bin_xy_fixed[1])
-        self._blue_bin_xy = (bin_x, bin_y)
+            bin_x = float(self._blue_bin_xy_fixed[0])
+            if self.randomize_obstacle:
+                y0, y1 = self.obstacle_y_range
+                bin_y = float(self._rng.uniform(float(y0), float(y1)))
+            else:
+                bin_y = float(self._blue_bin_xy_fixed[1])
+            self._blue_bin_xy = (bin_x, bin_y)
 
-        absent_p = float(self.obstacle_absent_prob)
-        self.obstacle_present = bool(absent_p <= 0.0 or self._rng.random() >= absent_p)
+            absent_p = float(self.obstacle_absent_prob)
+            self.obstacle_present = bool(
+                absent_p <= 0.0 or self._rng.random() >= absent_p
+            )
 
-        self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(self._rng)
+            self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(
+                self._rng
+            )
+
         waypoint_list = waypoints_to_list(self.waypoints)
         self.current_waypoint_idx = 0
         self.waypoint = waypoint_list[0].copy()
@@ -598,6 +715,7 @@ class IsaacG1Wrapper:
             "active_obstacles": list(self._active_obstacles),
             "obstacle_present": bool(self.obstacle_present),
             "robot_xy": robot_xy,
+            "blue_bin_xy": (float(self._blue_bin_xy[0]), float(self._blue_bin_xy[1])),
             "obstacle_positions": obstacle_positions,
             "waypoint": self.waypoint.copy(),
             "waypoints": self.waypoints.copy(),
@@ -767,11 +885,11 @@ class IsaacG1Wrapper:
         )
 
     def is_out_of_y_bounds(self) -> bool:
-        """True if env-local |y| exceeds soft corridor. Disabled when y_bound <= 0."""
+        """True if |y - y_center| exceeds soft corridor. Disabled when y_bound <= 0."""
         if self.y_bound <= 0.0:
             return False
         xy = self.get_robot_xy_local()
-        return bool(abs(float(xy[1])) > self.y_bound)
+        return bool(abs(float(xy[1]) - float(self.y_center)) > self.y_bound)
 
     def is_out_of_x_bounds(self) -> bool:
         """True if env-local x exceeds the far boundary (default x >= 4)."""

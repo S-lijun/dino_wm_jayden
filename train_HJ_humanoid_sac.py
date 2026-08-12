@@ -3,9 +3,10 @@
 Uses PyHJ ``avoid_SACPolicy_annealing`` (stochastic ActorProb + twin critics),
 NOT DDPG. Separate from ``train_HJ_humanoid.py`` / ``train_HJ_humanoid_qp.py``.
 
-Pipeline mirrors DDPG humanoid:
+Pipeline:
   waypoint buffer → critic warmup → joint SAC actor+critics
-  train/collect: yaw free (vx, vy, yaw all trained); buffer pass-side cycle includes middle.
+  buffer: start→front→left|right|middle; full waypoint cmds (vx, vy, yaw).
+  train: default yaw free; ``--freeze_yaw`` forces yaw=0 on SF + a_nom (vx/vy only).
 """
 
 import argparse
@@ -73,8 +74,14 @@ parser.add_argument(
 parser.add_argument(
     "--y_bound",
     type=float,
-    default=1.5,
-    help="Soft |y| corridor (meters). |y|>bound truncates+reset. <=0 disables.",
+    default=3.0,
+    help="Soft |y - y_center| half-width (m). <=0 disables.",
+)
+parser.add_argument(
+    "--y_center",
+    type=float,
+    default=-2.0,
+    help="Y corridor center (m). Matches aisle/waypoints after -2m shift.",
 )
 parser.add_argument(
     "--x_bound_max",
@@ -105,6 +112,31 @@ parser.add_argument(
     type=float,
     default=0.5,
     help="Penalty when |act| > 0.8. Set 0 to disable.",
+)
+parser.add_argument(
+    "--freeze_yaw",
+    action="store_true",
+    help=(
+        "Train/collect with yaw forced to 0 (SF + a_nom); only vx/vy are used. "
+        "Buffer warm-up still stores full waypoint yaw. Default: off (yaw free)."
+    ),
+)
+parser.add_argument(
+    "--force_right_pass",
+    action="store_true",
+    help=(
+        "Force every episode's pass-side waypoint to the right region "
+        "(buffer + formal train). Default off: keep left|right(|middle) cycle."
+    ),
+)
+parser.add_argument(
+    "--spawn_hemisphere_pass",
+    action="store_true",
+    help=(
+        "Formal train only: alternate spawn half-disks about (1.5,-2) and couple "
+        "pass-side (left half→left region, right half→right). Avoids cross-aisle "
+        "goals. Buffer always stays start→front→left|right|middle. Default off."
+    ),
 )
 parser.add_argument(
     "--alpha",
@@ -404,14 +436,31 @@ def main():
     policy._attach_act_nom = False
     action_reg_coef = float(args.action_reg_coef)
     boundary_reg_coef = float(args.boundary_reg_coef)
+    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
 
-    def _waypoint_acts_policy() -> np.ndarray:
+    def _zero_yaw_act(act):
+        """Force yaw (dim 2) to 0 in policy-space actions (tensor or ndarray)."""
+        if isinstance(act, torch.Tensor):
+            if act.shape[-1] < 3:
+                return act
+            out = act.clone()
+            out[..., 2] = 0.0
+            return out
+        out = np.array(act, dtype=np.float32, copy=True)
+        if out.ndim >= 1 and out.shape[-1] >= 3:
+            out[..., 2] = 0.0
+        return out
+
+    def _waypoint_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
         fns = train_envs.get_env_attr("compute_waypoint_nav_action")
         acts_env = np.stack(
             [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
             axis=0,
         )
-        return np.asarray(policy.map_action_inverse(acts_env), dtype=np.float32)
+        acts = np.asarray(policy.map_action_inverse(acts_env), dtype=np.float32)
+        if zero_yaw:
+            acts = _zero_yaw_act(acts)
+        return acts
 
     def _batch_act_nom_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor:
         act_nom = None
@@ -425,22 +474,27 @@ def main():
         )
         if act_nom_t.ndim == 1:
             act_nom_t = act_nom_t.unsqueeze(0)
+        # Train/BC: optional yaw=0 so we never imitate buffer yaw.
+        if freeze_yaw:
+            act_nom_t = _zero_yaw_act(act_nom_t)
         return act_nom_t
 
     _orig_policy_forward = policy.forward
 
     def _sac_forward(batch, state=None, input="obs", **kwargs):
-        """SAC forward (yaw free); optionally stash a_nom during collect."""
+        """SAC forward; optional yaw=0; stash a_nom during collect."""
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
+        if freeze_yaw:
+            out.act = _zero_yaw_act(out.act)
         if getattr(policy, "_attach_act_nom", False):
-            act_nom = _waypoint_acts_policy()
+            act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
             out.policy = Batch(act_nom=act_nom)
         return out
 
     policy.forward = _sac_forward  # type: ignore[method-assign]
 
     def learn_sac_humanoid(batch, **kwargs):
-        """Twin-critic HJ update + SAC actor (yaw free; no drone rot_cost)."""
+        """Twin-critic HJ update + SAC actor (optional freeze_yaw)."""
         del kwargs
         td1, critic1_loss = policy._mse_optimizer(
             batch, policy.critic1, policy.critic1_optim
@@ -459,7 +513,7 @@ def main():
 
         if not policy.warmup:
             obs_result = policy(batch)
-            act = obs_result.act
+            act = obs_result.act  # yaw already 0 if --freeze_yaw
             q = torch.min(
                 policy.critic1(batch.obs, act).flatten(),
                 policy.critic2(batch.obs, act).flatten(),
@@ -516,7 +570,8 @@ def main():
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
         f"λ_nom={action_reg_coef}, boundary={boundary_reg_coef}, "
-        f"yaw free (train SF + a_nom)"
+        f"freeze_yaw={freeze_yaw} "
+        f"({'SF+a_nom yaw=0, buffer keeps yaw' if freeze_yaw else 'yaw free'})"
     )
 
     if int(getattr(args, "wandb_video_every", 1)) != 0:
@@ -574,9 +629,11 @@ def main():
     logger.log_update_data = log_update_data_synced  # type: ignore[method-assign]
 
     def exploration_noise_stash(act, batch):
-        """SAC explores via rsample; do not replace actions. Stash env act (yaw free)."""
+        """SAC explores via rsample; do not replace actions. Stash env act."""
         del batch
         try:
+            if freeze_yaw:
+                act = _zero_yaw_act(act)
             if isinstance(act, torch.Tensor):
                 act_np = act.detach().cpu().numpy()
             else:
@@ -621,18 +678,96 @@ def main():
 
     train_collector.collect = _collect_with_act_nom  # type: ignore[method-assign]
 
-    # Buffer + train: with p=0.1 hide bin far away; LiDAR ignored so l→2.
+    # Scene layout (fresh train AND resume): spawn disk → left|right; bin fixed.
     obstacle_absent_p = 0.1
-    train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
-    print(
-        "[INFO] Collecting initial transitions with WaypointNavController "
-        "(start disk r=1 → front r=0.5 → cycle left|right|middle r=0.5; "
-        f"bin at (3.5,0) or absent p={obstacle_absent_p}; no behind-bin back)..."
+    bin_xy = (3.5, -2.0)
+    force_right_pass = bool(getattr(args, "force_right_pass", False))
+    spawn_hemisphere_pass = bool(getattr(args, "spawn_hemisphere_pass", False))
+    if force_right_pass and spawn_hemisphere_pass:
+        print(
+            "[WARN] --force_right_pass and --spawn_hemisphere_pass both set; "
+            "formal train uses spawn_hemisphere_pass (coupled L/R)."
+        )
+
+    def _apply_train_scene_layout(*, include_middle: bool) -> None:
+        """Shared layout for buffer / formal train / resume."""
+        train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
+        train_envs.set_env_attr("randomize_obstacle", False)
+        # Farther lateral goals: ±2.0m from bin y=-2 → y=0 / y=-4.
+        train_envs.set_env_attr(
+            "left_region",
+            {"center": np.array([3.5, 0.0], dtype=np.float64), "r": 0.5},
+        )
+        train_envs.set_env_attr(
+            "right_region",
+            {"center": np.array([3.5, -4.0], dtype=np.float64), "r": 0.5},
+        )
+        if include_middle:
+            # Buffer ALWAYS: spawn → front → left|right|middle (independent cycle).
+            # Hemisphere coupling is formal-train only; never alter buffer path.
+            train_envs.set_env_attr(
+                "start_region",
+                {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
+            )
+            train_envs.set_env_attr(
+                "front_region",
+                {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 0.5},
+            )
+            train_envs.set_env_attr(
+                "trajectory_region_sequence",
+                ["start", "front", ("left", "right", "middle")],
+            )
+            train_envs.set_env_attr("include_middle_pass", True)
+            train_envs.set_env_attr("spawn_hemisphere_pass", False)
+            if force_right_pass:
+                train_envs.set_env_attr("force_pass_side", "right")
+            else:
+                train_envs.set_env_attr("force_pass_side", None)
+        else:
+            # Formal train: spawn disk → left|right (no front/middle).
+            train_envs.set_env_attr(
+                "start_region",
+                {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 1.0},
+            )
+            train_envs.set_env_attr(
+                "trajectory_region_sequence",
+                ["start", ("left", "right")],
+            )
+            train_envs.set_env_attr("include_middle_pass", False)
+            if spawn_hemisphere_pass:
+                train_envs.set_env_attr("spawn_hemisphere_pass", True)
+                train_envs.set_env_attr("force_pass_side", None)
+            else:
+                train_envs.set_env_attr("spawn_hemisphere_pass", False)
+                if force_right_pass:
+                    train_envs.set_env_attr("force_pass_side", "right")
+                else:
+                    train_envs.set_env_attr("force_pass_side", None)
+
+    yb = float(getattr(args, "y_bound", 0.0))
+    yc = float(getattr(args, "y_center", -2.0))
+    if spawn_hemisphere_pass:
+        train_pass_desc = "hemisphere-coupled alternate L/R"
+    elif force_right_pass:
+        train_pass_desc = "FORCE right only"
+    else:
+        train_pass_desc = "cycle left|right"
+    buffer_pass_desc = (
+        "FORCE right only" if force_right_pass else "cycle left|right|middle"
     )
-    train_envs.set_env_attr("randomize_obstacle", False)
-    train_envs.set_env_attr("include_middle_pass", True)
+
     _actor_forward = policy.forward
     _expl_fn = policy.exploration_noise
+
+    # Buffer warm-up always runs (fresh + resume): refill replay; honor force_right_pass.
+    _apply_train_scene_layout(include_middle=True)
+    print(
+        "[INFO] Collecting initial transitions with WaypointNavController "
+        f"(spawn=(0,-2)r=1 → front=(1.5,-2)r=0.5 → {buffer_pass_desc}; "
+        f"left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5; "
+        f"bin at {bin_xy} or absent p={obstacle_absent_p}; no behind-bin back"
+        f"{'; resume' if args.resume_policy else ''})..."
+    )
 
     def _waypoint_forward(batch, state=None, **kwargs):
         del batch, state, kwargs
@@ -647,7 +782,9 @@ def main():
             else:
                 act_np = np.asarray(act)
             act_env = policy.map_action(np.array(act_np, dtype=np.float64, copy=True))
-            policy.last_clean_act_env = np.asarray(act_env, dtype=np.float64).reshape(-1, 3)[0]
+            policy.last_clean_act_env = np.asarray(act_env, dtype=np.float64).reshape(
+                -1, 3
+            )[0]
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] waypoint act stash failed: {exc}")
             policy.last_clean_act_env = None
@@ -685,22 +822,13 @@ def main():
     )
     policy.forward = _actor_forward  # type: ignore[method-assign]
     policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
-    # Keep bin XY fixed when present; absent-prob stays on for formal train.
-    train_envs.set_env_attr("randomize_obstacle", False)
-    train_envs.set_env_attr("include_middle_pass", False)
-    train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
-    # Formal train: larger spawn disk around front corridor (not buffer's origin disk).
-    train_envs.set_env_attr(
-        "start_region",
-        {"center": np.array([1.5, 0.0], dtype=np.float64), "r": 1.5},
-    )
-    yb = float(getattr(args, "y_bound", 0.0))
+    _apply_train_scene_layout(include_middle=False)
     print(
         "[INFO] Buffer done; restoring SAC actor "
-        "(train: SAC controls; yaw free; spawn disk center=(1.5,0) r=1.5; "
-        "goal=cycle left|right r=0.5). "
-        f"Bin at (3.5,0) or absent p={obstacle_absent_p}; "
-        f"y_bound={'disabled' if yb <= 0 else f'±{yb} (OOB truncate+reset)'}."
+        f"(train: SAC controls; freeze_yaw={freeze_yaw}; "
+        f"spawn=(1.5,-2)r=1 → {train_pass_desc}; no front/middle). "
+        f"Bin at {bin_xy} or absent p={obstacle_absent_p}; "
+        f"y_bound={'disabled' if yb <= 0 else f'{yc}±{yb} (OOB truncate+reset)'}."
     )
 
     n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))

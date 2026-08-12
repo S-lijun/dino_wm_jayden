@@ -7,21 +7,22 @@ from typing import Any, Sequence
 import numpy as np
 
 # Scene shifted +1.5m in x (avoid GS issues near old origin).
-# Obstacle: FIXED at (3.5,0) during buffer; training resamples y∈[-0.5,0.5] on x=3.5.
-# start: spawn disk around (0,0), r=1; then front disk (1.5,0) r=0.5; then fork.
-# left / right: terminal goals beside the bin, disks r=0.5 at (3.5, ±1).
+# All waypoints shifted -2m in y (aisle centerline at y=-2).
+# Obstacle: FIXED at (3.5,-2); training may resample y∈[-2.5,-1.5] on x=3.5.
+# start: spawn disk around (0,-2), r=1; then front disk (1.5,-2) r=0.5; then fork.
+# left / right: terminal goals beside the bin, disks r=0.5 at (3.5, -0.5) / (3.5, -3.5).
 # middle: collision demos for critic (fixed point on the bin).
 # back: past the bin on the centerline (straight ahead behind obstacle).
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
-    "start": {"center": np.array([0.0, 0.0], dtype=np.float64), "r": 1.0},
-    "front": {"center": np.array([1.5, 0.0], dtype=np.float64), "r": 0.5},
-    "left": {"center": np.array([3.5, 1.0], dtype=np.float64), "r": 0.5},
-    "right": {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.5},
-    "middle": {"mode": "point", "xy": (3.5, 0.0)},
-    "back": {"mode": "point", "xy": (5.0, 0.0)},
+    "start": {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
+    "front": {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 0.5},
+    "left": {"center": np.array([3.5, -0.5], dtype=np.float64), "r": 0.5},
+    "right": {"center": np.array([3.5, -3.5], dtype=np.float64), "r": 0.5},
+    "middle": {"mode": "point", "xy": (3.5, -2.0)},
+    "back": {"mode": "point", "xy": (5.0, -2.0)},
 }
 
-# (0,0) -> (1.5,0) -> left|right|middle. No behind-bin back.
+# (0,-2) -> (1.5,-2) -> left|right|middle. No behind-bin back.
 # QP critic-only: buffer + train may include middle (collision demos).
 # Actor pipelines / test: disable middle via include_middle_pass=False.
 DEFAULT_TRAJECTORY_REGION_SEQUENCE: list[str | tuple[str, ...]] = [
@@ -63,6 +64,37 @@ def sample_point_in_region(
     theta = rng.uniform(0.0, 2.0 * np.pi)
     rr = radius * np.sqrt(rng.uniform(0.0, 1.0))
     return center + rr * np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
+
+
+def sample_point_in_half_disk(
+    region_cfg: dict[str, Any],
+    rng: np.random.Generator,
+    *,
+    side: str,
+) -> np.ndarray:
+    """Uniform sample in the left (+y) or right (-y) half of a disk region.
+
+    Facing +x: left hemisphere is y >= center_y; right is y <= center_y.
+    """
+    side = str(side).lower()
+    if side not in ("left", "right"):
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+    center = np.asarray(region_cfg["center"], dtype=np.float64).reshape(2)
+    for _ in range(256):
+        pt = sample_point_in_region(region_cfg, rng)
+        if side == "left" and float(pt[1]) >= float(center[1]):
+            return pt
+        if side == "right" and float(pt[1]) <= float(center[1]):
+            return pt
+    # Fallback: project a full-disk sample onto the correct half-plane.
+    pt = sample_point_in_region(region_cfg, rng)
+    if side == "left" and float(pt[1]) < float(center[1]):
+        pt = pt.copy()
+        pt[1] = float(center[1]) + abs(float(pt[1]) - float(center[1]))
+    elif side == "right" and float(pt[1]) > float(center[1]):
+        pt = pt.copy()
+        pt[1] = float(center[1]) - abs(float(pt[1]) - float(center[1]))
+    return pt
 
 
 def generate_random_waypoint_sequence(

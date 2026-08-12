@@ -1,16 +1,21 @@
 """Test SAC HJ safety filter on Isaac G1 latent humanoid.
 
-Loads ``train_HJ_humanoid_sac.py`` checkpoints (ActorProb + twin critics).
-Modes: switching / waypoint_only / safe_only (same gate as DDPG test, but SAC actor).
+Default: each trial freezes one scene and runs three controllers
+  - safe_only (SF only)
+  - waypoint_only (WaypointNavController)
+  - switching (Q-gate)
+then writes 3 videos + one overlay traj PNG.
 
-Cannot reuse ``test_HJ_humanoid.py`` (DDPG Actor / single critic).
+Test waypoint layout (not used in training):
+  start → front → left|right sampled in danger disk (bin center, r=0.3)
+  → back disk at (5.5, 0) r=1.0
 
 Usage::
 
   python test_HJ_humanoid_sac.py --headless --visual_mode rtx_rgb \\
     --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
     --policy_path runs/sac_hj_humanoid/.../epoch_id_N/policy.pth \\
-    --mode switching --num_runs 5
+    --num_runs 5
 """
 
 from __future__ import annotations
@@ -28,6 +33,13 @@ sys.path.insert(0, ISAACLAB_ROOT)
 
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
+
+COMPARE_MODES = ("safe_only", "waypoint_only", "switching")
+MODE_LABELS = {
+    "safe_only": "SF only",
+    "waypoint_only": "Waypoint only",
+    "switching": "Switching",
+}
 
 parser = argparse.ArgumentParser("Test SAC HJ filter on latent Humanoid (Isaac G1)")
 cli_args.add_rsl_rl_args(parser)
@@ -64,8 +76,9 @@ parser.add_argument(
 parser.add_argument(
     "--mode",
     type=str,
-    default="switching",
-    choices=["switching", "waypoint_only", "safe_only"],
+    default="compare",
+    choices=["compare", "switching", "waypoint_only", "safe_only"],
+    help="compare (default) = SF / waypoint / switching on the same scene.",
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
@@ -78,6 +91,36 @@ parser.add_argument("--max_visual_steps", type=int, default=400)
 parser.add_argument("--out_dir", type=str, default=None)
 parser.add_argument("--save_video", action="store_true", default=True)
 parser.add_argument("--no_save_video", action="store_true")
+parser.add_argument(
+    "--goal_radius",
+    type=float,
+    default=0.1,
+    help="Waypoint stop / goal success radius (m).",
+)
+parser.add_argument(
+    "--pass_radius",
+    type=float,
+    default=0.3,
+    help="Danger pass disk radius around obstacle for left|right vias (m).",
+)
+parser.add_argument(
+    "--back_center_x",
+    type=float,
+    default=5.5,
+    help="Back-region disk center x.",
+)
+parser.add_argument(
+    "--back_center_y",
+    type=float,
+    default=-2.0,
+    help="Back-region disk center y (aisle at y=-2).",
+)
+parser.add_argument(
+    "--back_radius",
+    type=float,
+    default=1.0,
+    help="Back-region disk radius (m).",
+)
 
 args_cli, remaining = parser.parse_known_args()
 
@@ -228,7 +271,6 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"--policy_path not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    # Auto-alpha buffers may be absent / differ; load matching keys strictly for nets.
     missing, unexpected = policy.load_state_dict(state, strict=False)
     if missing:
         print(f"[WARN] missing keys (ok if alpha-only): {missing}")
@@ -276,6 +318,197 @@ def safe_action_env(policy, z: np.ndarray, device: str) -> np.ndarray:
     return act_env
 
 
+def _robot_xy(env: LatentHumanoidEnv) -> np.ndarray:
+    return np.asarray(env.wrapper.get_robot_xy_local(), dtype=np.float64).reshape(2)
+
+
+def _capture_layout(env: LatentHumanoidEnv) -> dict:
+    layout = getattr(env, "_last_reset_layout", None)
+    if layout is None:
+        raise RuntimeError("No reset layout captured; call env.reset() first.")
+    return {
+        "blue_bin_xy": (
+            float(layout["blue_bin_xy"][0]),
+            float(layout["blue_bin_xy"][1]),
+        ),
+        "obstacle_present": bool(layout["obstacle_present"]),
+        "waypoints": np.asarray(layout["waypoints"], dtype=np.float64).copy(),
+        "waypoint_region_names": list(layout["waypoint_region_names"]),
+        "robot_xy": np.asarray(layout["robot_xy"], dtype=np.float64).copy(),
+    }
+
+
+def configure_test_waypoints(
+    env: LatentHumanoidEnv,
+    *,
+    pass_radius: float,
+    back_center_x: float,
+    back_center_y: float,
+    back_radius: float,
+    goal_radius: float,
+) -> None:
+    """Eval layout: start→front→danger left|right@bin→back disk."""
+    bin_xy = env.wrapper._blue_bin_xy_fixed
+    env.wrapper.include_middle_pass = False
+    env.wrapper.alternate_left_right = True
+    env.wrapper.obstacle_absent_prob = 0.0
+    env.wrapper.randomize_obstacle = False
+    env.wrapper.y_bound = 0.0
+    # Allow reaching back disk (~5.5±1); training wall at 4.5 would clip early.
+    env.wrapper.x_bound_max = float(back_center_x + back_radius + 1.0)
+    env.wrapper.trajectory_region_sequence = [
+        "start",
+        "front",
+        ("left", "right"),
+        "back",
+    ]
+    danger = {
+        "center": np.array([float(bin_xy[0]), float(bin_xy[1])], dtype=np.float64),
+        "r": float(pass_radius),
+    }
+    env.wrapper.trajectory_regions["left"] = {
+        "center": danger["center"].copy(),
+        "r": float(pass_radius),
+    }
+    env.wrapper.trajectory_regions["right"] = {
+        "center": danger["center"].copy(),
+        "r": float(pass_radius),
+    }
+    env.wrapper.trajectory_regions["back"] = {
+        "center": np.array(
+            [float(back_center_x), float(back_center_y)], dtype=np.float64
+        ),
+        "r": float(back_radius),
+    }
+    env.wrapper.waypoint_stop_thresh = float(goal_radius)
+    env.waypoint_nav.stop_thresh = float(goal_radius)
+    print(
+        f"[INFO] test waypoints: sequence={env.wrapper.trajectory_region_sequence} "
+        f"danger_pass=bin{tuple(bin_xy)} r={pass_radius} "
+        f"back=({back_center_x},{back_center_y}) r={back_radius} "
+        f"goal_radius={goal_radius} x_bound_max={env.wrapper.x_bound_max}"
+    )
+
+
+def _save_compare_traj(
+    *,
+    out_path: Path,
+    mode_trajs: dict[str, np.ndarray],
+    mode_ends: dict[str, str],
+    waypoints: np.ndarray,
+    obstacle_xy: np.ndarray,
+    pass_radius: float,
+    goal_radius: float,
+    run_id: int,
+) -> None:
+    """Overlay SF / waypoint / switching paths on one top-down PNG."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    wps = np.asarray(waypoints, dtype=np.float64).reshape(-1, 2)
+    goal_xy = wps[-1]
+    start_xy = wps[0]
+    vias = wps[1:-1] if wps.shape[0] > 2 else wps[1:]
+
+    style = {
+        "safe_only": {"color": "#1f77b4", "lw": 1.8, "z": 3},
+        "waypoint_only": {"color": "0.45", "lw": 1.6, "z": 2},
+        "switching": {"color": "#d62728", "lw": 1.8, "z": 4},
+    }
+
+    fig, ax = plt.subplots(figsize=(7.2, 5.2), dpi=150)
+    for mode in COMPARE_MODES:
+        traj = mode_trajs.get(mode)
+        if traj is None or len(traj) == 0:
+            continue
+        traj = np.asarray(traj, dtype=np.float64).reshape(-1, 2)
+        st = style[mode]
+        ax.plot(
+            traj[:, 0],
+            traj[:, 1],
+            "-",
+            color=st["color"],
+            linewidth=st["lw"],
+            zorder=st["z"],
+            label=MODE_LABELS[mode],
+        )
+
+    ax.scatter(
+        float(start_xy[0]),
+        float(start_xy[1]),
+        c="green",
+        s=45,
+        zorder=5,
+        label="start",
+    )
+    if vias.size:
+        ax.scatter(
+            vias[:, 0],
+            vias[:, 1],
+            c="cyan",
+            marker="x",
+            s=55,
+            zorder=5,
+            label="vias",
+        )
+    ax.scatter(
+        float(obstacle_xy[0]),
+        float(obstacle_xy[1]),
+        c="blue",
+        s=70,
+        zorder=5,
+        label="obstacle",
+    )
+    ax.add_patch(
+        Circle(
+            (float(obstacle_xy[0]), float(obstacle_xy[1])),
+            float(pass_radius),
+            fill=False,
+            edgecolor="blue",
+            linestyle=":",
+            linewidth=1.2,
+            label=f"pass region r={pass_radius:.2f}",
+        )
+    )
+    ax.add_patch(
+        Circle(
+            (float(goal_xy[0]), float(goal_xy[1])),
+            float(goal_radius),
+            fill=False,
+            edgecolor="red",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"goal r={goal_radius:.2f}",
+        )
+    )
+    ax.scatter(
+        float(goal_xy[0]),
+        float(goal_xy[1]),
+        c="red",
+        s=70,
+        marker="*",
+        zorder=6,
+        label="goal",
+    )
+
+    ends = ", ".join(
+        f"{MODE_LABELS[m]}={mode_ends.get(m, '?')}" for m in COMPARE_MODES
+    )
+    ax.set_title(f"run{run_id:02d} | {ends}", fontsize=9)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[INFO] Saved compare traj: {out_path}")
+
+
 def simulate_one(
     env: LatentHumanoidEnv,
     policy,
@@ -287,9 +520,18 @@ def simulate_one(
     save_video: bool,
     out_dir: Path,
     run_id: int,
+    fixed_layout: dict | None = None,
+    seed: int | None = None,
 ) -> dict:
-    z, info = env.reset()
+    if fixed_layout is None:
+        z, info = env.reset(seed=seed)
+        layout = _capture_layout(env)
+    else:
+        z, info = env.reset(seed=seed, options={"fixed_layout": fixed_layout})
+        layout = fixed_layout
+
     frames: list[np.ndarray] = []
+    traj = [_robot_xy(env)]
     h_s_last = float(env.wrapper.calculate_cost())
     hj_exec = env._hj_value(z)
     if save_video:
@@ -337,6 +579,7 @@ def simulate_one(
         min_hj_nom = min(min_hj_nom, q_nom)
 
         z, h_s, terminated, truncated, info = env.step(action)
+        traj.append(_robot_xy(env))
         h_s_last = float(h_s)
         if h_s < 0:
             constraint_violations += 1
@@ -385,6 +628,8 @@ def simulate_one(
         "final_h_s": h_s_last,
         "stuck": float(info.get("stuck", 0.0)),
         "video": video_path,
+        "traj": np.asarray(traj, dtype=np.float64),
+        "layout": layout,
     }
     print(
         f"[RUN {run_id}] mode={mode} end={end_reason} success={success} "
@@ -408,8 +653,9 @@ def main():
     stamp = datetime.now().strftime("%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac") / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
+    modes = list(COMPARE_MODES) if args.mode == "compare" else [args.mode]
     print(f"[INFO] out_dir={out_dir}")
-    print(f"[INFO] mode={args.mode} policy={args.policy_path}")
+    print(f"[INFO] modes={modes} policy={args.policy_path}")
 
     ckpt_dir = Path(args.dino_ckpt_dir)
     hydra_cfg = ckpt_dir / "hydra.yaml"
@@ -431,57 +677,108 @@ def main():
         latent_h=False,
         wandb_video_every=0,
     )
-    env.wrapper.include_middle_pass = False
-    env.wrapper.y_bound = 0.0
+    configure_test_waypoints(
+        env,
+        pass_radius=float(args.pass_radius),
+        back_center_x=float(args.back_center_x),
+        back_center_y=float(args.back_center_y),
+        back_radius=float(args.back_radius),
+        goal_radius=float(args.goal_radius),
+    )
     policy = build_policy(env, args, args.device)
     load_policy_checkpoint(policy, args.policy_path, args.device)
     env.policy_for_log = policy
 
     results = []
+    base_seed = int(getattr(args, "seed", 0))
     for run_id in range(int(args.num_runs)):
-        print(f"\n=== Run {run_id + 1}/{args.num_runs} ({args.mode}) ===")
-        results.append(
-            simulate_one(
+        print(f"\n=== Trial {run_id + 1}/{args.num_runs} modes={modes} ===")
+        trial_seed = base_seed + run_id
+        # First mode samples the scene; later modes reuse the same layout.
+        layout = None
+        mode_trajs: dict[str, np.ndarray] = {}
+        mode_ends: dict[str, str] = {}
+        for mode in modes:
+            r = simulate_one(
                 env,
                 policy,
-                mode=args.mode,
+                mode=mode,
                 device=args.device,
                 safety_threshold=float(args.safety_threshold),
                 max_visual_steps=int(args.max_visual_steps),
                 save_video=save_video,
                 out_dir=out_dir,
                 run_id=run_id,
+                fixed_layout=layout,
+                seed=trial_seed,
             )
-        )
+            if layout is None:
+                layout = r["layout"]
+                print(
+                    f"[INFO] frozen layout bin={layout['blue_bin_xy']} "
+                    f"waypoints={layout['waypoints'].tolist()} "
+                    f"names={layout['waypoint_region_names']}"
+                )
+            results.append(r)
+            mode_trajs[mode] = r["traj"]
+            mode_ends[mode] = r["end_reason"]
 
-    n = len(results)
-    n_ok = sum(1 for r in results if r["success"])
-    n_stuck = sum(1 for r in results if r["end_reason"] == "stuck")
-    n_oob = sum(1 for r in results if r["end_reason"] == "out_of_bounds")
-    mean_int = float(np.mean([r["hj_interventions"] for r in results])) if n else 0.0
-    mean_viol = float(np.mean([r["constraint_violations"] for r in results])) if n else 0.0
+        if args.mode == "compare" and layout is not None and len(modes) > 1:
+            _save_compare_traj(
+                out_path=out_dir / f"run{run_id:02d}_compare_traj.png",
+                mode_trajs=mode_trajs,
+                mode_ends=mode_ends,
+                waypoints=layout["waypoints"],
+                obstacle_xy=np.asarray(layout["blue_bin_xy"], dtype=np.float64),
+                pass_radius=float(args.pass_radius),
+                goal_radius=float(args.goal_radius),
+                run_id=run_id,
+            )
 
-    summary_path = out_dir / f"summary_{args.mode}.txt"
+    # Per-mode summary
     lines = [
-        f"mode={args.mode}",
         f"policy={args.policy_path}",
         f"algo=SAC",
-        f"runs={n}",
-        f"success={n_ok}/{n} ({100.0 * n_ok / max(n, 1):.1f}%)",
-        f"stuck={n_stuck}",
-        f"out_of_bounds={n_oob}",
-        f"mean_hj_interventions={mean_int:.2f}",
-        f"mean_constraint_violations={mean_viol:.2f}",
+        f"eval_mode={args.mode}",
+        f"modes={modes}",
+        f"pass_radius={float(args.pass_radius)}",
+        f"back=({float(args.back_center_x)},{float(args.back_center_y)}) "
+        f"r={float(args.back_radius)}",
+        f"goal_radius={float(args.goal_radius)}",
+        f"trials={int(args.num_runs)}",
         "",
-        "per-run:",
     ]
-    for r in results:
-        lines.append(
-            f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
-            f"steps={r['visual_steps']} int={r['hj_interventions']} "
-            f"viol={r['constraint_violations']} minQ={r['min_q_nom']}"
+    for mode in modes:
+        rs = [r for r in results if r["mode"] == mode]
+        n = len(rs)
+        n_ok = sum(1 for r in rs if r["success"])
+        n_stuck = sum(1 for r in rs if r["end_reason"] == "stuck")
+        n_oob = sum(1 for r in rs if r["end_reason"] == "out_of_bounds")
+        mean_int = float(np.mean([r["hj_interventions"] for r in rs])) if n else 0.0
+        mean_viol = (
+            float(np.mean([r["constraint_violations"] for r in rs])) if n else 0.0
         )
-    text = "\n".join(lines) + "\n"
+        lines.extend(
+            [
+                f"[{MODE_LABELS.get(mode, mode)}]",
+                f"  success={n_ok}/{n} ({100.0 * n_ok / max(n, 1):.1f}%)",
+                f"  stuck={n_stuck} out_of_bounds={n_oob}",
+                f"  mean_hj_interventions={mean_int:.2f}",
+                f"  mean_constraint_violations={mean_viol:.2f}",
+            ]
+        )
+        for r in rs:
+            lines.append(
+                f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
+                f"steps={r['visual_steps']} int={r['hj_interventions']} "
+                f"viol={r['constraint_violations']} minQ={r['min_q_nom']}"
+            )
+        lines.append("")
+
+    text = "\n".join(lines)
+    summary_path = out_dir / (
+        "summary_compare.txt" if args.mode == "compare" else f"summary_{args.mode}.txt"
+    )
     summary_path.write_text(text, encoding="utf-8")
     print("\n" + "=" * 60)
     print(text)
