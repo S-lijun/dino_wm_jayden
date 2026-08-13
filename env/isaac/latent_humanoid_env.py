@@ -203,6 +203,15 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.force_pass_side = str(value)
 
     @property
+    def advance_passed_terminal(self) -> bool:
+        return bool(getattr(self.wrapper, "advance_passed_terminal", False))
+
+    @advance_passed_terminal.setter
+    def advance_passed_terminal(self, value: bool) -> None:
+        """If True, geometrically passing the last waypoint completes it."""
+        self.wrapper.advance_passed_terminal = bool(value)
+
+    @property
     def spawn_hemisphere_pass(self) -> bool:
         return bool(getattr(self.wrapper, "spawn_hemisphere_pass", False))
 
@@ -265,6 +274,23 @@ class LatentHumanoidEnv(gym.Env):
     @right_region.setter
     def right_region(self, value: dict) -> None:
         self.set_region("right", value)
+
+    @property
+    def back_region(self) -> dict:
+        return self.wrapper.trajectory_regions["back"]
+
+    @back_region.setter
+    def back_region(self, value: dict) -> None:
+        """Override behind-bin goal disk (switch-collect train / test)."""
+        self.set_region("back", value)
+
+    @property
+    def x_bound_max(self) -> float:
+        return float(self.wrapper.x_bound_max)
+
+    @x_bound_max.setter
+    def x_bound_max(self, value: float) -> None:
+        self.wrapper.x_bound_max = float(value)
 
     @property
     def obstacle_absent_prob(self) -> float:

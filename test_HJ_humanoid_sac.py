@@ -9,6 +9,7 @@ then writes 3 videos + one overlay traj PNG.
 Test waypoint layout (not used in training):
   start → front → left|right sampled in danger disk (bin center, r=0.3)
   → back disk at (5.5, 0) r=1.0
+  Every 5 trials, exactly one has no blue bin; other sampling is unchanged.
 
 Usage::
 
@@ -81,6 +82,15 @@ parser.add_argument(
     help="compare (default) = SF / waypoint / switching on the same scene.",
 )
 parser.add_argument("--num_runs", type=int, default=5)
+parser.add_argument(
+    "--no_bin_every",
+    type=int,
+    default=5,
+    help=(
+        "In each block of this many trials, exactly one has no blue bin "
+        "(waypoints / spawn otherwise unchanged). 0 disables."
+    ),
+)
 parser.add_argument(
     "--safety_threshold",
     type=float,
@@ -338,6 +348,19 @@ def _capture_layout(env: LatentHumanoidEnv) -> dict:
     }
 
 
+def _no_bin_run_ids(
+    num_runs: int, every: int, rng: np.random.Generator
+) -> set[int]:
+    """Pick exactly one no-bin trial in each block of ``every`` runs."""
+    if every <= 0 or num_runs <= 0:
+        return set()
+    ids: set[int] = set()
+    for start in range(0, int(num_runs), int(every)):
+        block = np.arange(start, min(start + int(every), int(num_runs)))
+        ids.add(int(rng.choice(block)))
+    return ids
+
+
 def configure_test_waypoints(
     env: LatentHumanoidEnv,
     *,
@@ -400,6 +423,7 @@ def _save_compare_traj(
     pass_radius: float,
     goal_radius: float,
     run_id: int,
+    obstacle_present: bool = True,
 ) -> None:
     """Overlay SF / waypoint / switching paths on one top-down PNG."""
     import matplotlib
@@ -454,25 +478,26 @@ def _save_compare_traj(
             zorder=5,
             label="vias",
         )
-    ax.scatter(
-        float(obstacle_xy[0]),
-        float(obstacle_xy[1]),
-        c="blue",
-        s=70,
-        zorder=5,
-        label="obstacle",
-    )
-    ax.add_patch(
-        Circle(
-            (float(obstacle_xy[0]), float(obstacle_xy[1])),
-            float(pass_radius),
-            fill=False,
-            edgecolor="blue",
-            linestyle=":",
-            linewidth=1.2,
-            label=f"pass region r={pass_radius:.2f}",
+    if obstacle_present:
+        ax.scatter(
+            float(obstacle_xy[0]),
+            float(obstacle_xy[1]),
+            c="blue",
+            s=70,
+            zorder=5,
+            label="obstacle",
         )
-    )
+        ax.add_patch(
+            Circle(
+                (float(obstacle_xy[0]), float(obstacle_xy[1])),
+                float(pass_radius),
+                fill=False,
+                edgecolor="blue",
+                linestyle=":",
+                linewidth=1.2,
+                label=f"pass region r={pass_radius:.2f}",
+            )
+        )
     ax.add_patch(
         Circle(
             (float(goal_xy[0]), float(goal_xy[1])),
@@ -497,7 +522,8 @@ def _save_compare_traj(
     ends = ", ".join(
         f"{MODE_LABELS[m]}={mode_ends.get(m, '?')}" for m in COMPARE_MODES
     )
-    ax.set_title(f"run{run_id:02d} | {ends}", fontsize=9)
+    bin_tag = "bin" if obstacle_present else "no bin"
+    ax.set_title(f"run{run_id:02d} | {bin_tag} | {ends}", fontsize=9)
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_aspect("equal", adjustable="box")
@@ -691,11 +717,35 @@ def main():
 
     results = []
     base_seed = int(getattr(args, "seed", 0))
+    no_bin_every = int(getattr(args, "no_bin_every", 5))
+    no_bin_ids = _no_bin_run_ids(
+        int(args.num_runs),
+        no_bin_every,
+        np.random.default_rng(base_seed + 17),
+    )
+    if no_bin_ids:
+        pretty = ", ".join(str(i + 1) for i in sorted(no_bin_ids))
+        print(
+            f"[INFO] no blue bin on trial(s) {pretty} "
+            f"(1 per {no_bin_every} trials; waypoints otherwise unchanged)"
+        )
+    else:
+        print("[INFO] blue bin present on every trial")
+
     for run_id in range(int(args.num_runs)):
-        print(f"\n=== Trial {run_id + 1}/{args.num_runs} modes={modes} ===")
+        no_bin = run_id in no_bin_ids
+        # Sample spawn / waypoints as usual (bin always present in RNG), then
+        # optionally hide the bin so the rest of the trial is unchanged.
+        env.wrapper.obstacle_absent_prob = 0.0
         trial_seed = base_seed + run_id
-        # First mode samples the scene; later modes reuse the same layout.
-        layout = None
+        env.reset(seed=trial_seed)
+        layout = _capture_layout(env)
+        if no_bin:
+            layout["obstacle_present"] = False
+        print(
+            f"\n=== Trial {run_id + 1}/{args.num_runs} modes={modes} "
+            f"blue_bin={'absent' if no_bin else 'present'} ==="
+        )
         mode_trajs: dict[str, np.ndarray] = {}
         mode_ends: dict[str, str] = {}
         for mode in modes:
@@ -712,10 +762,10 @@ def main():
                 fixed_layout=layout,
                 seed=trial_seed,
             )
-            if layout is None:
-                layout = r["layout"]
+            if mode == modes[0]:
                 print(
                     f"[INFO] frozen layout bin={layout['blue_bin_xy']} "
+                    f"obstacle_present={layout['obstacle_present']} "
                     f"waypoints={layout['waypoints'].tolist()} "
                     f"names={layout['waypoint_region_names']}"
                 )
@@ -733,6 +783,7 @@ def main():
                 pass_radius=float(args.pass_radius),
                 goal_radius=float(args.goal_radius),
                 run_id=run_id,
+                obstacle_present=bool(layout["obstacle_present"]),
             )
 
     # Per-mode summary
@@ -746,6 +797,8 @@ def main():
         f"r={float(args.back_radius)}",
         f"goal_radius={float(args.goal_radius)}",
         f"trials={int(args.num_runs)}",
+        f"no_bin_every={no_bin_every} no_bin_trials="
+        f"{sorted(i + 1 for i in no_bin_ids)}",
         "",
     ]
     for mode in modes:
@@ -770,6 +823,7 @@ def main():
         for r in rs:
             lines.append(
                 f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
+                f"bin={'absent' if not r['layout']['obstacle_present'] else 'present'} "
                 f"steps={r['visual_steps']} int={r['hj_interventions']} "
                 f"viol={r['constraint_violations']} minQ={r['min_q_nom']}"
             )

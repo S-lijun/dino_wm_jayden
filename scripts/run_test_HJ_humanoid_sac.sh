@@ -4,6 +4,7 @@
 # Each trial freezes the same scene:
 #   start → front → left|right in danger disk (bin center, r=0.3) → back disk (5.5,0) r=1
 # runs all three controllers, writes 3 videos + 1 overlay traj PNG.
+# Every 5 trials, exactly one has no blue bin (waypoints otherwise unchanged).
 #
 # Usage:
 #   bash scripts/run_test_HJ_humanoid_sac.sh runs/sac_hj_humanoid/.../epoch_id_N/policy.pth

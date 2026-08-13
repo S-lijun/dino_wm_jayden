@@ -1,13 +1,29 @@
+import os
+
 import torch
 import torch.nn as nn
 
-torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
+torch.hub._validate_not_a_forked_repo = lambda a, b, c: True
+
+
+def _load_dinov2(name: str):
+    """Load DINOv2 from the local torch hub cache; avoid GitHub if possible."""
+    hub_dir = torch.hub.get_dir()
+    local_repo = os.path.join(hub_dir, "facebookresearch_dinov2_main")
+    hubconf = os.path.join(local_repo, "hubconf.py")
+    if os.path.isfile(hubconf):
+        print(f"[INFO] Loading DINOv2 from local hub cache: {local_repo}", flush=True)
+        return torch.hub.load(local_repo, name, source="local", trust_repo=True)
+    # Pin :main so torch.hub does not probe GitHub for the default branch.
+    print("[INFO] Local DINOv2 hub cache missing; loading facebookresearch/dinov2:main", flush=True)
+    return torch.hub.load("facebookresearch/dinov2:main", name, trust_repo=True)
+
 
 class DinoV2Encoder(nn.Module):
     def __init__(self, name, feature_key):
         super().__init__()
         self.name = name
-        self.base_model = torch.hub.load("facebookresearch/dinov2", name)
+        self.base_model = _load_dinov2(name)
         self.feature_key = feature_key
         self.emb_dim = self.base_model.num_features
         if feature_key == "x_norm_patchtokens":

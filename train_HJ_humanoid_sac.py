@@ -8,7 +8,8 @@ Pipeline:
   buffer: start→front→left|right|middle; full waypoint cmds (vx, vy, yaw).
   train: default yaw free; ``--freeze_yaw`` forces yaw=0 on SF + a_nom (vx/vy only).
   ``--switch_collect``: formal collect uses Q-gate (waypoint if Q(a_nom)>=thr else SF).
-    Actor loss is pure SAC (no λ_nom, no boundary); SF still updates every learn step.
+    Path: spawn → left|right via at the bin → back disk behind the bin.
+    After the bin, Q>=0 → nominal goes to back. Actor is pure SAC (no λ_nom / boundary).
 """
 
 import argparse
@@ -793,21 +794,19 @@ def main():
         )
 
     def _apply_train_scene_layout(*, include_middle: bool) -> None:
-        """Shared layout for buffer / formal train / resume."""
+        """Training layout only. Never reads test_HJ knobs (no_bin / pass_radius / danger disk)."""
         train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
         train_envs.set_env_attr("randomize_obstacle", False)
-        # Farther lateral goals: ±2.0m from bin y=-2 → y=0 / y=-4.
-        train_envs.set_env_attr(
-            "left_region",
-            {"center": np.array([3.5, 0.0], dtype=np.float64), "r": 0.5},
-        )
-        train_envs.set_env_attr(
-            "right_region",
-            {"center": np.array([3.5, -4.0], dtype=np.float64), "r": 0.5},
-        )
+        train_envs.set_env_attr("advance_passed_terminal", False)
+        # SF-only formal: far lateral goals. Buffer + switch-collect: vias by the bin.
+        far_left = {"center": np.array([3.5, 0.0], dtype=np.float64), "r": 0.5}
+        far_right = {"center": np.array([3.5, -4.0], dtype=np.float64), "r": 0.5}
+        via_left = {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.5}
+        via_right = {"center": np.array([3.5, -3.0], dtype=np.float64), "r": 0.5}
         if include_middle:
             # Buffer ALWAYS: spawn → front → left|right|middle (independent cycle).
-            # Hemisphere coupling is formal-train only; never alter buffer path.
+            train_envs.set_env_attr("left_region", via_left)
+            train_envs.set_env_attr("right_region", via_right)
             train_envs.set_env_attr(
                 "start_region",
                 {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
@@ -821,6 +820,7 @@ def main():
                 ["start", "front", ("left", "right", "middle")],
             )
             train_envs.set_env_attr("include_middle_pass", True)
+            train_envs.set_env_attr("x_bound_max", float(getattr(args, "x_bound_max", 4.5)))
             train_envs.set_env_attr("spawn_hemisphere_pass", False)
             if force_right_pass:
                 train_envs.set_env_attr("force_pass_side", "right")
@@ -832,10 +832,38 @@ def main():
                 "start_region",
                 {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 1.0},
             )
-            train_envs.set_env_attr(
-                "trajectory_region_sequence",
-                ["start", ("left", "right")],
-            )
+            if switch_collect:
+                # Opt-in --switch_collect only: closer L/R vias + back disk.
+                train_envs.set_env_attr("left_region", via_left)
+                train_envs.set_env_attr("right_region", via_right)
+                back_xy = (5.5, -2.0)
+                back_r = 1.0
+                train_envs.set_env_attr(
+                    "back_region",
+                    {
+                        "center": np.array(
+                            [back_xy[0], back_xy[1]], dtype=np.float64
+                        ),
+                        "r": back_r,
+                    },
+                )
+                train_envs.set_env_attr(
+                    "trajectory_region_sequence",
+                    ["start", ("left", "right"), "back"],
+                )
+                train_envs.set_env_attr(
+                    "x_bound_max", float(back_xy[0] + back_r + 1.0)
+                )
+            else:
+                train_envs.set_env_attr("left_region", far_left)
+                train_envs.set_env_attr("right_region", far_right)
+                train_envs.set_env_attr(
+                    "trajectory_region_sequence",
+                    ["start", ("left", "right")],
+                )
+                train_envs.set_env_attr(
+                    "x_bound_max", float(getattr(args, "x_bound_max", 4.5))
+                )
             train_envs.set_env_attr("include_middle_pass", False)
             if spawn_hemisphere_pass:
                 train_envs.set_env_attr("spawn_hemisphere_pass", True)
@@ -867,7 +895,7 @@ def main():
     print(
         "[INFO] Collecting initial transitions with WaypointNavController "
         f"(spawn=(0,-2)r=1 → front=(1.5,-2)r=0.5 → {buffer_pass_desc}; "
-        f"left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5; "
+        f"left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5; "
         f"bin at {bin_xy} or absent p={obstacle_absent_p}; no behind-bin back"
         f"{'; resume' if args.resume_policy else ''})..."
     )
@@ -929,14 +957,22 @@ def main():
     if switch_collect:
         train_ctrl_desc = (
             f"Q-gate switch (thr={switch_threshold:g}: "
-            "waypoint if Q(a_nom)>=thr else SF; actor=pure SAC)"
+            "waypoint if Q(a_nom)>=thr else SF; actor=pure SAC; "
+            "start→L|R via→back; SF pass-via then nominal to back)"
         )
     else:
         train_ctrl_desc = "SAC controls"
     print(
         "[INFO] Buffer done; restoring SAC actor "
         f"(train: {train_ctrl_desc}; freeze_yaw={freeze_yaw}; "
-        f"spawn=(1.5,-2)r=1 → {train_pass_desc}; no front/middle). "
+        f"spawn=(1.5,-2)r=1 → {train_pass_desc}"
+        + (
+            " → back=(5.5,-2)r=1; left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5; "
+            "no front/middle"
+            if switch_collect
+            else "; left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5; no front/middle/back"
+        )
+        + "). "
         f"Bin at {bin_xy} or absent p={obstacle_absent_p}; "
         f"y_bound={'disabled' if yb <= 0 else f'{yc}±{yb} (OOB truncate+reset)'}."
     )

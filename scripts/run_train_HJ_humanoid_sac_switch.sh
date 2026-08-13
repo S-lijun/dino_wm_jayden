@@ -2,8 +2,10 @@
 # Train SAC HJ safety filter with Q-gate switching on Isaac G1 + DINO-WM.
 #
 # Formal collect (after waypoint buffer + critic warmup):
+#   path: spawn → left|right via at the bin → back disk (5.5,-2) r=1
 #   Q(z, a_nom) >= 0  → waypoint controller interacts with the env
 #   Q(z, a_nom) <  0  → safety filter interacts with the env
+# After the bin, Q>=0 so nominal typically drives to the back goal.
 # Actor is pure SAC (no λ_nom, no boundary). SF still updates every learn step;
 # only the executed action is switched.
 #

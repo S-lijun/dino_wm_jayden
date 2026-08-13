@@ -2,10 +2,10 @@
 # Train SAC HJ safety filter on Isaac G1 + DINO-WM.
 #
 # Usage:
+# Formal train uses spawn-hemisphere L/R by default.
 #   bash scripts/run_train_HJ_humanoid_sac.sh
 #   bash scripts/run_train_HJ_humanoid_sac.sh --freeze_yaw
 #   bash scripts/run_train_HJ_humanoid_sac.sh --force_right_pass
-#   bash scripts/run_train_HJ_humanoid_sac.sh --spawn_hemisphere_pass
 #   bash scripts/run_train_HJ_humanoid_sac.sh --resume_policy runs/sac_hj_humanoid/.../epoch_id_N/policy.pth --force_right_pass --freeze_yaw
 
 set -euo pipefail
@@ -51,10 +51,11 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --gamma-pyhj 0.98 \
   --critic_warmup_updates 1000 \
   --actor_bc_warmup_updates 0 \
-  --action_reg_coef 0.0 \
+  --action_reg_coef 0.1 \
   --boundary_reg_coef 0.5 \
   --y_bound 3.0 \
   --y_center -2.0 \
   --x_bound_max 4.5 \
   --auto_alpha \
+  --spawn_hemisphere_pass \
   "$@"

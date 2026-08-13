@@ -168,6 +168,10 @@ class IsaacG1Wrapper:
         self.collision_force_threshold = collision_force_threshold
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
+        # If True, geometrically passing the last waypoint also completes it
+        # (needed for switch-collect train: pass-side left|right is the goal).
+        # Test keeps False so the terminal back disk still requires proximity.
+        self.advance_passed_terminal = False
         # y_bound <= 0 disables the soft |y - y_center| corridor (default: disabled).
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
         self.y_center = float(getattr(args_cli, "y_center", y_center))
@@ -443,7 +447,8 @@ class IsaacG1Wrapper:
 
         - Buffer (``include_middle_pass=True``): start → front → left|right|middle
           (cycle unless ``force_pass_side`` / ``randomize_obstacle``).
-        - Formal train (``include_middle_pass=False``): start → left|right.
+        - Formal train (``include_middle_pass=False``): start → left|right
+          (switch-collect also appends behind-bin ``back``).
         - ``spawn_hemisphere_pass=True`` (formal train only): alternate spawn
           half-disk coupled to matching left/right (no front/middle).
         """
@@ -505,7 +510,17 @@ class IsaacG1Wrapper:
             self.trajectory_regions["start"], rng, side=side
         )
         goal_pt = sample_point_in_region(self.trajectory_regions[side], rng)
-        return np.stack([start_pt, goal_pt], axis=0), ["start", side]
+        pts = [start_pt, goal_pt]
+        names = ["start", side]
+        seq = list(self.trajectory_region_sequence)
+        has_back = any(
+            e == "back" or (isinstance(e, (tuple, list)) and "back" in e)
+            for e in seq
+        )
+        if has_back and "back" in self.trajectory_regions:
+            pts.append(sample_point_in_region(self.trajectory_regions["back"], rng))
+            names.append("back")
+        return np.stack(pts, axis=0), names
 
     def _reset_stuck_counters(self) -> None:
         n = len(self._collision_link_indices)
@@ -530,10 +545,9 @@ class IsaacG1Wrapper:
         return bool(np.any(self._link_stuck_counters >= self.stuck_contact_steps))
 
     def distance_to_current_waypoint(self) -> float:
-        robot = self.env.unwrapped.scene["robot"]
-        base_pos = robot.data.root_pos_w[0].cpu().numpy()
-        target = self.waypoint
-        return float(np.hypot(target[0] - base_pos[0], target[1] - base_pos[1]))
+        robot_xy = self.get_robot_xy_local()
+        target = np.asarray(self.waypoint, dtype=np.float64).reshape(2)
+        return float(np.hypot(target[0] - robot_xy[0], target[1] - robot_xy[1]))
 
     def _robot_xy_world(self) -> np.ndarray:
         base_pos, _ = self.get_robot_base_pose()
@@ -544,12 +558,15 @@ class IsaacG1Wrapper:
 
         Needed for switching: SF may drive past a via without entering
         ``waypoint_stop_thresh``; when nominal resumes it must not turn back.
-        Terminal goal is never skipped this way (proximity only).
+        Terminal goal is proximity-only unless ``advance_passed_terminal``.
         """
         waypoint_list = waypoints_to_list(self.waypoints)
         i = int(self.current_waypoint_idx)
-        # Last waypoint = goal: only "reached", never "passed".
-        if i < 0 or i >= len(waypoint_list) - 1:
+        if i < 0 or i >= len(waypoint_list):
+            return False
+        # Last waypoint = goal: skip-by-pass only when explicitly enabled
+        # (switch-collect train: left|right is the episode goal).
+        if i >= len(waypoint_list) - 1 and not bool(self.advance_passed_terminal):
             return False
         curr = np.asarray(waypoint_list[i], dtype=np.float64).reshape(2)
         prev = (
@@ -560,9 +577,13 @@ class IsaacG1Wrapper:
         seg = curr - prev
         seg_norm2 = float(np.dot(seg, seg))
         if seg_norm2 < 1e-8:
-            # Degenerate segment: fall back to plane facing the next via.
-            nxt = np.asarray(waypoint_list[i + 1], dtype=np.float64).reshape(2)
-            fwd = nxt - curr
+            # Degenerate segment: fall back to plane facing the next via,
+            # or +x if this is the terminal goal.
+            if i + 1 >= len(waypoint_list):
+                fwd = np.array([1.0, 0.0], dtype=np.float64)
+            else:
+                nxt = np.asarray(waypoint_list[i + 1], dtype=np.float64).reshape(2)
+                fwd = nxt - curr
             fwd_norm = float(np.linalg.norm(fwd))
             if fwd_norm < 1e-8:
                 return False
@@ -580,7 +601,7 @@ class IsaacG1Wrapper:
         if not waypoint_list:
             return True
 
-        robot_xy = self._robot_xy_world()
+        robot_xy = self.get_robot_xy_local()
         advanced = False
         while self.current_waypoint_idx < len(waypoint_list):
             dist = self.distance_to_current_waypoint()
