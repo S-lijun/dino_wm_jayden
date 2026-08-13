@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# Train SAC HJ safety filter on Isaac G1 + DINO-WM.
+# Train SAC HJ safety filter with Q-gate switching on Isaac G1 + DINO-WM.
+#
+# Formal collect (after waypoint buffer + critic warmup):
+#   Q(z, a_nom) >= 0  → waypoint controller interacts with the env
+#   Q(z, a_nom) <  0  → safety filter interacts with the env
+# Actor is pure SAC (no λ_nom, no boundary). SF still updates every learn step;
+# only the executed action is switched.
+#
+# Does NOT replace run_train_HJ_humanoid_sac.sh (that run stays SF-only collect
+# with optional λ_nom / boundary).
 #
 # Usage:
-#   bash scripts/run_train_HJ_humanoid_sac.sh
-#   bash scripts/run_train_HJ_humanoid_sac.sh --freeze_yaw
-#   bash scripts/run_train_HJ_humanoid_sac.sh --force_right_pass
-#   bash scripts/run_train_HJ_humanoid_sac.sh --spawn_hemisphere_pass
-#   bash scripts/run_train_HJ_humanoid_sac.sh --resume_policy runs/sac_hj_humanoid/.../epoch_id_N/policy.pth --force_right_pass --freeze_yaw
+#   bash scripts/run_train_HJ_humanoid_sac_switch.sh
+#   bash scripts/run_train_HJ_humanoid_sac_switch.sh --freeze_yaw
+#   bash scripts/run_train_HJ_humanoid_sac_switch.sh --force_right_pass
+#   bash scripts/run_train_HJ_humanoid_sac_switch.sh --spawn_hemisphere_pass
+#   bash scripts/run_train_HJ_humanoid_sac_switch.sh \
+#     --resume_policy runs/sac_hj_humanoid/.../epoch_id_N/policy.pth
 
 set -euo pipefail
 
@@ -36,7 +46,8 @@ mkdir -p "${MPLCONFIGDIR}" "${REPO_ROOT}/runs"
 cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
-echo "[INFO] SAC avoid train -> runs/sac_hj_humanoid/"
+echo "[INFO] SAC avoid train + Q-gate switch -> runs/sac_hj_humanoid/"
+echo "[INFO] collect: waypoint if Q(a_nom)>=0 else SF; actor=pure SAC (no λ_nom/boundary)"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --headless \
@@ -52,9 +63,11 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --critic_warmup_updates 1000 \
   --actor_bc_warmup_updates 0 \
   --action_reg_coef 0.0 \
-  --boundary_reg_coef 0.5 \
+  --boundary_reg_coef 0.0 \
   --y_bound 3.0 \
   --y_center -2.0 \
   --x_bound_max 4.5 \
   --auto_alpha \
+  --switch_collect \
+  --switch_threshold 0.0 \
   "$@"

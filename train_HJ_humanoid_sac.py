@@ -7,6 +7,8 @@ Pipeline:
   waypoint buffer → critic warmup → joint SAC actor+critics
   buffer: start→front→left|right|middle; full waypoint cmds (vx, vy, yaw).
   train: default yaw free; ``--freeze_yaw`` forces yaw=0 on SF + a_nom (vx/vy only).
+  ``--switch_collect``: formal collect uses Q-gate (waypoint if Q(a_nom)>=thr else SF).
+    Actor loss is pure SAC (no λ_nom, no boundary); SF still updates every learn step.
 """
 
 import argparse
@@ -137,6 +139,23 @@ parser.add_argument(
         "pass-side (left half→left region, right half→right). Avoids cross-aisle "
         "goals. Buffer always stays start→front→left|right|middle. Default off."
     ),
+)
+parser.add_argument(
+    "--switch_collect",
+    action="store_true",
+    help=(
+        "Formal-train collect: execute waypoint if min(Q1,Q2)(z, a_nom) >= "
+        "--switch_threshold, else execute the safety filter. Actor/critic still "
+        "update every learn step (pure SAC: no λ_nom / boundary); SF action only "
+        "hits the env when the gate says unsafe. Buffer warm-up stays waypoint-only. "
+        "Default off."
+    ),
+)
+parser.add_argument(
+    "--switch_threshold",
+    type=float,
+    default=0.0,
+    help="Q-gate threshold for --switch_collect. SF interacts iff Q(a_nom) < this.",
 )
 parser.add_argument(
     "--alpha",
@@ -310,9 +329,10 @@ def main():
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
+    run_tag = "sac-switch" if bool(getattr(args, "switch_collect", False)) else "sac"
     wandb.init(
         project="sac-hj-latent-humanoid",
-        name=f"sac-{args.dino_encoder}-{timestamp}",
+        name=f"{run_tag}-{args.dino_encoder}-{timestamp}",
         config=vars(args),
     )
     wandb.define_metric("trainer/env_step")
@@ -322,7 +342,12 @@ def main():
     wandb.define_metric("rollout/*", step_metric="trainer/env_step")
     wandb.define_metric("loss/*", step_metric="trainer/env_step")
     wandb.define_metric("train/*", step_metric="trainer/env_step")
-    writer = SummaryWriter(log_dir=f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}/logs")
+    wandb.define_metric("switch/*", step_metric="trainer/env_step")
+    if bool(getattr(args, "switch_collect", False)):
+        tb_dir = f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}/logs"
+    else:
+        tb_dir = f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}/logs"
+    writer = SummaryWriter(log_dir=tb_dir)
     wb_logger = WandbLogger(update_interval=1, train_interval=10**9, test_interval=10**9)
     wb_logger.load(writer)
     logger = wb_logger
@@ -437,6 +462,15 @@ def main():
     action_reg_coef = float(args.action_reg_coef)
     boundary_reg_coef = float(args.boundary_reg_coef)
     freeze_yaw = bool(getattr(args, "freeze_yaw", False))
+    switch_collect = bool(getattr(args, "switch_collect", False))
+    switch_threshold = float(getattr(args, "switch_threshold", 0.0))
+    if switch_collect and (action_reg_coef != 0.0 or boundary_reg_coef != 0.0):
+        print(
+            "[INFO] --switch_collect: actor is pure SAC; "
+            f"dropping λ_nom={action_reg_coef} and boundary={boundary_reg_coef}."
+        )
+        action_reg_coef = 0.0
+        boundary_reg_coef = 0.0
 
     def _zero_yaw_act(act):
         """Force yaw (dim 2) to 0 in policy-space actions (tensor or ndarray)."""
@@ -479,16 +513,70 @@ def main():
             act_nom_t = _zero_yaw_act(act_nom_t)
         return act_nom_t
 
+    def _obs_to_tensor(obs) -> torch.Tensor:
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)
+        return obs_t
+
+    def _q_nom_min(obs, act_nom) -> np.ndarray:
+        """min(Q1, Q2)(z, a_nom) in policy space. Shape (B,)."""
+        obs_t = _obs_to_tensor(obs)
+        act_t = torch.as_tensor(act_nom, dtype=torch.float32, device=args.device)
+        if act_t.ndim == 1:
+            act_t = act_t.unsqueeze(0)
+        with torch.no_grad():
+            q = torch.min(
+                policy.critic1(obs_t, act_t).flatten(),
+                policy.critic2(obs_t, act_t).flatten(),
+            )
+        return q.detach().cpu().numpy().reshape(-1)
+
+    def _mix_switch_act(act_sf, act_nom, use_sf: np.ndarray):
+        """Keep SF act where use_sf else a_nom. Matches act_sf type."""
+        use_sf = np.asarray(use_sf, dtype=bool).reshape(-1)
+        if isinstance(act_sf, torch.Tensor):
+            act_nom_t = torch.as_tensor(
+                act_nom, dtype=act_sf.dtype, device=act_sf.device
+            )
+            if act_nom_t.ndim == 1:
+                act_nom_t = act_nom_t.unsqueeze(0)
+            gate = torch.as_tensor(use_sf, device=act_sf.device).reshape(-1, 1)
+            return torch.where(gate, act_sf, act_nom_t)
+        act_sf_np = np.asarray(act_sf, dtype=np.float32)
+        act_nom_np = np.asarray(act_nom, dtype=np.float32)
+        if act_sf_np.ndim == 1:
+            act_sf_np = act_sf_np.reshape(1, -1)
+        if act_nom_np.ndim == 1:
+            act_nom_np = act_nom_np.reshape(1, -1)
+        out = np.array(act_nom_np, dtype=np.float32, copy=True)
+        out[use_sf] = act_sf_np[use_sf]
+        return out
+
     _orig_policy_forward = policy.forward
 
     def _sac_forward(batch, state=None, input="obs", **kwargs):
-        """SAC forward; optional yaw=0; stash a_nom during collect."""
+        """SAC forward; optional yaw=0; collect may Q-gate waypoint vs SF."""
+        # Always run the SF actor (learning uses this path; collect may discard act).
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
         if freeze_yaw:
             out.act = _zero_yaw_act(out.act)
         if getattr(policy, "_attach_act_nom", False):
             act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
-            out.policy = Batch(act_nom=act_nom)
+            pol_extra = Batch(act_nom=act_nom)
+            if switch_collect:
+                q_nom = _q_nom_min(batch[input], act_nom)
+                use_sf = q_nom < switch_threshold
+                pol_extra.q_nom = np.asarray(q_nom, dtype=np.float32)
+                pol_extra.use_sf = np.asarray(use_sf, dtype=np.bool_)
+                out.act = _mix_switch_act(out.act, act_nom, use_sf)
+                policy.last_q_nom = float(q_nom.reshape(-1)[0])
+                policy.last_switch_use_sf = float(bool(use_sf.reshape(-1)[0]))
+                ls = getattr(policy, "log_state", None)
+                if isinstance(ls, dict):
+                    ls["switch_n"] = int(ls.get("switch_n", 0)) + int(use_sf.size)
+                    ls["switch_sf"] = int(ls.get("switch_sf", 0)) + int(use_sf.sum())
+            out.policy = pol_extra
         return out
 
     policy.forward = _sac_forward  # type: ignore[method-assign]
@@ -512,6 +600,7 @@ def main():
         act_sat_frac = 0.0
 
         if not policy.warmup:
+            # Learn always uses the SF actor (not the switched env action).
             obs_result = policy(batch)
             act = obs_result.act  # yaw already 0 if --freeze_yaw
             q = torch.min(
@@ -519,13 +608,16 @@ def main():
                 policy.critic2(batch.obs, act).flatten(),
             )
             actor_loss = (policy._alpha * obs_result.log_prob.flatten() - q).mean()
-            act_nom = _batch_act_nom_tensor(batch, act)
-            nom_reg = torch.nn.functional.mse_loss(act, act_nom)
-            boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
-            if boundary_reg_coef > 0.0:
-                actor_loss = actor_loss + boundary_reg_coef * boundary_reg
-            if action_reg_coef > 0.0:
-                actor_loss = actor_loss + action_reg_coef * nom_reg
+            nom_reg = act.new_zeros(())
+            boundary_reg = act.new_zeros(())
+            if action_reg_coef > 0.0 or boundary_reg_coef > 0.0:
+                act_nom = _batch_act_nom_tensor(batch, act)
+                nom_reg = torch.nn.functional.mse_loss(act, act_nom)
+                boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
+                if boundary_reg_coef > 0.0:
+                    actor_loss = actor_loss + boundary_reg_coef * boundary_reg
+                if action_reg_coef > 0.0:
+                    actor_loss = actor_loss + action_reg_coef * nom_reg
 
             policy.actor1_optim.zero_grad()
             actor_loss.backward()
@@ -571,17 +663,26 @@ def main():
         f"critic_warmup={args.critic_warmup_updates}, "
         f"λ_nom={action_reg_coef}, boundary={boundary_reg_coef}, "
         f"freeze_yaw={freeze_yaw} "
-        f"({'SF+a_nom yaw=0, buffer keeps yaw' if freeze_yaw else 'yaw free'})"
+        f"({'SF+a_nom yaw=0, buffer keeps yaw' if freeze_yaw else 'yaw free'}), "
+        f"switch_collect={switch_collect}"
+        + (
+            f" (waypoint if Q(a_nom)>={switch_threshold:g} else SF; "
+            "actor=pure SAC)"
+            if switch_collect
+            else ""
+        )
     )
 
     if int(getattr(args, "wandb_video_every", 1)) != 0:
         args.wandb_video_every = 1
-    log_state = {"env_step": 0, "update": 0}
+    log_state = {"env_step": 0, "update": 0, "switch_n": 0, "switch_sf": 0}
     train_envs.set_env_attr("wandb_video_every", int(args.wandb_video_every))
     train_envs.set_env_attr("log_state", log_state)
     train_envs.set_env_attr("policy_for_log", policy)
     policy.log_state = log_state
     policy.last_clean_act_env = None
+    policy.last_q_nom = None
+    policy.last_switch_use_sf = None
 
     resume_epoch = 0
     if args.resume_policy:
@@ -656,13 +757,15 @@ def main():
             if torch.is_tensor(policy._alpha)
             else float(policy._alpha)
         )
-        wandb.log(
-            {
-                "trainer/env_step": float(log_state.get("env_step", 0)),
-                "train/epoch_alpha": alpha_v,
-                "train/epoch": float(epoch),
-            }
-        )
+        payload = {
+            "trainer/env_step": float(log_state.get("env_step", 0)),
+            "train/epoch_alpha": alpha_v,
+            "train/epoch": float(epoch),
+        }
+        n_sw = int(log_state.get("switch_n", 0))
+        if switch_collect and n_sw > 0:
+            payload["switch/sf_frac_cum"] = float(log_state.get("switch_sf", 0)) / n_sw
+        wandb.log(payload)
 
     buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
     # exploration_noise=True only calls our stash (no Gaussian); SAC samples in forward.
@@ -823,9 +926,16 @@ def main():
     policy.forward = _actor_forward  # type: ignore[method-assign]
     policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
     _apply_train_scene_layout(include_middle=False)
+    if switch_collect:
+        train_ctrl_desc = (
+            f"Q-gate switch (thr={switch_threshold:g}: "
+            "waypoint if Q(a_nom)>=thr else SF; actor=pure SAC)"
+        )
+    else:
+        train_ctrl_desc = "SAC controls"
     print(
         "[INFO] Buffer done; restoring SAC actor "
-        f"(train: SAC controls; freeze_yaw={freeze_yaw}; "
+        f"(train: {train_ctrl_desc}; freeze_yaw={freeze_yaw}; "
         f"spawn=(1.5,-2)r=1 → {train_pass_desc}; no front/middle). "
         f"Bin at {bin_xy} or absent p={obstacle_absent_p}; "
         f"y_bound={'disabled' if yb <= 0 else f'{yc}±{yb} (OOB truncate+reset)'}."
@@ -888,11 +998,21 @@ def main():
         policy.train(was_training)
         print("[INFO] Actor BC warmup done.")
 
-    log_path = Path(f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}")
-    if args.resume_policy:
+    if switch_collect:
         log_path = Path(
-            f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+            f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}"
         )
+    else:
+        log_path = Path(f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}")
+    if args.resume_policy:
+        if switch_collect:
+            log_path = Path(
+                f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+            )
+        else:
+            log_path = Path(
+                f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+            )
     print(f"[INFO] Training epochs {start_epoch}..{end_epoch}; ckpts -> {log_path}")
     for epoch in range(start_epoch, end_epoch + 1):
         print(f"\n=== Epoch {epoch}/{end_epoch} ===")

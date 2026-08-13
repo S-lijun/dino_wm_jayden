@@ -391,6 +391,18 @@ class LatentHumanoidEnv(gym.Env):
                     payload["actor_action/vx"] = float(act[0])
                     payload["actor_action/vy"] = float(act[1])
                     payload["actor_action/theta"] = float(act[2])
+            q_nom = (
+                getattr(policy, "last_q_nom", None) if policy is not None else None
+            )
+            if q_nom is not None and np.isfinite(q_nom):
+                payload["switch/q_nom"] = float(q_nom)
+            use_sf = (
+                getattr(policy, "last_switch_use_sf", None)
+                if policy is not None
+                else None
+            )
+            if use_sf is not None:
+                payload["switch/use_sf"] = float(use_sf)
             wandb.log(payload)
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] rollout metric wandb log failed: {exc}")
