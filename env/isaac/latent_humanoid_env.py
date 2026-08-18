@@ -13,6 +13,7 @@ from PIL import Image
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
+    SAFE_SIDE_WAYPOINTS,
     WaypointNavController,
 )
 
@@ -107,6 +108,9 @@ class LatentHumanoidEnv(gym.Env):
         # Print timing for the first few visual steps (diagnose "stuck" collects).
         self.debug_step_timing = False
         self._debug_steps_left = 0
+        # WM predictor history (visual frames + executed actions) for z_{t+1} look-ahead.
+        self._obs_hist: list[dict[str, np.ndarray]] = []
+        self._act_hist: list[np.ndarray] = []
 
         self._episode_sim_step = 0
         self._episode_visual_step = 0
@@ -121,6 +125,15 @@ class LatentHumanoidEnv(gym.Env):
             max_speed=float(getattr(self.wrapper, "max_speed", 0.5)),
             stop_thresh=float(self.wrapper.waypoint_stop_thresh),
         )
+        # Separate controller so a_good does not share smoothing state with a_nom.
+        self._safe_side_nav = WaypointNavController(
+            max_speed=float(getattr(self.wrapper, "max_speed", 0.5)),
+            stop_thresh=float(self.wrapper.waypoint_stop_thresh),
+        )
+        self.safe_side_waypoints = tuple(
+            np.asarray(p, dtype=np.float64).reshape(2).copy()
+            for p in SAFE_SIDE_WAYPOINTS
+        )
 
         if latent_h:
             raise NotImplementedError("FailureClassifier latent_h is not wired for Isaac G1 yet.")
@@ -128,11 +141,22 @@ class LatentHumanoidEnv(gym.Env):
         reset_info = self.wrapper.reset_scene(seed=getattr(args, "seed", None))
         self._reset_timers()
         self.waypoint_nav.reset()
+        self._safe_side_nav.reset()
         # Constructor warm-up reset is not a training episode; do not record.
         self._record_this_episode = False
         self._episode_frames = []
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)
+        self.observation_space = Box(
+            low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
+        )
+        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-0.5, 0.5]
+        self.action_space = Box(
+            low=np.array([0.0, -0.5, -0.5], dtype=np.float32),
+            high=np.array([0.8, 0.5, 0.5], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self._reset_wm_history(obs)
         approx_substeps = max(1, int(round(self.visual_period_s / self.sim_dt)))
         print(
             f"[LatentHumanoidEnv] latent shape: {z.shape}, "
@@ -142,6 +166,7 @@ class LatentHumanoidEnv(gym.Env):
             f"y_bound={'disabled' if self.wrapper.y_bound <= 0 else f'{self.wrapper.y_center}±{self.wrapper.y_bound}'}, "
             f"x_bound_max={self.wrapper.x_bound_max} "
             f"(OOB → truncate only, no h_s penalty), "
+            f"wm_num_hist={self._wm_num_hist()}, "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
         def _region_summary(v: dict) -> dict:
@@ -162,16 +187,6 @@ class LatentHumanoidEnv(gym.Env):
             f"bin FIXED in buffer, randomized in training "
             f"(x={float(self.wrapper._blue_bin_xy_fixed[0]):.1f}, "
             f"y∈{tuple(self.wrapper.obstacle_y_range)})"
-        )
-
-        self.observation_space = Box(
-            low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
-        )
-        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-0.5, 0.5]
-        self.action_space = Box(
-            low=np.array([0.0, -0.5, -0.5], dtype=np.float32),
-            high=np.array([0.8, 0.5, 0.5], dtype=np.float32),
-            dtype=np.float32,
         )
 
     @property
@@ -313,6 +328,26 @@ class LatentHumanoidEnv(gym.Env):
         cmd = self.waypoint_nav.compute_command(
             base_pos, base_quat, self.wrapper.waypoint
         )
+        return self._clip_nav_cmd(cmd)
+
+    def compute_safe_side_nav_action(self) -> np.ndarray:
+        """Env-space action toward the closer fully-safe side waypoint (a_good).
+
+        Picks (3.5, -0.5) or (3.5, -3.5) by XY distance. Does not touch the
+        episode waypoint or the nominal controller state.
+        """
+        base_pos, base_quat = self.wrapper.get_robot_base_pose()
+        xy = np.asarray(base_pos[:2], dtype=np.float64)
+        pts = [
+            np.asarray(p, dtype=np.float64).reshape(2)
+            for p in self.safe_side_waypoints
+        ]
+        dists = [float(np.linalg.norm(xy - p)) for p in pts]
+        target = pts[int(np.argmin(np.asarray(dists)))]
+        cmd = self._safe_side_nav.compute_command(base_pos, base_quat, target)
+        return self._clip_nav_cmd(cmd)
+
+    def _clip_nav_cmd(self, cmd) -> np.ndarray:
         low = np.asarray(self.action_space.low, dtype=np.float32)
         high = np.asarray(self.action_space.high, dtype=np.float32)
         return np.clip(np.asarray(cmd, dtype=np.float32).reshape(3), low, high)
@@ -546,9 +581,11 @@ class LatentHumanoidEnv(gym.Env):
         reset_info = self.wrapper.reset_scene(seed=seed, fixed_layout=fixed_layout)
         self._reset_timers()
         self.waypoint_nav.reset()
+        self._safe_side_nav.reset()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)
+        self._reset_wm_history(obs)
         l_val = float(self.wrapper.calculate_cost())
         hj_val = self._hj_value(z)
         # Reset frame: same env_step index, do not bump (no transition yet).
@@ -633,6 +670,7 @@ class LatentHumanoidEnv(gym.Env):
                 flush=True,
             )
         obs = self.wrapper.get_raw_obs()
+        self._push_wm_history(obs, action)
         z_next = self.encode(obs)
         # Q(z, a_executed) — same cost as the old actor-based overlay.
         hj_val = self._hj_value(z_next, action_env=np.asarray(action, dtype=np.float64))
@@ -674,46 +712,120 @@ class LatentHumanoidEnv(gym.Env):
             self._log_episode_video(end_reason)
         return z_next, h_s, terminated, truncated, self._pyhj_info(end_reason, stuck)
 
-    def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
-        """Encode visual + proprio into a flat latent vector via the world model."""
+    def _wm_num_hist(self) -> int:
+        return max(1, int(getattr(self.wm, "num_hist", 1)))
+
+    def _split_raw_obs(self, obs: dict[str, Any] | tuple | list):
         if isinstance(obs, dict):
-            visual = obs["visual"]
-            proprio = obs["proprio"]
-        elif isinstance(obs, (tuple, list)) and len(obs) == 2:
-            visual, proprio = obs
+            return obs["visual"], obs["proprio"]
+        if isinstance(obs, (tuple, list)) and len(obs) == 2:
+            return obs[0], obs[1]
+        raise ValueError(f"Unexpected obs type: {type(obs)}")
+
+    def _copy_raw_obs(self, obs: dict[str, Any] | tuple | list) -> dict[str, np.ndarray]:
+        visual, proprio = self._split_raw_obs(obs)
+        if isinstance(visual, torch.Tensor):
+            visual_np = visual.detach().cpu().numpy()
         else:
-            raise ValueError(f"Unexpected obs type: {type(obs)}")
+            visual_np = np.array(visual, copy=True)
+        if isinstance(proprio, torch.Tensor):
+            proprio_np = proprio.detach().cpu().numpy().astype(np.float32, copy=True)
+        else:
+            proprio_np = np.array(proprio, dtype=np.float32, copy=True)
+        return {"visual": visual_np, "proprio": proprio_np}
+
+    def _visual_to_normalized_chw(self, visual) -> np.ndarray:
+        """Match ``encode``: HWC → CHW float in [-1, 1]."""
+        if isinstance(visual, torch.Tensor):
+            visual_np = visual.permute(2, 0, 1).float().cpu().numpy()
+            if visual_np.max() > 1.0:
+                visual_np = visual_np / 255.0
+        else:
+            visual_np = np.transpose(visual, (2, 0, 1)).astype(np.float32)
+            visual_np = visual_np / 255.0
+        return np.ascontiguousarray((visual_np - 0.5) / 0.5, dtype=np.float32)
+
+    def _flatten_latent_obs(self, lat: dict[str, torch.Tensor]) -> np.ndarray:
+        z_vis = lat["visual"].reshape(1, -1)
+        if self.with_proprio:
+            z_prop = lat["proprio"].reshape(z_vis.shape[0], -1)
+            z = torch.cat([z_vis, z_prop], dim=-1)
+        else:
+            z = z_vis
+        return z.squeeze(0).cpu().numpy()
+
+    def _reset_wm_history(self, obs: dict[str, Any] | tuple | list) -> None:
+        """Repeat the first frame so the predictor has ``num_hist`` context."""
+        n = self._wm_num_hist()
+        self._obs_hist = [self._copy_raw_obs(obs) for _ in range(n)]
+        act_dim = int(np.prod(self.action_space.shape))
+        zero = np.zeros((act_dim,), dtype=np.float32)
+        self._act_hist = [zero.copy() for _ in range(max(0, n - 1))]
+
+    def _push_wm_history(self, obs: dict[str, Any] | tuple | list, action) -> None:
+        """After a step: new obs is current; executed action belongs to the previous frame."""
+        n = self._wm_num_hist()
+        self._obs_hist.append(self._copy_raw_obs(obs))
+        self._obs_hist = self._obs_hist[-n:]
+        a = np.asarray(action, dtype=np.float32).reshape(-1)
+        self._act_hist.append(a)
+        keep = max(0, n - 1)
+        self._act_hist = self._act_hist[-keep:] if keep > 0 else []
+
+    def predict_next_latent(self, action_env) -> np.ndarray:
+        """WM one-step look-ahead: ``z_{t+1}`` from history + candidate env action.
+
+        Same flattening as ``encode`` (critic space). Uses ``encode`` + ``predict``
+        on a ``num_hist`` window, with ``action_env`` as the action at the last
+        (current) frame — matching ``scripts/pred_recon_wm_episode.py``.
+        """
+        if self.wm.predictor is None:
+            raise RuntimeError("World model has no predictor; cannot look ahead.")
+        n = self._wm_num_hist()
+        if len(self._obs_hist) < n:
+            raise RuntimeError("WM history is empty; call reset() first.")
+
+        action = np.asarray(action_env, dtype=np.float32).reshape(-1)
+        acts = list(self._act_hist[-max(0, n - 1) :])
+        while len(acts) < n - 1:
+            acts.insert(0, np.zeros_like(action))
+        acts.append(action)
+
+        vis_list = []
+        prop_list = []
+        for frame in self._obs_hist[-n:]:
+            vis_list.append(self._visual_to_normalized_chw(frame["visual"]))
+            prop_list.append(np.asarray(frame["proprio"], dtype=np.float32).reshape(-1))
+
+        vis_t = torch.from_numpy(np.stack(vis_list, axis=0)).unsqueeze(0).to(self.device)
+        prop_t = torch.from_numpy(np.stack(prop_list, axis=0)).unsqueeze(0).to(self.device)
+        act_t = torch.from_numpy(np.stack(acts, axis=0)).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            if isinstance(visual, torch.Tensor):
-                visual_np = visual.permute(2, 0, 1).float().cpu().numpy()
-                if visual_np.max() > 1.0:
-                    visual_np /= 255.0
-                visual_np = (visual_np - 0.5) / 0.5
-                vis_t = torch.from_numpy(visual_np).unsqueeze(0).unsqueeze(1).to(self.device)
+            z = self.wm.encode({"visual": vis_t, "proprio": prop_t}, act_t)
+            z_pred = self.wm.predict(z)
+            z_next = z_pred[:, -1:, ...]
+            z_obs, _ = self.wm.separate_emb(z_next)
+            return self._flatten_latent_obs(z_obs)
+
+    def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """Encode visual + proprio into a flat latent vector via the world model."""
+        visual, proprio = self._split_raw_obs(obs)
+
+        with torch.no_grad():
+            vis_np = self._visual_to_normalized_chw(visual)
+            vis_t = torch.from_numpy(vis_np).unsqueeze(0).unsqueeze(1).to(self.device)
+            if isinstance(proprio, torch.Tensor):
                 prop_t = proprio.unsqueeze(0).unsqueeze(1).float().to(self.device)
             else:
-                visual_np = np.transpose(visual, (2, 0, 1)).astype(np.float32)
-                visual_np /= 255.0
-                visual_np = (visual_np - 0.5) / 0.5
-                vis_t = torch.from_numpy(visual_np).unsqueeze(0).unsqueeze(1).to(self.device)
                 prop_t = (
                     torch.from_numpy(np.asarray(proprio, dtype=np.float32))
                     .unsqueeze(0)
                     .unsqueeze(1)
                     .to(self.device)
                 )
-
             lat = self.wm.encode_obs({"visual": vis_t, "proprio": prop_t})
-
-            if self.with_proprio:
-                z_vis = lat["visual"].reshape(1, -1)
-                z_prop = lat["proprio"].squeeze(0)
-                z = torch.cat([z_vis, z_prop], dim=-1)
-                return z.squeeze(0).cpu().numpy()
-
-            z_vis = lat["visual"].reshape(1, -1)
-            return z_vis.squeeze(0).cpu().numpy()
+            return self._flatten_latent_obs(lat)
 
     def calculate_cost(self) -> float:
         return self.wrapper.calculate_cost()

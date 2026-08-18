@@ -17,6 +17,9 @@ Usage::
     --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
     --policy_path runs/sac_hj_humanoid/.../epoch_id_N/policy.pth \\
     --num_runs 5
+
+  # WM dynamics look-ahead: gate on V(z_{t+1}) instead of Q(z_t, a_nom)
+  python test_HJ_humanoid_sac.py ... --look_ahead
 """
 
 from __future__ import annotations
@@ -95,7 +98,19 @@ parser.add_argument(
     "--safety_threshold",
     type=float,
     default=0.0,
-    help="Switch to SF when min(Q1,Q2)(z, a_nom) < this.",
+    help=(
+        "Switch to SF when the gate value < this. Default gate is "
+        "min(Q1,Q2)(z_t, a_nom). With --look_ahead, gate is V(z_{t+1}) "
+        "= min(Q1,Q2)(z_hat, pi(z_hat)) from the WM predictor."
+    ),
+)
+parser.add_argument(
+    "--look_ahead",
+    action="store_true",
+    help=(
+        "Use WM predictor look-ahead: gate and SF actor both use predicted "
+        "z_{t+1} given a_nom, not current z_t. Gate is V(z_hat); SF is pi(z_hat)."
+    ),
 )
 parser.add_argument("--max_visual_steps", type=int, default=400)
 parser.add_argument("--out_dir", type=str, default=None)
@@ -305,6 +320,30 @@ def q_value(policy, z: np.ndarray, act_policy: np.ndarray, device: str) -> float
     q1 = policy.critic1(z_t, a_t)
     q2 = policy.critic2(z_t, a_t)
     q = torch.min(q1, q2)
+    return float(q.reshape(-1)[0].item())
+
+
+@torch.no_grad()
+def v_value(policy, z: np.ndarray, device: str) -> float:
+    """V(z) = min(Q1, Q2)(z, pi(z)) with the deterministic SAC actor."""
+    from PyHJ.data import Batch
+
+    was_training = policy.training
+    policy.eval()
+    z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
+    if z_t.ndim == 1:
+        z_t = z_t.unsqueeze(0)
+    act_pol = policy(Batch(obs=z_t, info=Batch())).act
+    if isinstance(act_pol, torch.Tensor):
+        a_t = act_pol
+    else:
+        a_t = torch.as_tensor(act_pol, dtype=torch.float32, device=device)
+    if a_t.ndim == 1:
+        a_t = a_t.unsqueeze(0)
+    q1 = policy.critic1(z_t, a_t)
+    q2 = policy.critic2(z_t, a_t)
+    q = torch.min(q1, q2)
+    policy.train(was_training)
     return float(q.reshape(-1)[0].item())
 
 
@@ -548,6 +587,7 @@ def simulate_one(
     run_id: int,
     fixed_layout: dict | None = None,
     seed: int | None = None,
+    look_ahead: bool = False,
 ) -> dict:
     if fixed_layout is None:
         z, info = env.reset(seed=seed)
@@ -576,24 +616,31 @@ def simulate_one(
             policy.map_action_inverse(a_nom_env), dtype=np.float32
         ).reshape(-1)
 
+        if look_ahead:
+            z_hat = env.predict_next_latent(a_nom_env)
+            q_nom = v_value(policy, z_hat, device)
+            z_sf = z_hat
+            gate_name = "V(z_hat)"
+        else:
+            q_nom = q_value(policy, z, a_nom_pol, device)
+            z_sf = z
+            gate_name = "Q(a_nom)"
+
         if mode == "waypoint_only":
             action = a_nom_env
-            q_nom = q_value(policy, z, a_nom_pol, device)
         elif mode == "safe_only":
-            action = safe_action_env(policy, z, device)
-            q_nom = q_value(policy, z, a_nom_pol, device)
+            action = safe_action_env(policy, z_sf, device)
             hj_interventions += 1
         else:  # switching
-            q_nom = q_value(policy, z, a_nom_pol, device)
             if q_nom < safety_threshold:
-                action = safe_action_env(policy, z, device)
+                action = safe_action_env(policy, z_sf, device)
                 hj_interventions += 1
                 if last_controller == "waypoint":
                     total_switches += 1
                 last_controller = "hj"
                 if step < 30 or hj_interventions <= 5:
                     print(
-                        f"  step {step}: SF intervene Q(a_nom)={q_nom:.3f} "
+                        f"  step {step}: SF intervene {gate_name}={q_nom:.3f} "
                         f"a_nom={a_nom_env} a_sf={action}"
                     )
             else:
@@ -680,8 +727,13 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac") / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
     modes = list(COMPARE_MODES) if args.mode == "compare" else [args.mode]
+    look_ahead = bool(getattr(args, "look_ahead", False))
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] modes={modes} policy={args.policy_path}")
+    gate_desc = (
+        "gate=V(z_t+1) from WM predictor" if look_ahead else "gate=Q(z_t, a_nom)"
+    )
+    print(f"[INFO] look_ahead={look_ahead} ({gate_desc})")
 
     ckpt_dir = Path(args.dino_ckpt_dir)
     hydra_cfg = ckpt_dir / "hydra.yaml"
@@ -761,6 +813,7 @@ def main():
                 run_id=run_id,
                 fixed_layout=layout,
                 seed=trial_seed,
+                look_ahead=look_ahead,
             )
             if mode == modes[0]:
                 print(
@@ -791,6 +844,8 @@ def main():
         f"policy={args.policy_path}",
         f"algo=SAC",
         f"eval_mode={args.mode}",
+        f"look_ahead={look_ahead}",
+        f"safety_threshold={float(args.safety_threshold)}",
         f"modes={modes}",
         f"pass_radius={float(args.pass_radius)}",
         f"back=({float(args.back_center_x)},{float(args.back_center_y)}) "

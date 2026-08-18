@@ -13,6 +13,11 @@ import numpy as np
 # left / right: terminal goals beside the bin, disks r=0.5 at (3.5, -0.5) / (3.5, -3.5).
 # middle: collision demos for critic (fixed point on the bin).
 # back: past the bin on the centerline (straight ahead behind obstacle).
+# Fully-safe lateral points for a_good (SF reg when Q(a_nom)<0). Not collect vias.
+SAFE_SIDE_WAYPOINTS: tuple[np.ndarray, np.ndarray] = (
+    np.array([3.5, -0.5], dtype=np.float64),  # left of bin at (3.5,-2)
+    np.array([3.5, -3.5], dtype=np.float64),  # right of bin
+)
 DEFAULT_TRAJECTORY_REGIONS: dict[str, dict[str, Any]] = {
     "start": {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
     "front": {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 0.5},

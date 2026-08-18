@@ -6,17 +6,20 @@
 #   Q(z, a_nom) >= 0  → waypoint controller interacts with the env
 #   Q(z, a_nom) <  0  → safety filter interacts with the env
 # After the bin, Q>=0 so nominal typically drives to the back goal.
-# Actor is pure SAC (no λ_nom, no boundary). SF still updates every learn step;
-# only the executed action is switched.
+# Actor: SAC + λ_nom not cleared.
+#   Q>=0: MSE(a_sf, a_nom); env executes a_nom
+#   Q< 0: MSE(a_sf, a_good); env executes a_sf
+#   a_good = waypoint action toward closer of (3.5,-0.5) / (3.5,-3.5)
+# SF still updates every learn step; only the executed action is switched.
 #
 # Does NOT replace run_train_HJ_humanoid_sac.sh (that run stays SF-only collect
 # with optional λ_nom / boundary).
 #
+# Formal train uses spawn-hemisphere L/R by default.
 # Usage:
 #   bash scripts/run_train_HJ_humanoid_sac_switch.sh
 #   bash scripts/run_train_HJ_humanoid_sac_switch.sh --freeze_yaw
 #   bash scripts/run_train_HJ_humanoid_sac_switch.sh --force_right_pass
-#   bash scripts/run_train_HJ_humanoid_sac_switch.sh --spawn_hemisphere_pass
 #   bash scripts/run_train_HJ_humanoid_sac_switch.sh \
 #     --resume_policy runs/sac_hj_humanoid/.../epoch_id_N/policy.pth
 
@@ -49,7 +52,7 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] SAC avoid train + Q-gate switch -> runs/sac_hj_humanoid/"
-echo "[INFO] collect: waypoint if Q(a_nom)>=0 else SF; actor=pure SAC (no λ_nom/boundary)"
+echo "[INFO] collect: waypoint if Q>=0 else SF; λ_nom: a_nom if Q>=0 else a_good (3.5,-0.5)|(3.5,-3.5)"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --headless \
@@ -64,7 +67,7 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --gamma-pyhj 0.98 \
   --critic_warmup_updates 1000 \
   --actor_bc_warmup_updates 0 \
-  --action_reg_coef 0.0 \
+  --action_reg_coef 0.8 \
   --boundary_reg_coef 0.0 \
   --y_bound 3.0 \
   --y_center -2.0 \
@@ -72,4 +75,5 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --auto_alpha \
   --switch_collect \
   --switch_threshold 0.0 \
+  --spawn_hemisphere_pass \
   "$@"

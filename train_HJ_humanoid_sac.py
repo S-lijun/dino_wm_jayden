@@ -9,7 +9,10 @@ Pipeline:
   train: default yaw free; ``--freeze_yaw`` forces yaw=0 on SF + a_nom (vx/vy only).
   ``--switch_collect``: formal collect uses Q-gate (waypoint if Q(a_nom)>=thr else SF).
     Path: spawn → left|right via at the bin → back disk behind the bin.
-    After the bin, Q>=0 → nominal goes to back. Actor is pure SAC (no λ_nom / boundary).
+    After the bin, Q>=0 → nominal goes to back. Collect still executes only a_nom
+    when safe; actor keeps λ_nom = MSE(a_sf, a_nom) on Q>=thr samples and
+    MSE(a_sf, a_good) on Q<thr samples. a_good is the waypoint action toward the
+    closer fully-safe side point (3.5,-0.5) or (3.5,-3.5).
 """
 
 import argparse
@@ -108,7 +111,11 @@ parser.add_argument(
     "--action_reg_coef",
     type=float,
     default=0.0,
-    help="λ_nom for MSE(tanh(μ), a_nom) in policy space. 0 disables.",
+    help=(
+        "λ_nom for MSE(a_sf, target) in policy space. 0 disables. "
+        "With --switch_collect: target is a_nom if Q(a_nom) >= threshold else "
+        "a_good (closer safe-side waypoint). Not cleared."
+    ),
 )
 parser.add_argument(
     "--boundary_reg_coef",
@@ -146,9 +153,12 @@ parser.add_argument(
     action="store_true",
     help=(
         "Formal-train collect: execute waypoint if min(Q1,Q2)(z, a_nom) >= "
-        "--switch_threshold, else execute the safety filter. Actor/critic still "
-        "update every learn step (pure SAC: no λ_nom / boundary); SF action only "
-        "hits the env when the gate says unsafe. Buffer warm-up stays waypoint-only. "
+        "--switch_threshold, else execute the safety filter. SF action only "
+        "hits the env when the gate says unsafe. Actor still updates every "
+        "learn step; λ_nom is kept: MSE(a_sf, a_nom) when Q(a_nom) >= threshold, "
+        "MSE(a_sf, a_good) when Q(a_nom) < threshold. a_good is the waypoint "
+        "action toward the closer fully-safe side point (3.5,-0.5)|(3.5,-3.5). "
+        "Buffer warm-up stays waypoint-only. "
         "Default off."
     ),
 )
@@ -465,12 +475,12 @@ def main():
     freeze_yaw = bool(getattr(args, "freeze_yaw", False))
     switch_collect = bool(getattr(args, "switch_collect", False))
     switch_threshold = float(getattr(args, "switch_threshold", 0.0))
-    if switch_collect and (action_reg_coef != 0.0 or boundary_reg_coef != 0.0):
+    if switch_collect and boundary_reg_coef != 0.0:
         print(
-            "[INFO] --switch_collect: actor is pure SAC; "
-            f"dropping λ_nom={action_reg_coef} and boundary={boundary_reg_coef}."
+            "[INFO] --switch_collect: dropping boundary="
+            f"{boundary_reg_coef}; keeping λ_nom={action_reg_coef} "
+            f"(MSE(a_sf, a_nom) if Q>=thr else MSE(a_sf, a_good))."
         )
-        action_reg_coef = 0.0
         boundary_reg_coef = 0.0
 
     def _zero_yaw_act(act):
@@ -497,6 +507,18 @@ def main():
             acts = _zero_yaw_act(acts)
         return acts
 
+    def _safe_side_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
+        """Policy-space a_good toward the closer fully-safe side waypoint."""
+        fns = train_envs.get_env_attr("compute_safe_side_nav_action")
+        acts_env = np.stack(
+            [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
+            axis=0,
+        )
+        acts = np.asarray(policy.map_action_inverse(acts_env), dtype=np.float32)
+        if zero_yaw:
+            acts = _zero_yaw_act(acts)
+        return acts
+
     def _batch_act_nom_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor:
         act_nom = None
         pol = getattr(batch, "policy", None)
@@ -513,6 +535,21 @@ def main():
         if freeze_yaw:
             act_nom_t = _zero_yaw_act(act_nom_t)
         return act_nom_t
+
+    def _batch_act_good_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor | None:
+        """Stored a_good (safe-side waypoint). None if the batch has no field."""
+        pol = getattr(batch, "policy", None)
+        act_good = None if pol is None else getattr(pol, "act_good", None)
+        if act_good is None:
+            return None
+        act_good_t = torch.as_tensor(
+            act_good, dtype=act_ref.dtype, device=act_ref.device
+        )
+        if act_good_t.ndim == 1:
+            act_good_t = act_good_t.unsqueeze(0)
+        if freeze_yaw:
+            act_good_t = _zero_yaw_act(act_good_t)
+        return act_good_t
 
     def _obs_to_tensor(obs) -> torch.Tensor:
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
@@ -566,6 +603,8 @@ def main():
             act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
             pol_extra = Batch(act_nom=act_nom)
             if switch_collect:
+                act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                pol_extra.act_good = act_good
                 q_nom = _q_nom_min(batch[input], act_nom)
                 use_sf = q_nom < switch_threshold
                 pol_extra.q_nom = np.asarray(q_nom, dtype=np.float32)
@@ -595,7 +634,9 @@ def main():
 
         actor_loss_v = 0.0
         nom_reg_v = 0.0
+        good_reg_v = 0.0
         boundary_reg_v = 0.0
+        nom_reg_safe_frac = 0.0
         alpha_loss_v = None
         act_abs_mean = 0.0
         act_sat_frac = 0.0
@@ -610,10 +651,33 @@ def main():
             )
             actor_loss = (policy._alpha * obs_result.log_prob.flatten() - q).mean()
             nom_reg = act.new_zeros(())
+            good_reg = act.new_zeros(())
             boundary_reg = act.new_zeros(())
             if action_reg_coef > 0.0 or boundary_reg_coef > 0.0:
                 act_nom = _batch_act_nom_tensor(batch, act)
-                nom_reg = torch.nn.functional.mse_loss(act, act_nom)
+                if switch_collect and action_reg_coef > 0.0:
+                    # Q>=thr: pull a_sf → a_nom. Q<thr: a_nom is unsafe, pull
+                    # a_sf → a_good (closer fully-safe side waypoint).
+                    with torch.no_grad():
+                        q_nom = torch.min(
+                            policy.critic1(batch.obs, act_nom).flatten(),
+                            policy.critic2(batch.obs, act_nom).flatten(),
+                        )
+                    safe_w = (q_nom >= switch_threshold).to(dtype=act.dtype)
+                    unsafe_w = 1.0 - safe_w
+                    nom_reg_safe_frac = float(safe_w.mean().item())
+                    sq_nom = (act - act_nom).pow(2).mean(dim=-1)
+                    act_good = _batch_act_good_tensor(batch, act)
+                    if act_good is not None:
+                        sq_good = (act - act_good).pow(2).mean(dim=-1)
+                        nom_reg = (sq_nom * safe_w + sq_good * unsafe_w).mean()
+                        good_denom = unsafe_w.sum().clamp(min=1.0)
+                        good_reg = (sq_good * unsafe_w).sum() / good_denom
+                    else:
+                        denom = safe_w.sum().clamp(min=1.0)
+                        nom_reg = (sq_nom * safe_w).sum() / denom
+                else:
+                    nom_reg = torch.nn.functional.mse_loss(act, act_nom)
                 boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
                 if boundary_reg_coef > 0.0:
                     actor_loss = actor_loss + boundary_reg_coef * boundary_reg
@@ -635,6 +699,7 @@ def main():
 
             actor_loss_v = float(actor_loss.item())
             nom_reg_v = float(nom_reg.item())
+            good_reg_v = float(good_reg.item())
             boundary_reg_v = float(boundary_reg.item())
             act_abs_mean = float(act.detach().abs().mean().item())
             act_sat_frac = float((act.detach().abs() > 0.95).float().mean().item())
@@ -650,6 +715,9 @@ def main():
             "train/actor_abs_mean": act_abs_mean,
             "train/actor_sat_frac": act_sat_frac,
         }
+        if switch_collect:
+            result["train/nom_reg_safe_frac"] = nom_reg_safe_frac
+            result["loss/good_reg"] = good_reg_v
         if alpha_loss_v is not None:
             result["loss/alpha"] = alpha_loss_v
             result["train/alpha"] = float(policy._alpha.item())
@@ -668,7 +736,7 @@ def main():
         f"switch_collect={switch_collect}"
         + (
             f" (waypoint if Q(a_nom)>={switch_threshold:g} else SF; "
-            "actor=pure SAC)"
+            f"λ_nom: a_nom if Q>=thr else a_good side (3.5,-0.5)|(3.5,-3.5))"
             if switch_collect
             else ""
         )
@@ -718,10 +786,12 @@ def main():
         for key in (
             "loss/nom_reg",
             "loss/boundary_reg",
+            "loss/good_reg",
             "loss/alpha",
             "train/alpha",
             "train/actor_abs_mean",
             "train/actor_sat_frac",
+            "train/nom_reg_safe_frac",
         ):
             if key in update_result:
                 payload[key] = float(update_result[key])
@@ -798,15 +868,20 @@ def main():
         train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
         train_envs.set_env_attr("randomize_obstacle", False)
         train_envs.set_env_attr("advance_passed_terminal", False)
-        # SF-only formal: far lateral goals. Buffer + switch-collect: vias by the bin.
+        # Formal + buffer: far lateral goals. switch-collect: same L/R vias
+        # (3.5,-1) / (3.5,-3) in buffer AND formal train.
         far_left = {"center": np.array([3.5, 0.0], dtype=np.float64), "r": 0.5}
         far_right = {"center": np.array([3.5, -4.0], dtype=np.float64), "r": 0.5}
         via_left = {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.5}
         via_right = {"center": np.array([3.5, -3.0], dtype=np.float64), "r": 0.5}
         if include_middle:
-            # Buffer ALWAYS: spawn → front → left|right|middle (independent cycle).
-            train_envs.set_env_attr("left_region", via_left)
-            train_envs.set_env_attr("right_region", via_right)
+            # Buffer: spawn → front → left|right|middle (independent cycle).
+            if switch_collect:
+                train_envs.set_env_attr("left_region", via_left)
+                train_envs.set_env_attr("right_region", via_right)
+            else:
+                train_envs.set_env_attr("left_region", far_left)
+                train_envs.set_env_attr("right_region", far_right)
             train_envs.set_env_attr(
                 "start_region",
                 {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
@@ -892,10 +967,15 @@ def main():
 
     # Buffer warm-up always runs (fresh + resume): refill replay; honor force_right_pass.
     _apply_train_scene_layout(include_middle=True)
+    _lr_buf = (
+        "left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5"
+        if switch_collect
+        else "left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5"
+    )
     print(
         "[INFO] Collecting initial transitions with WaypointNavController "
         f"(spawn=(0,-2)r=1 → front=(1.5,-2)r=0.5 → {buffer_pass_desc}; "
-        f"left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5; "
+        f"{_lr_buf}; "
         f"bin at {bin_xy} or absent p={obstacle_absent_p}; no behind-bin back"
         f"{'; resume' if args.resume_policy else ''})..."
     )
@@ -903,7 +983,10 @@ def main():
     def _waypoint_forward(batch, state=None, **kwargs):
         del batch, state, kwargs
         acts = _waypoint_acts_policy()
-        return Batch(act=acts, state=None, policy=Batch(act_nom=acts.copy()))
+        pol_extra = Batch(act_nom=acts.copy())
+        if switch_collect:
+            pol_extra.act_good = _safe_side_acts_policy()
+        return Batch(act=acts, state=None, policy=pol_extra)
 
     def _waypoint_expl(act, batch):
         del batch
@@ -957,7 +1040,9 @@ def main():
     if switch_collect:
         train_ctrl_desc = (
             f"Q-gate switch (thr={switch_threshold:g}: "
-            "waypoint if Q(a_nom)>=thr else SF; actor=pure SAC; "
+            "waypoint if Q(a_nom)>=thr else SF; "
+            f"λ_nom={action_reg_coef} a_nom if Q>=thr else a_good "
+            "closer of (3.5,-0.5)|(3.5,-3.5); "
             "start→L|R via→back; SF pass-via then nominal to back)"
         )
     else:

@@ -52,7 +52,7 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac.py \
   --critic_warmup_updates 1000 \
   --actor_bc_warmup_updates 0 \
   --action_reg_coef 0.1 \
-  --boundary_reg_coef 0.5 \
+  --boundary_reg_coef 0.0 \
   --y_bound 3.0 \
   --y_center -2.0 \
   --x_bound_max 4.5 \
