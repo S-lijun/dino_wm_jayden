@@ -1,18 +1,17 @@
-"""SAC HJ safety-filter training on Isaac G1 latent space.
+"""SAC HJ safety-filter training on Isaac G1 latent space (start-goal path layout).
 
-Uses PyHJ ``avoid_SACPolicy_annealing`` (stochastic ActorProb + twin critics),
-NOT DDPG. Separate from ``train_HJ_humanoid.py`` / ``train_HJ_humanoid_qp.py``.
+Separate from ``train_HJ_humanoid_sac.py`` (aisle / hemisphere / left-right).
+Do not use this file as a drop-in replacement for the original pipeline.
 
-Pipeline:
-  waypoint buffer → critic warmup → joint SAC actor+critics
-  buffer: start→front→left|right|middle; full waypoint cmds (vx, vy, yaw).
-  train: default yaw free; ``--freeze_yaw`` forces yaw=0 on SF + a_nom (vx/vy only).
-  ``--switch_collect``: formal collect uses Q-gate (waypoint if Q(a_nom)>=thr else SF).
-    Path: spawn → left|right via at the bin → back disk behind the bin.
-    After the bin, Q>=0 → nominal goes to back. Collect still executes only a_nom
-    when safe; actor keeps λ_nom = MSE(a_sf, a_nom) on Q>=thr samples and
-    MSE(a_sf, a_good) on Q<thr samples. a_good is the waypoint action toward the
-    closer fully-safe side point (3.5,-0.5) or (3.5,-3.5).
+Layout:
+  each episode samples start + goal inside the arena rectangle
+  x in [-2, 5], y in [-4, 2]; two transition waypoints offset ±2.5 m
+  perpendicular to the start-goal segment, ordered near-start then near-goal.
+  Hitting the rectangle edge resets; that transition is not stored for updates.
+
+  h_s = lidar_min - 1.5; non-foot contact also labels failure (l <= -1.5).
+  Foot soles left/right_ankle_roll_link are ignored. Yaw action in [-1, 1].
+  Blue-bin placement is still the original fixed (3.5, -2) until specified.
 """
 
 import argparse
@@ -32,7 +31,7 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("SAC HJ on DINO latent Humanoid (Isaac G1)")
+parser = argparse.ArgumentParser("SAC HJ on DINO latent Humanoid (start-goal path)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument(
@@ -80,25 +79,170 @@ parser.add_argument(
 parser.add_argument(
     "--y_bound",
     type=float,
-    default=3.0,
-    help="Soft |y - y_center| half-width (m). <=0 disables.",
+    default=0.0,
+    help="Legacy |y - y_center| half-width. Path pipeline uses --use_arena_bounds.",
 )
 parser.add_argument(
     "--y_center",
     type=float,
     default=-2.0,
-    help="Y corridor center (m). Matches aisle/waypoints after -2m shift.",
+    help="Unused when arena bounds are on.",
 )
 parser.add_argument(
     "--x_bound_max",
     type=float,
-    default=4.5,
-    help="Soft far wall: x >= this truncates+reset (meters). Default 4.5.",
+    default=100.0,
+    help="Legacy far-x wall. Disabled in practice when --use_arena_bounds.",
+)
+parser.add_argument(
+    "--use_arena_bounds",
+    action="store_true",
+    help="Enable rectangular arena reset: x in [arena_x_min, arena_x_max], y in [arena_y_min, arena_y_max].",
+)
+parser.add_argument("--arena_x_min", type=float, default=-2.0)
+parser.add_argument("--arena_x_max", type=float, default=5.0)
+parser.add_argument("--arena_y_min", type=float, default=-4.0)
+parser.add_argument("--arena_y_max", type=float, default=2.0)
+parser.add_argument(
+    "--skip_arena_oob_from_buffer",
+    action="store_true",
+    default=True,
+    help="Do not store / train on the arena-edge reset transition (default on).",
+)
+parser.add_argument(
+    "--no_skip_arena_oob_from_buffer",
+    action="store_true",
+    help="Store arena-OOB transitions in the replay buffer.",
+)
+parser.add_argument(
+    "--lidar_distance_threshold",
+    type=float,
+    default=1.5,
+    help="h_s = lidar_min - this (meters).",
+)
+parser.add_argument(
+    "--lidar_h_half_fov_deg",
+    type=float,
+    default=60.0,
+    help=(
+        "Half-width (deg) of the forward cone used for l/h_s. "
+        "Inside ±this, l is the true min range; outside, l=2.0. "
+        "Default 60 → 120° FOV (camera-visible). Aisle pipeline keeps 90."
+    ),
+)
+parser.add_argument(
+    "--include_contact_in_hs",
+    action="store_true",
+    default=True,
+    help=(
+        "Fold non-foot obstacle contact into l/h_s (failure label). "
+        "Ignores left/right_ankle_roll_link (foot soles). Default on."
+    ),
+)
+parser.add_argument(
+    "--no_include_contact_in_hs",
+    action="store_true",
+    help="Supervise l from LiDAR only (ignore contact force).",
+)
+parser.add_argument(
+    "--contact_hs",
+    type=float,
+    default=-1.5,
+    help="l/h_s cap when a non-foot link is in contact (must be < 0).",
+)
+parser.add_argument(
+    "--max_episode_steps",
+    type=int,
+    default=20000,
+    help=(
+        "Sim-step cap per episode (dt=0.005 → seconds/5e-3). "
+        "Path layout is longer than the aisle; default 20000 ≈ 100s. "
+        "Original aisle pipeline keeps 8000."
+    ),
+)
+parser.add_argument(
+    "--yaw_limit",
+    type=float,
+    default=1.0,
+    help="Abs yaw-rate action limit (env space). Original pipeline uses 0.5.",
+)
+parser.add_argument(
+    "--waypoint_layout",
+    type=str,
+    default="start_goal_perp",
+    choices=["regions", "start_goal_perp"],
+)
+parser.add_argument(
+    "--perp_offset",
+    type=float,
+    default=2.5,
+    help="Perpendicular offset (m) of transition waypoints AND obstacles.",
+)
+parser.add_argument(
+    "--min_start_goal_dist",
+    type=float,
+    default=4.0,
+    help="Reject start/goal samples closer than this (m).",
+)
+parser.add_argument(
+    "--layout_seed",
+    type=int,
+    default=None,
+    help=(
+        "Seed only for waypoint/obstacle sampling. Default: fresh each process "
+        "so two bash runs differ. Train --seed still applies to torch. "
+        "Pass this to reproduce a layout sequence."
+    ),
+)
+parser.add_argument(
+    "--max_n_obstacles",
+    type=int,
+    default=2,
+    help="Max bins spawned in the Isaac scene (need 2 for dual-LiDAR). Original pipeline omits this (1).",
+)
+parser.add_argument(
+    "--path_obstacle_layout",
+    action="store_true",
+    default=True,
+    help="Place bins on the start-goal perpendicular (±perp_offset). Default on for this pipeline.",
+)
+parser.add_argument(
+    "--obstacle_absent_prob",
+    type=float,
+    default=0.1,
+    help="P(no obstacles this episode).",
+)
+parser.add_argument(
+    "--two_obstacle_prob",
+    type=float,
+    default=0.5,
+    help="Given obstacles are present, P(two bins); else one. Max two.",
+)
+parser.add_argument(
+    "--alternate_collect",
+    action="store_true",
+    default=True,
+    help="Formal collect: even episodes waypoint-only, odd episodes Q-gate switch. Default on.",
+)
+parser.add_argument(
+    "--no_alternate_collect",
+    action="store_true",
+    help="Disable waypoint/switch episode alternation (pure SF collect).",
+)
+parser.add_argument(
+    "--buffer_warmup_steps",
+    type=int,
+    default=4000,
+    help=(
+        "Waypoint collect steps before critic/SAC updates. Path episodes "
+        "are long; default 4000 so warmup covers several layouts. "
+        "Aisle pipeline still uses 1000."
+    ),
 )
 parser.add_argument(
     "--critic_warmup_updates",
     type=int,
-    default=1000,
+    default=4000,
     help="Critic-only updates after buffer warm-up before joint SAC training.",
 )
 parser.add_argument(
@@ -112,9 +256,9 @@ parser.add_argument(
     type=float,
     default=0.0,
     help=(
-        "λ_nom for MSE(a_sf, target) in policy space. 0 disables. "
-        "With --switch_collect: target is a_nom if Q(a_nom) >= threshold else "
-        "a_good (closer safe-side waypoint). Not cleared."
+        "λ_nom for MSE(a_sf, target) in policy space. Default 0 (no "
+        "action regularization). With --switch_collect: target is a_nom if "
+        "Q(a_nom) >= threshold else a_good. Not cleared."
     ),
 )
 parser.add_argument(
@@ -242,6 +386,7 @@ OffpolicyTrainer.log_update_data = _log_update_data_bar_filter  # type: ignore[m
 
 from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
+from env.isaac.skip_update_buffer import SkipUpdateReplayBuffer
 from env.isaac.ckpt_utils import save_epoch_checkpoint
 
 
@@ -322,6 +467,18 @@ def main():
     args.dino_ckpt_dir = os.path.join(args.dino_ckpt_dir, args.dino_encoder)
     args.device = torch_device
     use_auto_alpha = bool(args.auto_alpha) and not bool(args.no_auto_alpha)
+    if bool(getattr(args, "no_skip_arena_oob_from_buffer", False)):
+        args.skip_arena_oob_from_buffer = False
+    else:
+        args.skip_arena_oob_from_buffer = True
+    if bool(getattr(args, "no_include_contact_in_hs", False)):
+        args.include_contact_in_hs = False
+    else:
+        args.include_contact_in_hs = True
+    if bool(getattr(args, "no_alternate_collect", False)):
+        args.alternate_collect = False
+    else:
+        args.alternate_collect = True
 
     if args.training_num > 1:
         print("[WARN] Isaac Sim supports one env instance; forcing training_num=1")
@@ -341,7 +498,7 @@ def main():
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
-    run_tag = "sac-switch" if bool(getattr(args, "switch_collect", False)) else "sac"
+    run_tag = "sac-path"
     wandb.init(
         project="sac-hj-latent-humanoid",
         name=f"{run_tag}-{args.dino_encoder}-{timestamp}",
@@ -355,10 +512,7 @@ def main():
     wandb.define_metric("loss/*", step_metric="trainer/env_step")
     wandb.define_metric("train/*", step_metric="trainer/env_step")
     wandb.define_metric("switch/*", step_metric="trainer/env_step")
-    if bool(getattr(args, "switch_collect", False)):
-        tb_dir = f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}/logs"
-    else:
-        tb_dir = f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}/logs"
+    tb_dir = f"runs/sac_hj_humanoid_path/{run_tag}-{args.dino_encoder}-{timestamp}/logs"
     writer = SummaryWriter(log_dir=tb_dir)
     wb_logger = WandbLogger(update_interval=1, train_interval=10**9, test_interval=10**9)
     wb_logger.load(writer)
@@ -594,18 +748,38 @@ def main():
 
     _orig_policy_forward = policy.forward
 
+    def _env_collect_controller() -> str:
+        try:
+            modes = train_envs.get_env_attr("collect_controller")
+            return str(modes[0])
+        except Exception:  # noqa: BLE001
+            return "sf"
+
+    def _as_act_like(act_ref, act_np: np.ndarray):
+        if isinstance(act_ref, torch.Tensor):
+            out = torch.as_tensor(act_np, dtype=act_ref.dtype, device=act_ref.device)
+            if out.ndim == 1:
+                out = out.unsqueeze(0)
+            return out
+        out = np.asarray(act_np, dtype=np.float32)
+        if out.ndim == 1:
+            out = out.reshape(1, -1)
+        return out
+
     def _sac_forward(batch, state=None, input="obs", **kwargs):
-        """SAC forward; optional yaw=0; collect may Q-gate waypoint vs SF."""
-        # Always run the SF actor (learning uses this path; collect may discard act).
+        """SAC forward; collect may execute waypoint or Q-gate switch."""
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
         if freeze_yaw:
             out.act = _zero_yaw_act(out.act)
         if getattr(policy, "_attach_act_nom", False):
             act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
             pol_extra = Batch(act_nom=act_nom)
-            if switch_collect:
-                act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
-                pol_extra.act_good = act_good
+            mode = _env_collect_controller()
+            if mode == "waypoint":
+                out.act = _as_act_like(out.act, act_nom)
+                policy.last_q_nom = None
+                policy.last_switch_use_sf = 0.0
+            elif mode == "switch":
                 q_nom = _q_nom_min(batch[input], act_nom)
                 use_sf = q_nom < switch_threshold
                 pol_extra.q_nom = np.asarray(q_nom, dtype=np.float32)
@@ -728,19 +902,24 @@ def main():
 
     policy.learn = learn_sac_humanoid  # type: ignore[method-assign]
     print(
-        f"[INFO] SAC avoid SF: gamma={args.gamma_pyhj}, "
+        f"[INFO] SAC avoid SF (path pipeline): gamma={args.gamma_pyhj}, "
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
         f"λ_nom={action_reg_coef}, boundary={boundary_reg_coef}, "
-        f"freeze_yaw={freeze_yaw} "
-        f"({'SF+a_nom yaw=0, buffer keeps yaw' if freeze_yaw else 'yaw free'}), "
-        f"switch_collect={switch_collect}"
+        f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
         + (
-            f" (waypoint if Q(a_nom)>={switch_threshold:g} else SF; "
-            f"λ_nom: a_nom if Q>=thr else a_good side (3.5,-0.5)|(3.5,-3.5))"
-            if switch_collect
+            f"+contact(ignore feet, cap={float(args.contact_hs):g})"
+            if bool(args.include_contact_in_hs)
             else ""
         )
+        + f", lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
+        + ", "
+        f"yaw_limit={float(args.yaw_limit):g}, "
+        f"freeze_yaw={freeze_yaw}, "
+        f"alternate_collect={bool(args.alternate_collect)} "
+        f"(waypoint ↔ switch), "
+        f"obstacles: absent_p={float(args.obstacle_absent_prob):g} "
+        f"P(2|present)={float(args.two_obstacle_prob):g} max={int(args.max_n_obstacles)}"
     )
 
     if int(getattr(args, "wandb_video_every", 1)) != 0:
@@ -840,6 +1019,9 @@ def main():
         wandb.log(payload)
 
     buffer = VectorReplayBuffer(args.buffer_size, args.training_num)
+    if bool(getattr(args, "skip_arena_oob_from_buffer", True)):
+        buffer = SkipUpdateReplayBuffer(buffer)
+        print("[INFO] Arena-edge resets are dropped from the replay buffer (no update).")
     # exploration_noise=True only calls our stash (no Gaussian); SAC samples in forward.
     train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
     _orig_collect = train_collector.collect
@@ -853,131 +1035,67 @@ def main():
 
     train_collector.collect = _collect_with_act_nom  # type: ignore[method-assign]
 
-    # Scene layout (fresh train AND resume): spawn disk → left|right; bin fixed.
-    obstacle_absent_p = 0.1
-    bin_xy = (3.5, -2.0)
-    force_right_pass = bool(getattr(args, "force_right_pass", False))
-    spawn_hemisphere_pass = bool(getattr(args, "spawn_hemisphere_pass", False))
-    if force_right_pass and spawn_hemisphere_pass:
-        print(
-            "[WARN] --force_right_pass and --spawn_hemisphere_pass both set; "
-            "formal train uses spawn_hemisphere_pass (coupled L/R)."
-        )
-
-    def _apply_train_scene_layout(*, include_middle: bool) -> None:
-        """Training layout only. Never reads test_HJ knobs (no_bin / pass_radius / danger disk)."""
-        train_envs.set_env_attr("obstacle_absent_prob", obstacle_absent_p)
+    # Scene: start + 2 perp vias + goal; bins on the same perpendicular.
+    def _apply_path_scene_layout() -> None:
+        train_envs.set_env_attr("obstacle_absent_prob", float(args.obstacle_absent_prob))
+        train_envs.set_env_attr("two_obstacle_prob", float(args.two_obstacle_prob))
+        train_envs.set_env_attr("path_obstacle_layout", True)
+        train_envs.set_env_attr("filter_lidar_to_active_obstacles", True)
         train_envs.set_env_attr("randomize_obstacle", False)
         train_envs.set_env_attr("advance_passed_terminal", False)
-        # Formal + buffer: far lateral goals. switch-collect: same L/R vias
-        # (3.5,-1) / (3.5,-3) in buffer AND formal train.
-        far_left = {"center": np.array([3.5, 0.0], dtype=np.float64), "r": 0.5}
-        far_right = {"center": np.array([3.5, -4.0], dtype=np.float64), "r": 0.5}
-        via_left = {"center": np.array([3.5, -1.0], dtype=np.float64), "r": 0.5}
-        via_right = {"center": np.array([3.5, -3.0], dtype=np.float64), "r": 0.5}
-        if include_middle:
-            # Buffer: spawn → front → left|right|middle (independent cycle).
-            if switch_collect:
-                train_envs.set_env_attr("left_region", via_left)
-                train_envs.set_env_attr("right_region", via_right)
-            else:
-                train_envs.set_env_attr("left_region", far_left)
-                train_envs.set_env_attr("right_region", far_right)
-            train_envs.set_env_attr(
-                "start_region",
-                {"center": np.array([0.0, -2.0], dtype=np.float64), "r": 1.0},
-            )
-            train_envs.set_env_attr(
-                "front_region",
-                {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 0.5},
-            )
-            train_envs.set_env_attr(
-                "trajectory_region_sequence",
-                ["start", "front", ("left", "right", "middle")],
-            )
-            train_envs.set_env_attr("include_middle_pass", True)
-            train_envs.set_env_attr("x_bound_max", float(getattr(args, "x_bound_max", 4.5)))
-            train_envs.set_env_attr("spawn_hemisphere_pass", False)
-            if force_right_pass:
-                train_envs.set_env_attr("force_pass_side", "right")
-            else:
-                train_envs.set_env_attr("force_pass_side", None)
-        else:
-            # Formal train: spawn disk → left|right (no front/middle).
-            train_envs.set_env_attr(
-                "start_region",
-                {"center": np.array([1.5, -2.0], dtype=np.float64), "r": 1.0},
-            )
-            if switch_collect:
-                # Opt-in --switch_collect only: closer L/R vias + back disk.
-                train_envs.set_env_attr("left_region", via_left)
-                train_envs.set_env_attr("right_region", via_right)
-                back_xy = (5.5, -2.0)
-                back_r = 1.0
-                train_envs.set_env_attr(
-                    "back_region",
-                    {
-                        "center": np.array(
-                            [back_xy[0], back_xy[1]], dtype=np.float64
-                        ),
-                        "r": back_r,
-                    },
-                )
-                train_envs.set_env_attr(
-                    "trajectory_region_sequence",
-                    ["start", ("left", "right"), "back"],
-                )
-                train_envs.set_env_attr(
-                    "x_bound_max", float(back_xy[0] + back_r + 1.0)
-                )
-            else:
-                train_envs.set_env_attr("left_region", far_left)
-                train_envs.set_env_attr("right_region", far_right)
-                train_envs.set_env_attr(
-                    "trajectory_region_sequence",
-                    ["start", ("left", "right")],
-                )
-                train_envs.set_env_attr(
-                    "x_bound_max", float(getattr(args, "x_bound_max", 4.5))
-                )
-            train_envs.set_env_attr("include_middle_pass", False)
-            if spawn_hemisphere_pass:
-                train_envs.set_env_attr("spawn_hemisphere_pass", True)
-                train_envs.set_env_attr("force_pass_side", None)
-            else:
-                train_envs.set_env_attr("spawn_hemisphere_pass", False)
-                if force_right_pass:
-                    train_envs.set_env_attr("force_pass_side", "right")
-                else:
-                    train_envs.set_env_attr("force_pass_side", None)
+        train_envs.set_env_attr("spawn_hemisphere_pass", False)
+        train_envs.set_env_attr("force_pass_side", None)
+        train_envs.set_env_attr("include_middle_pass", False)
+        train_envs.set_env_attr("waypoint_layout", str(args.waypoint_layout))
+        train_envs.set_env_attr("arena_x_min", float(args.arena_x_min))
+        train_envs.set_env_attr("arena_x_max", float(args.arena_x_max))
+        train_envs.set_env_attr("arena_y_min", float(args.arena_y_min))
+        train_envs.set_env_attr("arena_y_max", float(args.arena_y_max))
+        train_envs.set_env_attr("use_arena_bounds", True)
+        train_envs.set_env_attr("perp_offset", float(args.perp_offset))
+        train_envs.set_env_attr("min_start_goal_dist", float(args.min_start_goal_dist))
+        train_envs.set_env_attr(
+            "lidar_distance_threshold", float(args.lidar_distance_threshold)
+        )
+        train_envs.set_env_attr(
+            "lidar_h_half_fov_deg", float(args.lidar_h_half_fov_deg)
+        )
+        train_envs.set_env_attr(
+            "include_contact_in_hs", bool(args.include_contact_in_hs)
+        )
+        train_envs.set_env_attr("contact_hs", float(args.contact_hs))
+        train_envs.set_env_attr(
+            "skip_arena_oob_from_buffer",
+            bool(args.skip_arena_oob_from_buffer),
+        )
+        train_envs.set_env_attr(
+            "alternate_collect_controllers", bool(args.alternate_collect)
+        )
 
-    yb = float(getattr(args, "y_bound", 0.0))
-    yc = float(getattr(args, "y_center", -2.0))
-    if spawn_hemisphere_pass:
-        train_pass_desc = "hemisphere-coupled alternate L/R"
-    elif force_right_pass:
-        train_pass_desc = "FORCE right only"
-    else:
-        train_pass_desc = "cycle left|right"
-    buffer_pass_desc = (
-        "FORCE right only" if force_right_pass else "cycle left|right|middle"
+    arena_desc = (
+        f"x[{float(args.arena_x_min):g},{float(args.arena_x_max):g}] "
+        f"y[{float(args.arena_y_min):g},{float(args.arena_y_max):g}]"
+    )
+    path_desc = (
+        "start → 2 perp vias (±"
+        f"{float(args.perp_offset):g} m) → goal; "
+        f"min |G-S|={float(args.min_start_goal_dist):g} m"
     )
 
     _actor_forward = policy.forward
     _expl_fn = policy.exploration_noise
 
-    # Buffer warm-up always runs (fresh + resume): refill replay; honor force_right_pass.
-    _apply_train_scene_layout(include_middle=True)
-    _lr_buf = (
-        "left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5"
-        if switch_collect
-        else "left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5"
-    )
+    _apply_path_scene_layout()
     print(
         "[INFO] Collecting initial transitions with WaypointNavController "
-        f"(spawn=(0,-2)r=1 → front=(1.5,-2)r=0.5 → {buffer_pass_desc}; "
-        f"{_lr_buf}; "
-        f"bin at {bin_xy} or absent p={obstacle_absent_p}; no behind-bin back"
+        f"({path_desc}; arena {arena_desc}; "
+        f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
+        f"{'+contact' if bool(args.include_contact_in_hs) else ''}; "
+        f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
+        f"yaw=±{float(args.yaw_limit):g}; "
+        f"obstacles: absent_p={float(args.obstacle_absent_prob):g}, "
+        f"P(2|present)={float(args.two_obstacle_prob):g}, "
+        f"perp ±{float(args.perp_offset):g} m"
         f"{'; resume' if args.resume_policy else ''})..."
     )
 
@@ -1007,7 +1125,7 @@ def main():
 
     policy.forward = _waypoint_forward  # type: ignore[method-assign]
     policy.exploration_noise = _waypoint_expl  # type: ignore[method-assign]
-    warmup_n_step = 1000
+    warmup_n_step = max(0, int(getattr(args, "buffer_warmup_steps", 4000)))
     warmup_chunk = 50
     print(
         f"[INFO] Warm-up collect n_step={warmup_n_step} "
@@ -1037,33 +1155,24 @@ def main():
     )
     policy.forward = _actor_forward  # type: ignore[method-assign]
     policy.exploration_noise = _expl_fn  # type: ignore[method-assign]
-    _apply_train_scene_layout(include_middle=False)
-    if switch_collect:
-        train_ctrl_desc = (
-            f"Q-gate switch (thr={switch_threshold:g}: "
-            "waypoint if Q(a_nom)>=thr else SF; "
-            f"λ_nom={action_reg_coef} a_nom if Q>=thr else a_good "
-            "closer of (3.5,-0.5)|(3.5,-3.5); "
-            "start→L|R via→back; SF pass-via then nominal to back)"
+    _apply_path_scene_layout()
+    if bool(args.alternate_collect):
+        train_envs.set_env_attr("_collect_ep_toggle", 0)
+        train_envs.set_env_attr("collect_controller", "waypoint")
+        print(
+            "[INFO] Formal collect alternates per episode: "
+            "waypoint-only ↔ Q-gate switch (a_nom if Q>=0 else SF)."
         )
-    else:
-        train_ctrl_desc = "SAC controls"
     print(
         "[INFO] Buffer done; restoring SAC actor "
-        f"(train: {train_ctrl_desc}; freeze_yaw={freeze_yaw}; "
-        f"spawn=(1.5,-2)r=1 → {train_pass_desc}"
-        + (
-            " → back=(5.5,-2)r=1; left=(3.5,-1)r=0.5 right=(3.5,-3)r=0.5; "
-            "no front/middle"
-            if switch_collect
-            else "; left=(3.5,0)r=0.5 right=(3.5,-4)r=0.5; no front/middle/back"
-        )
-        + "). "
-        f"Bin at {bin_xy} or absent p={obstacle_absent_p}; "
-        f"y_bound={'disabled' if yb <= 0 else f'{yc}±{yb} (OOB truncate+reset)'}."
+        f"(learn always SF; freeze_yaw={freeze_yaw}; {path_desc}; "
+        f"arena {arena_desc}, OOB reset skip_update="
+        f"{bool(args.skip_arena_oob_from_buffer)}). "
+        f"Obstacles: absent_p={float(args.obstacle_absent_prob):g}, "
+        f"P(2|present)={float(args.two_obstacle_prob):g}."
     )
 
-    n_critic_wu = int(getattr(args, "critic_warmup_updates", 1000))
+    n_critic_wu = int(getattr(args, "critic_warmup_updates", 4000))
     if n_critic_wu > 0 and not args.resume_policy:
         print(f"[INFO] Critic-only warmup: {n_critic_wu} updates...")
         policy.warmup = True
@@ -1120,22 +1229,26 @@ def main():
         policy.train(was_training)
         print("[INFO] Actor BC warmup done.")
 
-    if switch_collect:
-        log_path = Path(
-            f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}"
-        )
-    else:
-        log_path = Path(f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}")
+    log_path = Path(
+        f"runs/sac_hj_humanoid_path/{run_tag}-{args.dino_encoder}-{timestamp}"
+    )
     if args.resume_policy:
-        if switch_collect:
-            log_path = Path(
-                f"runs/sac_hj_humanoid/{run_tag}-{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
-            )
-        else:
-            log_path = Path(
-                f"runs/sac_hj_humanoid/{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
-            )
+        log_path = Path(
+            f"runs/sac_hj_humanoid_path/{run_tag}-{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
+        )
     print(f"[INFO] Training epochs {start_epoch}..{end_epoch}; ckpts -> {log_path}")
+    switch_traj_dir = log_path / "switch_traj"
+    switch_traj_dir.mkdir(parents=True, exist_ok=True)
+    train_envs.set_env_attr("switch_traj_dir", str(switch_traj_dir))
+    train_envs.set_env_attr(
+        "failure_set_radius", float(args.lidar_distance_threshold)
+    )
+    train_envs.set_env_attr("record_switch_traj", True)
+    print(
+        "[INFO] Formal-train switch episodes will save 2D traj PNGs -> "
+        f"{switch_traj_dir} (obstacles as blue dots, dashed r="
+        f"{float(args.lidar_distance_threshold):g} failure set)."
+    )
     for epoch in range(start_epoch, end_epoch + 1):
         print(f"\n=== Epoch {epoch}/{end_epoch} ===")
         stats = offpolicy_trainer(

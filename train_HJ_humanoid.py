@@ -173,6 +173,7 @@ OffpolicyTrainer.log_update_data = _log_update_data_bar_filter  # type: ignore[m
 
 from wm_load import load_model  # not plan.py — avoids env.venv / utils collision
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
+from env.isaac.ckpt_utils import save_epoch_checkpoint
 
 
 def args_type(default):
@@ -785,9 +786,7 @@ def main():
                 numeric[f"train/{k}"] = float(v)
         wandb.log(numeric)
 
-        ckpt_dir_epoch = log_path / f"epoch_id_{epoch}"
-        ckpt_dir_epoch.mkdir(exist_ok=True, parents=True)
-        torch.save(policy.state_dict(), ckpt_dir_epoch / "policy.pth")
+        save_epoch_checkpoint(policy, log_path, epoch, keep=2)
 
     print("[INFO] Training complete.")
     simulation_app.close()

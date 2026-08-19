@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
@@ -43,7 +44,8 @@ class LatentHumanoidEnv(gym.Env):
     - soft X far wall: x >= x_bound_max (default 4.5). Same truncate-only behavior.
 
     Continuous LiDAR margin ``h_s = lidar_min_distance - 1.0`` (m) from the
-    **front 180°** LiDAR (<0 unsafe, >0 safe); no forward hit → ``h_s = 2.0``.
+    forward LiDAR cone (aisle default ±90°; path pipeline ±60°)
+    (<0 unsafe, >0 safe); no in-cone hit → ``h_s = 2.0``.
     Does **not** end the episode.
     Waypoints: start disk (0,-2) r=1 → front (1.5,-2) r=0.5 → left|right r=0.5
     (or middle point); bin at (3.5,-2). Spawn = sampled start (buffer and train).
@@ -111,6 +113,13 @@ class LatentHumanoidEnv(gym.Env):
         # WM predictor history (visual frames + executed actions) for z_{t+1} look-ahead.
         self._obs_hist: list[dict[str, np.ndarray]] = []
         self._act_hist: list[np.ndarray] = []
+        # Formal-train switch episodes: 2D traj PNG (off by default / original pipeline).
+        self.record_switch_traj = False
+        self.switch_traj_dir = ""
+        self.failure_set_radius = 1.5
+        self._record_switch_traj_ep = False
+        self._switch_traj_xy: list[np.ndarray] = []
+        self._switch_traj_use_sf: list[bool] = []
 
         self._episode_sim_step = 0
         self._episode_visual_step = 0
@@ -119,6 +128,7 @@ class LatentHumanoidEnv(gym.Env):
         # enable_cameras is handled by AppLauncher / visual_mode on args_cli,
         # not as an IsaacG1Wrapper kwarg.
         self.wrapper = IsaacG1Wrapper(args_cli)
+        self._apply_optional_pipeline_args(args)
         self.sim_dt = float(self.wrapper.sim_dt)
         # Same region-nav controller used in DataCollection_loop_test.
         self.waypoint_nav = WaypointNavController(
@@ -138,7 +148,13 @@ class LatentHumanoidEnv(gym.Env):
         if latent_h:
             raise NotImplementedError("FailureClassifier latent_h is not wired for Isaac G1 yet.")
 
-        reset_info = self.wrapper.reset_scene(seed=getattr(args, "seed", None))
+        use_path = (
+            str(getattr(self.wrapper, "waypoint_layout", "regions")) == "start_goal_perp"
+            or bool(getattr(self.wrapper, "path_obstacle_layout", False))
+        )
+        reset_info = self.wrapper.reset_scene(
+            seed=None if use_path else getattr(args, "seed", None)
+        )
         self._reset_timers()
         self.waypoint_nav.reset()
         self._safe_side_nav.reset()
@@ -150,12 +166,14 @@ class LatentHumanoidEnv(gym.Env):
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
         )
-        # (vx, vy, yaw_rate): vx in [0, 0.8], vy in [-0.5, 0.5], yaw in [-0.5, 0.5]
+        yaw_limit = float(getattr(self.wrapper, "action_high")[2])
         self.action_space = Box(
-            low=np.array([0.0, -0.5, -0.5], dtype=np.float32),
-            high=np.array([0.8, 0.5, 0.5], dtype=np.float32),
+            low=np.array([0.0, -0.5, -yaw_limit], dtype=np.float32),
+            high=np.array([0.8, 0.5, yaw_limit], dtype=np.float32),
             dtype=np.float32,
         )
+        self.wrapper.action_low = np.asarray(self.action_space.low, dtype=np.float32)
+        self.wrapper.action_high = np.asarray(self.action_space.high, dtype=np.float32)
         self._reset_wm_history(obs)
         approx_substeps = max(1, int(round(self.visual_period_s / self.sim_dt)))
         print(
@@ -164,7 +182,12 @@ class LatentHumanoidEnv(gym.Env):
             f"visual_fps={self.visual_fps}, ~{approx_substeps} sim steps / HJ step, "
             f"max_episode_sim_steps={self.max_episode_sim_steps}, "
             f"y_bound={'disabled' if self.wrapper.y_bound <= 0 else f'{self.wrapper.y_center}±{self.wrapper.y_bound}'}, "
-            f"x_bound_max={self.wrapper.x_bound_max} "
+            f"x_bound_max={self.wrapper.x_bound_max}, "
+            f"arena={'on ' + self._arena_str() if self.wrapper.use_arena_bounds else 'off'}, "
+            f"h_s=d_min-{self.wrapper.lidar_distance_threshold:g}"
+            f"{('+contact→' + str(self.wrapper.contact_hs) if self.wrapper.include_contact_in_hs else '')}, "
+            f"lidar_cone=±{float(getattr(self.wrapper, 'lidar_h_half_fov_deg', 90.0)):g}°, "
+            f"yaw=[{self.action_space.low[2]:g},{self.action_space.high[2]:g}] "
             f"(OOB → truncate only, no h_s penalty), "
             f"wm_num_hist={self._wm_num_hist()}, "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
@@ -177,16 +200,23 @@ class LatentHumanoidEnv(gym.Env):
                 return {"mode": "point", "xy": list(v.get("xy", (0.0, 0.0)))}
             return {"center": np.asarray(v["center"]).tolist(), "r": v["r"]}
 
+        layout = str(getattr(self.wrapper, "waypoint_layout", "regions"))
+        if layout == "start_goal_perp":
+            seq_desc = "start → trans1 → trans2 → goal (resampled XY each episode)"
+        else:
+            seq_desc = (
+                f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE} "
+                "(goal=left|right|middle; no back); "
+                "pass-side: include_middle_pass→left|right|middle "
+                "(QP critic train/buffer), else left|right (actor/test)"
+            )
         print(
             "[LatentHumanoidEnv] trajectory regions "
             f"{ {k: _region_summary(v) for k, v in self.wrapper.trajectory_regions.items()} }; "
-            f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE} "
-            f"(goal=left|right|middle; no back); "
-            f"pass-side: include_middle_pass→left|right|middle "
-            f"(QP critic train/buffer), else left|right (actor/test); "
-            f"bin FIXED in buffer, randomized in training "
-            f"(x={float(self.wrapper._blue_bin_xy_fixed[0]):.1f}, "
-            f"y∈{tuple(self.wrapper.obstacle_y_range)})"
+            f"{seq_desc}; "
+            f"obstacles: layout={layout} "
+            f"max_n={getattr(self.wrapper, '_max_n_obstacles', 1)} "
+            f"path_obs={bool(getattr(self.wrapper, 'path_obstacle_layout', False))}"
         )
 
     @property
@@ -308,6 +338,232 @@ class LatentHumanoidEnv(gym.Env):
         self.wrapper.x_bound_max = float(value)
 
     @property
+    def use_arena_bounds(self) -> bool:
+        return bool(self.wrapper.use_arena_bounds)
+
+    @use_arena_bounds.setter
+    def use_arena_bounds(self, value: bool) -> None:
+        self.wrapper.use_arena_bounds = bool(value)
+
+    @property
+    def waypoint_layout(self) -> str:
+        return str(self.wrapper.waypoint_layout)
+
+    @waypoint_layout.setter
+    def waypoint_layout(self, value: str) -> None:
+        self.wrapper.waypoint_layout = str(value)
+
+    @property
+    def lidar_distance_threshold(self) -> float:
+        return float(self.wrapper.lidar_distance_threshold)
+
+    @lidar_distance_threshold.setter
+    def lidar_distance_threshold(self, value: float) -> None:
+        self.wrapper.lidar_distance_threshold = float(value)
+
+    @property
+    def lidar_h_half_fov_deg(self) -> float:
+        return float(getattr(self.wrapper, "lidar_h_half_fov_deg", 90.0))
+
+    @lidar_h_half_fov_deg.setter
+    def lidar_h_half_fov_deg(self, value: float) -> None:
+        self.wrapper.lidar_h_half_fov_deg = float(value)
+
+    @property
+    def include_contact_in_hs(self) -> bool:
+        return bool(getattr(self.wrapper, "include_contact_in_hs", False))
+
+    @include_contact_in_hs.setter
+    def include_contact_in_hs(self, value: bool) -> None:
+        self.wrapper.include_contact_in_hs = bool(value)
+
+    @property
+    def contact_hs(self) -> float:
+        return float(getattr(self.wrapper, "contact_hs", -1.5))
+
+    @contact_hs.setter
+    def contact_hs(self, value: float) -> None:
+        self.wrapper.contact_hs = float(value)
+
+    @property
+    def perp_offset(self) -> float:
+        return float(self.wrapper.perp_offset)
+
+    @perp_offset.setter
+    def perp_offset(self, value: float) -> None:
+        self.wrapper.perp_offset = float(value)
+
+    @property
+    def min_start_goal_dist(self) -> float:
+        return float(self.wrapper.min_start_goal_dist)
+
+    @min_start_goal_dist.setter
+    def min_start_goal_dist(self, value: float) -> None:
+        self.wrapper.min_start_goal_dist = float(value)
+
+    @property
+    def path_obstacle_layout(self) -> bool:
+        return bool(getattr(self.wrapper, "path_obstacle_layout", False))
+
+    @path_obstacle_layout.setter
+    def path_obstacle_layout(self, value: bool) -> None:
+        self.wrapper.path_obstacle_layout = bool(value)
+        if value:
+            self.wrapper.filter_lidar_to_active_obstacles = True
+
+    @property
+    def two_obstacle_prob(self) -> float:
+        return float(getattr(self.wrapper, "two_obstacle_prob", 0.5))
+
+    @two_obstacle_prob.setter
+    def two_obstacle_prob(self, value: float) -> None:
+        self.wrapper.two_obstacle_prob = float(value)
+
+    @property
+    def collect_controller(self) -> str:
+        return str(getattr(self.wrapper, "collect_controller", "sf"))
+
+    @collect_controller.setter
+    def collect_controller(self, value: str) -> None:
+        self.wrapper.collect_controller = str(value)
+
+    @property
+    def alternate_collect_controllers(self) -> bool:
+        return bool(getattr(self.wrapper, "alternate_collect_controllers", False))
+
+    @alternate_collect_controllers.setter
+    def alternate_collect_controllers(self, value: bool) -> None:
+        self.wrapper.alternate_collect_controllers = bool(value)
+
+    @property
+    def _collect_ep_toggle(self) -> int:
+        return int(getattr(self.wrapper, "_collect_ep_toggle", 0))
+
+    @_collect_ep_toggle.setter
+    def _collect_ep_toggle(self, value: int) -> None:
+        self.wrapper._collect_ep_toggle = int(value)
+
+    @property
+    def filter_lidar_to_active_obstacles(self) -> bool:
+        return bool(getattr(self.wrapper, "filter_lidar_to_active_obstacles", False))
+
+    @filter_lidar_to_active_obstacles.setter
+    def filter_lidar_to_active_obstacles(self, value: bool) -> None:
+        self.wrapper.filter_lidar_to_active_obstacles = bool(value)
+
+    @property
+    def arena_x_min(self) -> float:
+        return float(self.wrapper.arena_x_min)
+
+    @arena_x_min.setter
+    def arena_x_min(self, value: float) -> None:
+        self.wrapper.arena_x_min = float(value)
+
+    @property
+    def arena_x_max(self) -> float:
+        return float(self.wrapper.arena_x_max)
+
+    @arena_x_max.setter
+    def arena_x_max(self, value: float) -> None:
+        self.wrapper.arena_x_max = float(value)
+
+    @property
+    def arena_y_min(self) -> float:
+        return float(self.wrapper.arena_y_min)
+
+    @arena_y_min.setter
+    def arena_y_min(self, value: float) -> None:
+        self.wrapper.arena_y_min = float(value)
+
+    @property
+    def arena_y_max(self) -> float:
+        return float(self.wrapper.arena_y_max)
+
+    @arena_y_max.setter
+    def arena_y_max(self, value: float) -> None:
+        self.wrapper.arena_y_max = float(value)
+
+    def set_arena_bounds(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+    ) -> None:
+        self.wrapper.arena_x_min = float(x_min)
+        self.wrapper.arena_x_max = float(x_max)
+        self.wrapper.arena_y_min = float(y_min)
+        self.wrapper.arena_y_max = float(y_max)
+        self.wrapper.use_arena_bounds = True
+
+    def _arena_str(self) -> str:
+        w = self.wrapper
+        return (
+            f"x[{w.arena_x_min:g},{w.arena_x_max:g}] "
+            f"y[{w.arena_y_min:g},{w.arena_y_max:g}]"
+        )
+
+    def _apply_optional_pipeline_args(self, args) -> None:
+        """New path-pipeline knobs. Missing attrs keep the original G1 defaults."""
+        self.skip_arena_oob_from_buffer = bool(
+            getattr(args, "skip_arena_oob_from_buffer", False)
+        )
+        thr = getattr(args, "lidar_distance_threshold", None)
+        if thr is not None:
+            self.wrapper.lidar_distance_threshold = float(thr)
+        if getattr(args, "lidar_h_half_fov_deg", None) is not None:
+            self.wrapper.lidar_h_half_fov_deg = float(args.lidar_h_half_fov_deg)
+        if bool(getattr(args, "no_include_contact_in_hs", False)):
+            self.wrapper.include_contact_in_hs = False
+        elif bool(getattr(args, "include_contact_in_hs", False)):
+            self.wrapper.include_contact_in_hs = True
+        if getattr(args, "contact_hs", None) is not None:
+            self.wrapper.contact_hs = float(args.contact_hs)
+        yaw_limit = getattr(args, "yaw_limit", None)
+        if yaw_limit is not None:
+            yaw_limit = float(yaw_limit)
+            self.wrapper.action_low = np.array(
+                [0.0, -0.5, -yaw_limit], dtype=np.float32
+            )
+            self.wrapper.action_high = np.array(
+                [0.8, 0.5, yaw_limit], dtype=np.float32
+            )
+        layout = getattr(args, "waypoint_layout", None)
+        if layout:
+            self.wrapper.waypoint_layout = str(layout)
+        if bool(getattr(args, "use_arena_bounds", False)):
+            self.wrapper.use_arena_bounds = True
+            if getattr(args, "arena_x_min", None) is not None:
+                self.wrapper.arena_x_min = float(args.arena_x_min)
+            if getattr(args, "arena_x_max", None) is not None:
+                self.wrapper.arena_x_max = float(args.arena_x_max)
+            if getattr(args, "arena_y_min", None) is not None:
+                self.wrapper.arena_y_min = float(args.arena_y_min)
+            if getattr(args, "arena_y_max", None) is not None:
+                self.wrapper.arena_y_max = float(args.arena_y_max)
+        if getattr(args, "perp_offset", None) is not None:
+            self.wrapper.perp_offset = float(args.perp_offset)
+        if getattr(args, "min_start_goal_dist", None) is not None:
+            self.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
+        if bool(getattr(args, "path_obstacle_layout", False)):
+            self.wrapper.path_obstacle_layout = True
+            self.wrapper.filter_lidar_to_active_obstacles = True
+        if getattr(args, "two_obstacle_prob", None) is not None:
+            self.wrapper.two_obstacle_prob = float(args.two_obstacle_prob)
+        if getattr(args, "obstacle_absent_prob", None) is not None:
+            self.wrapper.obstacle_absent_prob = float(args.obstacle_absent_prob)
+        layout_seed = getattr(args, "layout_seed", None)
+        if layout_seed is not None:
+            self.wrapper._rng = np.random.default_rng(int(layout_seed))
+            print(f"[LatentHumanoidEnv] layout RNG seeded with --layout_seed={int(layout_seed)}")
+        alt = bool(getattr(args, "alternate_collect", False))
+        if bool(getattr(args, "no_alternate_collect", False)):
+            alt = False
+        self.wrapper.alternate_collect_controllers = alt
+        if alt:
+            self.wrapper.collect_controller = "waypoint"
+
+    @property
     def obstacle_absent_prob(self) -> float:
         return float(self.wrapper.obstacle_absent_prob)
 
@@ -354,10 +610,15 @@ class LatentHumanoidEnv(gym.Env):
 
     def _pyhj_info(self, end_reason: str | None = None, stuck: bool = False) -> dict:
         """Scalar-only info with a fixed key set (required by PyHJ Batch assignment)."""
+        skip_update = (
+            end_reason == "out_of_bounds"
+            and bool(getattr(self, "skip_arena_oob_from_buffer", False))
+        )
         return {
             "episode_step": np.int32(self._episode_visual_step),
             "end_reason": np.int32(self._END_REASON_CODE.get(end_reason, 0)),
             "stuck": np.float32(1.0 if stuck else 0.0),
+            "skip_update": np.float32(1.0 if skip_update else 0.0),
         }
 
     def _visual_to_uint8_hwc(self, visual: Any) -> np.ndarray:
@@ -422,6 +683,7 @@ class LatentHumanoidEnv(gym.Env):
         hj_val: float | None,
         *,
         bump_env_step: bool = True,
+        contact: float | None = None,
     ) -> None:
         """One wandb.log per env transition; x-axis is trainer/env_step."""
         # Always bump the shared step counter (trainer x-axis), even if wandb is off.
@@ -441,6 +703,14 @@ class LatentHumanoidEnv(gym.Env):
                 "trainer/env_step": float(step),
                 "safety/l": float(l_val),
             }
+            contact_v = contact
+            if contact_v is None:
+                contact_v = float(
+                    getattr(self.wrapper, "_last_lidar_stats", {}).get(
+                        "contact_collision", 0.0
+                    )
+                )
+            payload["safety/contact"] = float(contact_v)
             if hj_val is not None and np.isfinite(hj_val):
                 payload["safety/hj"] = float(hj_val)
             # Deterministic actor cmd stashed by exploration_noise wrapper (pre-noise).
@@ -576,6 +846,111 @@ class LatentHumanoidEnv(gym.Env):
             self._episode_frames = []
             self._record_this_episode = False
 
+    def _current_switch_use_sf(self) -> bool:
+        """True iff this step executed SF (Q(a_nom)/HJ < 0)."""
+        policy = self.policy_for_log
+        if policy is None:
+            return False
+        use_sf = getattr(policy, "last_switch_use_sf", None)
+        if use_sf is not None:
+            try:
+                return bool(float(use_sf) > 0.5)
+            except (TypeError, ValueError):
+                return bool(use_sf)
+        q_nom = getattr(policy, "last_q_nom", None)
+        if q_nom is not None and np.isfinite(q_nom):
+            return bool(float(q_nom) < 0.0)
+        return False
+
+    def _start_switch_traj_recording(self, reset_info: dict) -> None:
+        self._switch_traj_xy = []
+        self._switch_traj_use_sf = []
+        mode = str(
+            (reset_info or {}).get(
+                "collect_controller", getattr(self.wrapper, "collect_controller", "sf")
+            )
+        )
+        self._record_switch_traj_ep = bool(self.record_switch_traj) and mode == "switch"
+        if not self._record_switch_traj_ep:
+            return
+        try:
+            xy = self.wrapper.get_robot_xy_local()
+            self._switch_traj_xy.append(np.asarray(xy, dtype=np.float64).reshape(2).copy())
+            self._switch_traj_use_sf.append(False)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] switch traj start failed: {exc}")
+            self._record_switch_traj_ep = False
+
+    def _append_switch_traj_xy(self) -> None:
+        if not self._record_switch_traj_ep:
+            return
+        try:
+            xy = self.wrapper.get_robot_xy_local()
+            self._switch_traj_xy.append(np.asarray(xy, dtype=np.float64).reshape(2).copy())
+            self._switch_traj_use_sf.append(self._current_switch_use_sf())
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] switch traj append failed: {exc}")
+
+    def _finish_switch_traj(self, end_reason: str | None) -> None:
+        if not self._record_switch_traj_ep:
+            self._switch_traj_xy = []
+            self._switch_traj_use_sf = []
+            return
+        self._record_switch_traj_ep = False
+        layout = getattr(self, "_last_reset_layout", None) or {}
+        try:
+            from env.isaac.switch_traj_plot import save_switch_traj_png
+
+            out_dir = Path(self.switch_traj_dir) if self.switch_traj_dir else Path(
+                "runs/sac_hj_humanoid_path/switch_traj"
+            )
+            ep_id = int(self._finished_episodes)
+            reason = end_reason or "ongoing"
+            out_path = out_dir / f"switch_ep{ep_id:04d}_{reason}.png"
+            arena = None
+            if bool(getattr(self.wrapper, "use_arena_bounds", False)):
+                arena = (
+                    float(self.wrapper.arena_x_min),
+                    float(self.wrapper.arena_x_max),
+                    float(self.wrapper.arena_y_min),
+                    float(self.wrapper.arena_y_max),
+                )
+            r = float(self.failure_set_radius)
+            if r <= 0:
+                r = float(self.wrapper.lidar_distance_threshold)
+            png = save_switch_traj_png(
+                out_path,
+                np.asarray(self._switch_traj_xy, dtype=np.float64),
+                layout.get("waypoints"),
+                layout.get("obstacle_xys") or [],
+                failure_radius=r,
+                arena=arena,
+                end_reason=reason,
+                episode_id=ep_id,
+                use_sf=np.asarray(self._switch_traj_use_sf, dtype=bool),
+            )
+            print(f"[LatentHumanoidEnv] saved switch traj {png}")
+            try:
+                import wandb
+
+                if wandb.run is not None:
+                    payload = {
+                        "rollout/switch_traj": wandb.Image(str(png)),
+                        "rollout/episode": ep_id,
+                    }
+                    if self.log_state is not None:
+                        payload["trainer/env_step"] = float(
+                            self.log_state.get("env_step", 0)
+                        )
+                    wandb.log(payload)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] switch traj wandb log failed: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] switch traj plot failed: {exc}")
+        finally:
+            self._switch_traj_xy = []
+            self._switch_traj_use_sf = []
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         fixed_layout = None if options is None else options.get("fixed_layout")
         reset_info = self.wrapper.reset_scene(seed=seed, fixed_layout=fixed_layout)
@@ -594,7 +969,10 @@ class LatentHumanoidEnv(gym.Env):
         if reset_info is not None:
             print(
                 f"[LatentHumanoidEnv] reset robot_xy={reset_info.get('robot_xy')} "
-                f"obstacle_present={reset_info.get('obstacle_present')} "
+                f"n_obstacles={reset_info.get('n_obstacles')} "
+                f"obstacle_xys={reset_info.get('obstacle_xys')} "
+                f"collect={reset_info.get('collect_controller')} "
+                f"wp_names={reset_info.get('waypoint_region_names')} "
                 f"waypoints={reset_info.get('waypoints')}"
             )
         info = self._pyhj_info(end_reason=None, stuck=False)
@@ -602,10 +980,14 @@ class LatentHumanoidEnv(gym.Env):
         self._last_reset_layout = {
             "blue_bin_xy": reset_info.get("blue_bin_xy"),
             "obstacle_present": bool(reset_info.get("obstacle_present", True)),
+            "n_obstacles": int(reset_info.get("n_obstacles", 0)),
+            "obstacle_xys": reset_info.get("obstacle_xys"),
+            "collect_controller": reset_info.get("collect_controller"),
             "waypoints": np.asarray(reset_info["waypoints"], dtype=np.float64).copy(),
             "waypoint_region_names": list(reset_info.get("waypoint_region_names", [])),
             "robot_xy": np.asarray(reset_info["robot_xy"], dtype=np.float64).copy(),
         }
+        self._start_switch_traj_recording(reset_info or {})
         return z, info
 
     def step(self, action):
@@ -617,6 +999,7 @@ class LatentHumanoidEnv(gym.Env):
         stuck = False
         end_reason = None
         step_info: dict[str, Any] = {}
+        contact_any = 0.0
         dbg = bool(self.debug_step_timing) and int(self._debug_steps_left) > 0
         t_enter = _time.time() if dbg else 0.0
         if dbg:
@@ -642,6 +1025,8 @@ class LatentHumanoidEnv(gym.Env):
                 )
 
             h_s = min(h_s, float(self.wrapper.calculate_cost()))
+            if float(self.wrapper._last_lidar_stats.get("contact_collision", 0.0)) > 0.5:
+                contact_any = 1.0
             stuck = stuck or bool(step_info.get("stuck", False))
 
             if self.wrapper.advance_waypoint_if_reached():
@@ -676,8 +1061,9 @@ class LatentHumanoidEnv(gym.Env):
         hj_val = self._hj_value(z_next, action_env=np.asarray(action, dtype=np.float64))
         # out_of_bounds: truncate only (stop collecting sparse flee data). Do NOT
         # rewrite h_s — OOB is not a collision / not a safety failure label.
-        self._log_rollout_metrics(h_s, hj_val, bump_env_step=True)
+        self._log_rollout_metrics(h_s, hj_val, bump_env_step=True, contact=contact_any)
         self._append_frame(obs, hj_val=hj_val, l_val=h_s)
+        self._append_switch_traj_xy()
         if dbg:
             print(
                 f"[LatentHumanoidEnv] step exit in {_time.time() - t_enter:.1f}s "
@@ -691,7 +1077,13 @@ class LatentHumanoidEnv(gym.Env):
         if truncated:
             xy = self.wrapper.get_robot_xy_local()
             if end_reason == "out_of_bounds":
-                if self.wrapper.is_out_of_x_bounds():
+                if bool(getattr(self.wrapper, "use_arena_bounds", False)):
+                    extra = (
+                        f" (arena xy=[{xy[0]:.3f},{xy[1]:.3f}] "
+                        f"{self._arena_str()}, truncate-only"
+                        f"{', skip_update' if self.skip_arena_oob_from_buffer else ''})"
+                    )
+                elif self.wrapper.is_out_of_x_bounds():
                     extra = (
                         f" (x={xy[0]:.3f}>={self.wrapper.x_bound_max}, truncate-only)"
                     )
@@ -710,6 +1102,7 @@ class LatentHumanoidEnv(gym.Env):
             )
             self._finished_episodes += 1
             self._log_episode_video(end_reason)
+            self._finish_switch_traj(end_reason)
         return z_next, h_s, terminated, truncated, self._pyhj_info(end_reason, stuck)
 
     def _wm_num_hist(self) -> int:

@@ -39,6 +39,11 @@ DEFAULT_TRAJECTORY_REGION_SEQUENCE: list[str | tuple[str, ...]] = [
 PASS_SIDE_CYCLE: tuple[str, ...] = ("left", "right", "middle")
 PASS_SIDE_TRAIN: tuple[str, ...] = ("left", "right")
 
+# Start–goal path layout (new SAC pipeline only; region layout is unchanged).
+DEFAULT_ARENA_BOUNDS: tuple[float, float, float, float] = (-2.0, 5.0, -4.0, 2.0)
+DEFAULT_PERP_OFFSET_M: float = 2.5
+DEFAULT_MIN_START_GOAL_DIST: float = 4.0
+
 
 def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
     """Single (2,) -> one point; (N, 2) -> N points."""
@@ -138,6 +143,207 @@ def generate_random_waypoint_sequence(
         log_names.append(region_name)
 
     return np.stack(points, axis=0), log_names
+
+
+def _point_in_rect(
+    xy: np.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    margin: float = 0.0,
+) -> bool:
+    x, y = float(xy[0]), float(xy[1])
+    return (
+        (x_min + margin) <= x <= (x_max - margin)
+        and (y_min + margin) <= y <= (y_max - margin)
+    )
+
+
+def _clamp_to_rect(
+    xy: np.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    margin: float = 0.0,
+) -> np.ndarray:
+    return np.array(
+        [
+            float(np.clip(xy[0], x_min + margin, x_max - margin)),
+            float(np.clip(xy[1], y_min + margin, y_max - margin)),
+        ],
+        dtype=np.float64,
+    )
+
+
+def sample_start_goal_perp_path(
+    rng: np.random.Generator,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    perp_offset: float = DEFAULT_PERP_OFFSET_M,
+    min_start_goal_dist: float = DEFAULT_MIN_START_GOAL_DIST,
+    margin: float = 0.5,
+    t_lo: float = 0.2,
+    t_hi: float = 0.8,
+    min_t_gap: float = 0.15,
+    max_tries: int = 256,
+) -> tuple[np.ndarray, list[str], float]:
+    """Sample start, two perpendicular transition waypoints, and goal.
+
+    Transition waypoints sit on the start→goal segment, then are offset
+    perpendicularly by ``±perp_offset`` (random independent signs). They are
+    ordered so the one closer to the start comes first (no turning back).
+
+    Returns ``(waypoints (4, 2), names, spawn_yaw)``. ``spawn_yaw`` faces
+    start → first transition waypoint.
+    """
+    ix0, ix1 = float(x_min + margin), float(x_max - margin)
+    iy0, iy1 = float(y_min + margin), float(y_max - margin)
+    if ix1 <= ix0 or iy1 <= iy0:
+        raise ValueError("Arena inset is empty; increase bounds or reduce margin.")
+
+    last_err = "failed to sample start-goal path"
+    for _ in range(int(max_tries)):
+        start = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        goal = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        delta = goal - start
+        dist = float(np.linalg.norm(delta))
+        if dist < float(min_start_goal_dist):
+            last_err = f"start-goal dist {dist:.2f} < {min_start_goal_dist}"
+            continue
+        tangent = delta / dist
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+
+        t1 = float(rng.uniform(t_lo, t_hi))
+        t2 = float(rng.uniform(t_lo, t_hi))
+        if abs(t1 - t2) < float(min_t_gap):
+            last_err = "transition t too close"
+            continue
+
+        trans: list[np.ndarray] = []
+        ok = True
+        for t in (t1, t2):
+            foot = start + t * delta
+            sign = -1.0 if rng.random() < 0.5 else 1.0
+            pt = foot + sign * float(perp_offset) * normal
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.3):
+                pt = foot - sign * float(perp_offset) * normal
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.15):
+                pt = _clamp_to_rect(pt, x_min, x_max, y_min, y_max, margin=0.15)
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.05):
+                ok = False
+                last_err = "transition waypoint outside arena"
+                break
+            trans.append(pt)
+        if not ok:
+            continue
+
+        d0 = float(np.linalg.norm(trans[0] - start))
+        d1 = float(np.linalg.norm(trans[1] - start))
+        if d1 < d0:
+            trans[0], trans[1] = trans[1], trans[0]
+
+        heading = trans[0] - start
+        if float(np.linalg.norm(heading)) < 1e-6:
+            heading = goal - start
+        spawn_yaw = float(np.arctan2(heading[1], heading[0]))
+        wps = np.stack([start, trans[0], trans[1], goal], axis=0)
+        names = ["start", "trans1", "trans2", "goal"]
+        return wps, names, spawn_yaw
+
+    raise RuntimeError(f"sample_start_goal_perp_path: {last_err}")
+
+
+def sample_perp_points_on_segment(
+    rng: np.random.Generator,
+    start: np.ndarray,
+    goal: np.ndarray,
+    n: int,
+    *,
+    perp_offset: float = DEFAULT_PERP_OFFSET_M,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    t_lo: float = 0.25,
+    t_hi: float = 0.75,
+    min_t_gap: float = 0.18,
+    min_pairwise: float = 1.2,
+    min_end_dist: float = 2.0,
+    margin: float = 0.3,
+    max_tries: int = 256,
+) -> list[np.ndarray]:
+    """Sample ``n`` points offset ±perp_offset from the start→goal segment.
+
+    Used for path-layout obstacles (and similar geometry). Empty if ``n<=0``.
+    """
+    n = int(n)
+    if n <= 0:
+        return []
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    delta = goal - start
+    dist = float(np.linalg.norm(delta))
+    if dist < 1e-6:
+        raise ValueError("start and goal are coincident")
+    tangent = delta / dist
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+
+    last_err = "failed to sample perp points"
+    for _ in range(int(max_tries)):
+        ts = [float(rng.uniform(t_lo, t_hi)) for _ in range(n)]
+        ts.sort()
+        if any(abs(ts[i] - ts[i - 1]) < float(min_t_gap) for i in range(1, n)):
+            last_err = "t too close"
+            continue
+        pts: list[np.ndarray] = []
+        ok = True
+        for t in ts:
+            foot = start + t * delta
+            sign = -1.0 if rng.random() < 0.5 else 1.0
+            pt = foot + sign * float(perp_offset) * normal
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=margin):
+                pt = foot - sign * float(perp_offset) * normal
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.15):
+                pt = _clamp_to_rect(pt, x_min, x_max, y_min, y_max, margin=0.15)
+            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.05):
+                ok = False
+                last_err = "point outside arena"
+                break
+            if float(np.linalg.norm(pt - start)) < float(min_end_dist):
+                ok = False
+                last_err = "too close to start"
+                break
+            if float(np.linalg.norm(pt - goal)) < float(min_end_dist):
+                ok = False
+                last_err = "too close to goal"
+                break
+            pts.append(pt)
+        if not ok:
+            continue
+        too_close = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                if float(np.linalg.norm(pts[i] - pts[j])) < float(min_pairwise):
+                    too_close = True
+                    last_err = "pairwise too close"
+                    break
+            if too_close:
+                break
+        if too_close:
+            continue
+        return pts
+    raise RuntimeError(f"sample_perp_points_on_segment: {last_err}")
 
 
 def quat_to_yaw(quat: np.ndarray) -> float:

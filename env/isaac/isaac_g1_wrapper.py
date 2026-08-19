@@ -13,6 +13,9 @@ import numpy as np
 import torch
 
 from env.isaac.waypoint_utils import (
+    DEFAULT_ARENA_BOUNDS,
+    DEFAULT_MIN_START_GOAL_DIST,
+    DEFAULT_PERP_OFFSET_M,
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     PASS_SIDE_CYCLE,
@@ -20,7 +23,10 @@ from env.isaac.waypoint_utils import (
     generate_random_waypoint_sequence,
     sample_point_in_half_disk,
     sample_point_in_region,
+    sample_perp_points_on_segment,
+    sample_start_goal_perp_path,
     waypoints_to_list,
+    quat_to_yaw,
 )
 
 # Obstacle scene keys registered on env_cfg.scene (see data_collection_obstacles.py).
@@ -32,6 +38,20 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
         "spawn_xy": (3.5, -2.0),
     },
 }
+
+_BIN_DEFAULT_Z = 0.5
+_BIN_DEFAULT_ROT = (0.5, 0.5, 0.5, 0.5)
+
+
+def _bin_spec(index: int) -> dict[str, Any]:
+    name = f"blue_bin_{index}"
+    if name in OBSTACLE_SPECS:
+        return dict(OBSTACLE_SPECS[name])
+    return {
+        "default_z": _BIN_DEFAULT_Z,
+        "rot": _BIN_DEFAULT_ROT,
+        "spawn_xy": (3.5 + 0.05 * index, -2.0),
+    }
 
 HIDDEN_OBSTACLE_POS = (100.0, 100.0, -10.0)
 DEFAULT_SENSOR_IMG_RES = (640, 480)  # portrait (height, width) before CCW rotation
@@ -162,10 +182,34 @@ class IsaacG1Wrapper:
         self.obstacle_y_range = (-2.5, -1.5)
         # Independent of y-jitter: with this prob hide the bin entirely on reset.
         self.obstacle_absent_prob = 0.0
+        self.two_obstacle_prob = 0.5
         self.obstacle_present = True
+        self.path_obstacle_layout = False
+        self.filter_lidar_to_active_obstacles = False
+        self._max_n_obstacles = max(1, int(getattr(args_cli, "max_n_obstacles", 1)))
+        self._obstacle_names = [f"blue_bin_{i}" for i in range(self._max_n_obstacles)]
+        self._obstacle_specs = {
+            name: _bin_spec(i) for i, name in enumerate(self._obstacle_names)
+        }
+        self._obstacle_xy_list: list[np.ndarray] = []
+        self._n_obstacles = 0
+        # Collect controller for the current episode: "sf" | "waypoint" | "switch".
+        self.collect_controller = "sf"
+        self.alternate_collect_controllers = False
+        self._collect_ep_toggle = 0
+        self._n_scene_resets = 0
         self.env_prim_root = env_prim_root
         self.lidar_distance_threshold = lidar_distance_threshold
+        # Half-width of the forward cone used for l / h_s (deg). Inside the
+        # cone, l is the true min range; outside, treat as no-hit (l=2).
+        # Default ±90° keeps the original aisle pipeline. Path uses ±60°.
+        self.lidar_h_half_fov_deg = float(
+            getattr(args_cli, "lidar_h_half_fov_deg", 90.0)
+        )
         self.collision_force_threshold = collision_force_threshold
+        # Path pipeline: non-foot obstacle contact folds into h_s / l. Off for aisle.
+        self.include_contact_in_hs = False
+        self.contact_hs = -1.5
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
         # If True, geometrically passing the last waypoint also completes it
@@ -176,6 +220,22 @@ class IsaacG1Wrapper:
         self.y_bound = float(getattr(args_cli, "y_bound", y_bound))
         self.y_center = float(getattr(args_cli, "y_center", y_center))
         self.x_bound_max = float(getattr(args_cli, "x_bound_max", x_bound_max))
+        # Rectangular arena (new path pipeline). Off by default so the original
+        # aisle walls (y_bound / x_bound_max) stay unchanged.
+        self.use_arena_bounds = False
+        self.arena_x_min = float(DEFAULT_ARENA_BOUNDS[0])
+        self.arena_x_max = float(DEFAULT_ARENA_BOUNDS[1])
+        self.arena_y_min = float(DEFAULT_ARENA_BOUNDS[2])
+        self.arena_y_max = float(DEFAULT_ARENA_BOUNDS[3])
+        # "regions" = original start/front/left|right. "start_goal_perp" = new path.
+        self.waypoint_layout = "regions"
+        self.perp_offset = float(DEFAULT_PERP_OFFSET_M)
+        self.min_start_goal_dist = float(DEFAULT_MIN_START_GOAL_DIST)
+        self.arena_sample_margin = 0.5
+        self._spawn_yaw: float | None = None
+        # Env-space velocity clip. Original pipeline: yaw in [-0.5, 0.5].
+        self.action_low = np.array([0.0, -0.5, -0.5], dtype=np.float32)
+        self.action_high = np.array([0.8, 0.5, 0.5], dtype=np.float32)
         # Copy defaults (start disk r=1, front disk r=0.5, left|right r=0.5, middle point).
         if trajectory_regions is not None:
             self.trajectory_regions = trajectory_regions
@@ -257,7 +317,6 @@ class IsaacG1Wrapper:
         self._Sdf = Sdf
         self._omni_usd = omni.usd
 
-        self._obstacle_names = list(OBSTACLE_SPECS.keys())
         self._depth_cam_names: list[str] = []
 
         # depth_rgb: lab meshes needed for RayCasterCamera.
@@ -278,6 +337,12 @@ class IsaacG1Wrapper:
                 include_lab_scene=False,
             )
         self._lidar_sensor_names = [f"lidar_{i}" for i in range(len(self._lidar_mesh_paths))]
+        self._obstacle_lidar_names: dict[str, str] = {}
+        for i, mesh_path in enumerate(self._lidar_mesh_paths):
+            path_s = str(mesh_path).rstrip("/")
+            for obs_name in self._obstacle_names:
+                if path_s.endswith("/" + obs_name) or path_s.endswith(obs_name):
+                    self._obstacle_lidar_names[obs_name] = self._lidar_sensor_names[i]
 
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(self.TASK, args_cli)
         checkpoint = get_published_pretrained_checkpoint(self.RL_LIBRARY, self.TASK)
@@ -291,12 +356,19 @@ class IsaacG1Wrapper:
         env_cfg.sim.render_interval = 1
         env_cfg.terminations.base_contact = None
 
+        use_path_spawn = bool(getattr(args_cli, "path_obstacle_layout", False)) or (
+            str(getattr(args_cli, "waypoint_layout", "regions")) == "start_goal_perp"
+        )
         for i, name in enumerate(self._obstacle_names):
-            if name == "blue_bin_0":
-                xy = self._blue_bin_xy  # CLI bin_x/bin_y override
+            spec = self._obstacle_specs[name]
+            # Path layout teleports bins every reset onto the start–goal
+            # perpendicular. Do not spawn bin_0 at the old aisle (3.5,-2).
+            if i == 0 and not use_path_spawn:
+                xy = spec["spawn_xy"]
+                z = spec["default_z"]
             else:
-                xy = OBSTACLE_SPECS[name]["spawn_xy"]
-            z = OBSTACLE_SPECS[name]["default_z"]
+                xy = (HIDDEN_OBSTACLE_POS[0], HIDDEN_OBSTACLE_POS[1])
+                z = HIDDEN_OBSTACLE_POS[2]
             add_blue_bin(env_cfg, pos=(float(xy[0]), float(xy[1]), float(z)), index=i)
 
         env_cfg.scene.robot_contact = ContactSensorCfg(
@@ -328,6 +400,7 @@ class IsaacG1Wrapper:
                 setattr(env_cfg.scene, name, dc_cfg)
                 self._depth_cam_names.append(name)
 
+        lidar_half = float(np.clip(self.lidar_h_half_fov_deg, 0.0, 180.0))
         lidar_common = dict(
             prim_path="{ENV_REGEX_NS}/Robot/head_link",
             update_period=self.lidar_period_s,
@@ -336,12 +409,16 @@ class IsaacG1Wrapper:
             pattern_cfg=patterns.LidarPatternCfg(
                 channels=45,
                 vertical_fov_range=(-90, 90),
-                # Front hemisphere only — rear rays off so passed obstacles
-                # do not keep pulling l negative against a forward camera.
-                horizontal_fov_range=(-90, 90),
+                # Forward cone only — rays outside this FOV must not pull l
+                # (camera cannot see the full front hemisphere).
+                horizontal_fov_range=(-lidar_half, lidar_half),
                 horizontal_res=2.0,
             ),
             debug_vis=False,
+        )
+        print(
+            f"[IsaacG1Wrapper] l/h_s LiDAR cone ±{lidar_half:g}° "
+            f"(outside cone → no-hit, l=2)"
         )
         for i, mesh_path in enumerate(self._lidar_mesh_paths):
             sensor_name = self._lidar_sensor_names[i]
@@ -413,6 +490,10 @@ class IsaacG1Wrapper:
         }
 
         self._rng = np.random.default_rng()
+        print(
+            "[IsaacG1Wrapper] layout RNG is independent of train --seed "
+            "(waypoints/obstacles differ across bash runs unless --layout_seed is set)."
+        )
 
     def _setup_contact_indices(self) -> None:
         sensor = self.env.unwrapped.scene["robot_contact"]
@@ -420,6 +501,13 @@ class IsaacG1Wrapper:
         self._collision_link_indices = [
             i for i, name in enumerate(link_names) if name not in self._ignored_collision_links
         ]
+        ignored = [n for n in link_names if n in self._ignored_collision_links]
+        monitored = [link_names[i] for i in self._collision_link_indices]
+        print(
+            "[IsaacG1Wrapper] contact: ignore foot soles "
+            f"{ignored}; monitor {len(monitored)} links "
+            f"(thr={self.collision_force_threshold:g} N)"
+        )
 
     def _load_scene_usd(self) -> None:
         from lab_scene_utils import load_lab_scene_usd
@@ -434,13 +522,91 @@ class IsaacG1Wrapper:
         )
 
     def _set_obstacle_pose(self, name: str, pos: tuple[float, float, float]) -> None:
-        rot = OBSTACLE_SPECS[name]["rot"]
+        spec = self._obstacle_specs.get(name) or _bin_spec(0)
+        rot = spec["rot"]
         obj = self.env.unwrapped.scene[name]
         obj.write_root_pose_to_sim(self._pose_tensor(pos, rot))
         if hasattr(obj, "write_root_velocity_to_sim"):
             obj.write_root_velocity_to_sim(
                 torch.zeros(1, 6, device=self.device, dtype=torch.float32)
             )
+
+    def _bin_z(self, name: str) -> float:
+        spec = self._obstacle_specs.get(name) or _bin_spec(0)
+        return float(spec["default_z"])
+
+    def _hide_obstacle(self, name: str) -> tuple[float, float, float]:
+        pos = HIDDEN_OBSTACLE_POS
+        self._set_obstacle_pose(name, pos)
+        return pos
+
+    def _choose_n_path_obstacles(self, rng: np.random.Generator) -> int:
+        absent_p = float(self.obstacle_absent_prob)
+        if absent_p > 0.0 and float(rng.random()) < absent_p:
+            return 0
+        max_n = min(2, int(self._max_n_obstacles))
+        if max_n <= 1:
+            return 1
+        if float(rng.random()) < float(self.two_obstacle_prob):
+            return 2
+        return 1
+
+    def _place_path_obstacles(
+        self,
+        rng: np.random.Generator,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+        *,
+        n_obstacles: int | None = None,
+        positions: list[np.ndarray] | None = None,
+    ) -> dict[str, tuple[float, float, float]]:
+        """Place 0/1/2 bins on the start-goal perpendicular. Hide unused assets."""
+        if positions is not None:
+            xys = [np.asarray(p, dtype=np.float64).reshape(2) for p in positions]
+            n = len(xys)
+        else:
+            n = int(self._choose_n_path_obstacles(rng) if n_obstacles is None else n_obstacles)
+            n = max(0, min(n, int(self._max_n_obstacles)))
+            xys = sample_perp_points_on_segment(
+                rng,
+                start_xy,
+                goal_xy,
+                n,
+                perp_offset=float(self.perp_offset),
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+            ) if n > 0 else []
+        self._n_obstacles = len(xys)
+        self.obstacle_present = self._n_obstacles > 0
+        self._obstacle_xy_list = [p.copy() for p in xys]
+        self._active_obstacles = list(self._obstacle_names[: self._n_obstacles])
+        obstacle_positions: dict[str, tuple[float, float, float]] = {}
+        for i, name in enumerate(self._obstacle_names):
+            z = self._bin_z(name)
+            if i < self._n_obstacles:
+                xy = xys[i]
+                pos = (float(xy[0]), float(xy[1]), z)
+                self._set_obstacle_pose(name, pos)
+            else:
+                pos = self._hide_obstacle(name)
+            obstacle_positions[name] = pos
+        if self._n_obstacles > 0:
+            self._blue_bin_xy = (float(xys[0][0]), float(xys[0][1]))
+        return obstacle_positions
+
+    def _advance_collect_controller(self) -> None:
+        """Alternate waypoint / switch on training resets (skip constructor reset)."""
+        if not bool(getattr(self, "alternate_collect_controllers", False)):
+            return
+        if int(self._n_scene_resets) == 0:
+            return
+        if int(self._collect_ep_toggle) % 2 == 0:
+            self.collect_controller = "waypoint"
+        else:
+            self.collect_controller = "switch"
+        self._collect_ep_toggle = int(self._collect_ep_toggle) + 1
 
     def _sample_waypoint_sequence(self, rng: np.random.Generator) -> tuple[np.ndarray, list[str]]:
         """Sample waypoint sequence from ``trajectory_region_sequence``.
@@ -451,7 +617,22 @@ class IsaacG1Wrapper:
           (switch-collect also appends behind-bin ``back``).
         - ``spawn_hemisphere_pass=True`` (formal train only): alternate spawn
           half-disk coupled to matching left/right (no front/middle).
+        - ``waypoint_layout="start_goal_perp"``: start + 2 perp vias + goal.
         """
+        self._spawn_yaw = None
+        if str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp":
+            wps, names, spawn_yaw = sample_start_goal_perp_path(
+                rng,
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+                perp_offset=float(self.perp_offset),
+                min_start_goal_dist=float(self.min_start_goal_dist),
+                margin=float(self.arena_sample_margin),
+            )
+            self._spawn_yaw = float(spawn_yaw)
+            return wps, names
         if bool(getattr(self, "spawn_hemisphere_pass", False)):
             return self._sample_hemisphere_coupled_sequence(rng)
 
@@ -638,48 +819,81 @@ class IsaacG1Wrapper:
         multi-mode eval so SF / waypoint / switching see the same scene.
         """
         if seed is not None:
-            self._rng = np.random.default_rng(seed)
+            # Path layout: do not reseed from yaml train seed=0, or every
+            # bash run repeats the same buffer trajectories.
+            use_path = bool(getattr(self, "path_obstacle_layout", False)) or (
+                str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp"
+            )
+            if not use_path:
+                self._rng = np.random.default_rng(seed)
+
+        self._advance_collect_controller()
+        self._n_scene_resets = int(self._n_scene_resets) + 1
 
         obs, _ = self.env.reset()
 
+        use_path_obs = bool(getattr(self, "path_obstacle_layout", False)) or (
+            str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp"
+        )
+
         if fixed_layout is not None:
-            bin_xy = fixed_layout.get("blue_bin_xy", fixed_layout.get("bin_xy"))
-            if bin_xy is None:
-                raise ValueError("fixed_layout requires blue_bin_xy")
-            self._blue_bin_xy = (float(bin_xy[0]), float(bin_xy[1]))
-            self.obstacle_present = bool(fixed_layout.get("obstacle_present", True))
             self.waypoints = np.asarray(fixed_layout["waypoints"], dtype=np.float64).copy()
             self.waypoint_region_names = list(
                 fixed_layout.get("waypoint_region_names", [])
             )
-        else:
-            bin_x = float(self._blue_bin_xy_fixed[0])
-            if self.randomize_obstacle:
-                y0, y1 = self.obstacle_y_range
-                bin_y = float(self._rng.uniform(float(y0), float(y1)))
+            if "spawn_yaw" in fixed_layout:
+                self._spawn_yaw = float(fixed_layout["spawn_yaw"])
+            if use_path_obs:
+                raw_xy = fixed_layout.get("obstacle_xys")
+                if raw_xy is None:
+                    pos_map = fixed_layout.get("obstacle_positions") or {}
+                    raw_xy = [
+                        np.array([float(v[0]), float(v[1])], dtype=np.float64)
+                        for _, v in sorted(pos_map.items())
+                        if abs(float(v[0]) - HIDDEN_OBSTACLE_POS[0]) > 10.0
+                    ]
+                n_obs = int(fixed_layout.get("n_obstacles", len(raw_xy)))
+                self.obstacle_present = bool(fixed_layout.get("obstacle_present", n_obs > 0))
             else:
-                bin_y = float(self._blue_bin_xy_fixed[1])
-            self._blue_bin_xy = (bin_x, bin_y)
-
-            absent_p = float(self.obstacle_absent_prob)
-            self.obstacle_present = bool(
-                absent_p <= 0.0 or self._rng.random() >= absent_p
-            )
-
+                bin_xy = fixed_layout.get("blue_bin_xy", fixed_layout.get("bin_xy"))
+                if bin_xy is None:
+                    raise ValueError("fixed_layout requires blue_bin_xy")
+                self._blue_bin_xy = (float(bin_xy[0]), float(bin_xy[1]))
+                self.obstacle_present = bool(fixed_layout.get("obstacle_present", True))
+        else:
             self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(
                 self._rng
             )
+            if not use_path_obs:
+                bin_x = float(self._blue_bin_xy_fixed[0])
+                if self.randomize_obstacle:
+                    y0, y1 = self.obstacle_y_range
+                    bin_y = float(self._rng.uniform(float(y0), float(y1)))
+                else:
+                    bin_y = float(self._blue_bin_xy_fixed[1])
+                self._blue_bin_xy = (bin_x, bin_y)
+                absent_p = float(self.obstacle_absent_prob)
+                self.obstacle_present = bool(
+                    absent_p <= 0.0 or self._rng.random() >= absent_p
+                )
 
         waypoint_list = waypoints_to_list(self.waypoints)
         self.current_waypoint_idx = 0
         self.waypoint = waypoint_list[0].copy()
         start_xy = waypoint_list[0]
+        goal_xy = waypoint_list[-1]
 
         robot = self.env.unwrapped.scene["robot"]
         robot_xy = start_xy.copy()
+        spawn_yaw = getattr(self, "_spawn_yaw", None)
+        if spawn_yaw is None:
+            spawn_quat = (1.0, 0.0, 0.0, 0.0)
+        else:
+            half = 0.5 * float(spawn_yaw)
+            spawn_quat = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
         root_pose = self._pose_tensor(
             (float(robot_xy[0]), float(robot_xy[1]), 0.8),
-            (1.0, 0.0, 0.0, 0.0),
+            spawn_quat,
         )
         robot.write_root_pose_to_sim(root_pose)
         if hasattr(robot, "write_root_velocity_to_sim"):
@@ -689,25 +903,46 @@ class IsaacG1Wrapper:
         self._reset_stuck_counters()
 
         obstacle_positions: dict[str, tuple[float, float, float]] = {}
-        if self.obstacle_present:
+        if use_path_obs:
+            extra_xy = None
+            extra_n = None
+            if fixed_layout is not None:
+                extra_xy = [
+                    np.asarray(p, dtype=np.float64).reshape(2)
+                    for p in (fixed_layout.get("obstacle_xys") or [])
+                ]
+                extra_n = int(fixed_layout.get("n_obstacles", len(extra_xy)))
+                if extra_n == 0:
+                    extra_xy = []
+            obstacle_positions = self._place_path_obstacles(
+                self._rng,
+                start_xy,
+                goal_xy,
+                n_obstacles=extra_n,
+                positions=extra_xy,
+            )
+        elif self.obstacle_present:
             self._active_obstacles = list(self._obstacle_names)
+            self._n_obstacles = len(self._active_obstacles)
             for name in self._obstacle_names:
+                spec = self._obstacle_specs[name]
                 if name == "blue_bin_0":
                     x, y = self._blue_bin_xy
                 else:
-                    x, y = OBSTACLE_SPECS[name]["spawn_xy"]
-                z = OBSTACLE_SPECS[name]["default_z"]
+                    x, y = spec["spawn_xy"]
+                z = float(spec["default_z"])
                 self._set_obstacle_pose(name, (x, y, z))
                 obstacle_positions[name] = (x, y, z)
         else:
             # Robot faces +x; park bin ~2.5m behind spawn (same y) — out of front view.
             self._active_obstacles = []
+            self._n_obstacles = 0
             behind_xy = (
                 float(robot_xy[0]) - 2.5,
                 float(robot_xy[1]),
             )
             for name in self._obstacle_names:
-                z = OBSTACLE_SPECS[name]["default_z"]
+                z = self._bin_z(name)
                 pos = (behind_xy[0], behind_xy[1], z)
                 self._set_obstacle_pose(name, pos)
                 obstacle_positions[name] = pos
@@ -729,21 +964,122 @@ class IsaacG1Wrapper:
             self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands
             obs, _, _, _ = self.env.step(zero_actions)
 
+        # Warp LiDAR meshes are static at spawn. Rebake after bins have been
+        # teleported and PhysX/USD have been stepped, otherwise dual-bin l
+        # reports range to the old mesh (often the farther bin).
+        self._refresh_lidar_warp_meshes()
         self._last_policy_obs = obs
         self._update_lidar_stats()
 
         return {
             "active_obstacles": list(self._active_obstacles),
             "obstacle_present": bool(self.obstacle_present),
+            "n_obstacles": int(getattr(self, "_n_obstacles", len(self._active_obstacles))),
             "robot_xy": robot_xy,
             "blue_bin_xy": (float(self._blue_bin_xy[0]), float(self._blue_bin_xy[1])),
+            "obstacle_xys": [
+                (float(p[0]), float(p[1]))
+                for p in getattr(self, "_obstacle_xy_list", [])
+            ],
             "obstacle_positions": obstacle_positions,
+            "collect_controller": str(getattr(self, "collect_controller", "sf")),
             "waypoint": self.waypoint.copy(),
             "waypoints": self.waypoints.copy(),
             "waypoint_region_names": list(self.waypoint_region_names),
             "current_waypoint_idx": self.current_waypoint_idx,
             **self._last_lidar_stats,
         }
+
+    def _rebake_raycaster_warp_mesh(self, lidar) -> None:
+        """Rebuild Warp mesh at the obstacle's *current* world pose.
+
+        Isaac Lab RayCaster only supports static meshes: vertices are baked in
+        world frame at sensor init. Moving a rigid bin with write_root_pose
+        does not move the raycast mesh, so dual-bin path layout would report
+        range to the spawn/ghost mesh (often the other bin) instead of the
+        closest visual bin.
+        """
+        import isaaclab.sim as sim_utils
+        import omni.usd
+        from isaaclab.utils.warp import convert_to_warp_mesh
+        from pxr import UsdGeom
+
+        mesh_prim_path = lidar.cfg.mesh_prim_paths[0]
+        mesh_prim = sim_utils.get_first_matching_child_prim(
+            mesh_prim_path, lambda prim: prim.GetTypeName() == "Mesh"
+        )
+        if mesh_prim is None or not mesh_prim.IsValid():
+            print(f"[WARN] lidar rebake: no Mesh under {mesh_prim_path}")
+            return
+        mesh_prim = UsdGeom.Mesh(mesh_prim)
+        points = np.asarray(mesh_prim.GetPointsAttr().Get())
+        transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh_prim)).T
+        points = np.matmul(points, transform_matrix[:3, :3].T)
+        points += transform_matrix[:3, 3]
+        indices = np.asarray(mesh_prim.GetFaceVertexIndicesAttr().Get())
+        lidar.meshes[mesh_prim_path] = convert_to_warp_mesh(
+            points, indices, device=self.device
+        )
+
+    def _refresh_lidar_warp_meshes(self) -> None:
+        scene = self.env.unwrapped.scene
+        n = 0
+        # InteractiveScene has no __contains__; `name not in scene` probes
+        # scene[0] and crashes with KeyError('0').
+        for name in list(getattr(self, "_lidar_sensor_names", []) or []):
+            try:
+                lidar = scene[str(name)]
+            except KeyError:
+                continue
+            try:
+                self._rebake_raycaster_warp_mesh(lidar)
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"[WARN] lidar rebake failed for {name}: {exc}")
+        if n and int(getattr(self, "_n_scene_resets", 0)) <= 2:
+            print(
+                f"[IsaacG1Wrapper] rebaked {n} RayCaster warp mesh(es) "
+                "to follow moved bins (static LiDAR meshes)."
+            )
+
+    def _forward_cone_cos_min(self) -> float:
+        half_deg = float(np.clip(getattr(self, "lidar_h_half_fov_deg", 90.0), 0.0, 180.0))
+        return float(np.cos(np.deg2rad(half_deg)))
+
+    def _xy_in_forward_cone(
+        self, dx: np.ndarray | float, dy: np.ndarray | float, c: float, s: float
+    ) -> np.ndarray:
+        """True where (dx, dy) lies in the heading-aligned LiDAR cone."""
+        dx_a = np.asarray(dx, dtype=np.float64)
+        dy_a = np.asarray(dy, dtype=np.float64)
+        # Missed rays are inf; inf*c + inf*s is NaN when yaw cos/sin have
+        # opposite signs. Treat non-finite hits as outside the cone.
+        finite = np.isfinite(dx_a) & np.isfinite(dy_a)
+        dx_s = np.where(finite, dx_a, 0.0)
+        dy_s = np.where(finite, dy_a, 0.0)
+        d = np.hypot(dx_s, dy_s)
+        fwd = dx_s * c + dy_s * s
+        return finite & (d > 1e-8) & (fwd >= d * self._forward_cone_cos_min() - 1e-6)
+
+    def _front_obstacle_xy_min(self) -> float:
+        """Min XY range to active bins inside the forward LiDAR cone."""
+        xys = getattr(self, "_obstacle_xy_list", None) or []
+        if not xys:
+            return float("nan")
+        robot_xy = self.get_robot_xy_local()
+        _, quat = self.get_robot_base_pose()
+        yaw = quat_to_yaw(np.asarray(quat, dtype=np.float64).reshape(-1))
+        c, s = float(np.cos(yaw)), float(np.sin(yaw))
+        best = float("inf")
+        for p in xys:
+            dx = float(p[0]) - float(robot_xy[0])
+            dy = float(p[1]) - float(robot_xy[1])
+            if not bool(self._xy_in_forward_cone(dx, dy, c, s)):
+                continue
+            d = float(np.hypot(dx, dy))
+            if d < best:
+                best = d
+        return best if np.isfinite(best) else float("nan")
 
     def get_lidar_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
         # Despawned obstacle: ignore mesh hits entirely so l is not polluted.
@@ -757,12 +1093,34 @@ class IsaacG1Wrapper:
             return empty, empty_r, empty_r, stats
 
         scene = self.env.unwrapped.scene
-        lidars = [scene[name] for name in self._lidar_sensor_names]
+        sensor_names = list(self._lidar_sensor_names)
+        if bool(getattr(self, "filter_lidar_to_active_obstacles", False)):
+            mapped = [
+                self._obstacle_lidar_names[name]
+                for name in self._active_obstacles
+                if name in getattr(self, "_obstacle_lidar_names", {})
+            ]
+            if not mapped:
+                stats = {
+                    "lidar_min_distance": float("nan"),
+                    "lidar_min_distance_xy": float("nan"),
+                }
+                empty = np.zeros((0, 3), dtype=np.float64)
+                empty_r = np.zeros((0,), dtype=np.float64)
+                return empty, empty_r, empty_r, stats
+            sensor_names = mapped
+        lidars = [scene[name] for name in sensor_names]
         hits_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
         origin = lidars[0].data.pos_w[0].detach().cpu().numpy()
         max_d = float(getattr(lidars[0].cfg, "max_distance", 1e6))
         diff_w, ranges, ranges_xy = merge_ray_hits_multi(origin, hits_list, max_d)
         valid_ray = np.isfinite(diff_w).all(axis=1) & (ranges > 1e-4) & (ranges < max_d * 0.999)
+        _, quat = self.get_robot_base_pose()
+        yaw = quat_to_yaw(np.asarray(quat, dtype=np.float64).reshape(-1))
+        c, s = float(np.cos(yaw)), float(np.sin(yaw))
+        valid_ray = valid_ray & self._xy_in_forward_cone(
+            diff_w[:, 0], diff_w[:, 1], c, s
+        )
         positive_ranges = ranges[valid_ray]
         positive_ranges_xy = ranges_xy[valid_ray]
         lidar_min_m = (
@@ -771,10 +1129,21 @@ class IsaacG1Wrapper:
         lidar_min_xy_m = (
             float(np.min(positive_ranges_xy)) if positive_ranges_xy.size > 0 else float("nan")
         )
+        geom_xy = self._front_obstacle_xy_min()
+        if np.isfinite(geom_xy):
+            lidar_min_m = (
+                geom_xy if not np.isfinite(lidar_min_m) else min(lidar_min_m, geom_xy)
+            )
+            lidar_min_xy_m = (
+                geom_xy
+                if not np.isfinite(lidar_min_xy_m)
+                else min(lidar_min_xy_m, geom_xy)
+            )
 
         stats = {
             "lidar_min_distance": lidar_min_m,
             "lidar_min_distance_xy": lidar_min_xy_m,
+            "lidar_geom_xy": float(geom_xy) if np.isfinite(geom_xy) else float("nan"),
         }
         return diff_w, ranges, ranges_xy, stats
 
@@ -798,8 +1167,11 @@ class IsaacG1Wrapper:
 
         ``h_s`` is the continuous PyHJ avoid cost:
         ``lidar_min_distance - lidar_distance_threshold`` (<0 unsafe, >0 safe).
-        If no valid forward-LiDAR hit (front 180° empty), set ``h_s = 2.0``.
-        Contact is logged but does not enter ``h_s``.
+        If no valid hit in the forward cone (``lidar_h_half_fov_deg``),
+        set ``h_s = 2.0``.
+        If ``include_contact_in_hs`` and a non-foot link hits (force above
+        threshold), ``h_s = min(h_s, contact_hs)`` so contact is a failure
+        label. Foot soles ``left/right_ankle_roll_link`` are ignored.
         """
         self._update_lidar_stats()
         contact = self.get_contact_collision()
@@ -811,8 +1183,10 @@ class IsaacG1Wrapper:
         if np.isfinite(lidar_dist):
             h_s = float(lidar_dist - self.lidar_distance_threshold)
         else:
-            # Front 180° clear / no hit: fixed safe margin for HJ (not NaN).
+            # Forward cone clear / no hit: fixed safe margin for HJ (not NaN).
             h_s = 2.0
+        if bool(getattr(self, "include_contact_in_hs", False)) and float(contact) > 0.5:
+            h_s = min(h_s, float(self.contact_hs))
         return {
             "lidar_min_distance": float(lidar_dist),
             "lidar_min_distance_xy": float(lidar_xy),
@@ -917,8 +1291,21 @@ class IsaacG1Wrapper:
         xy = self.get_robot_xy_local()
         return bool(float(xy[0]) >= self.x_bound_max)
 
+    def is_out_of_arena(self) -> bool:
+        """True if XY is on/outside the closed rectangle [x_min,x_max]×[y_min,y_max]."""
+        xy = self.get_robot_xy_local()
+        x, y = float(xy[0]), float(xy[1])
+        return bool(
+            x <= float(self.arena_x_min)
+            or x >= float(self.arena_x_max)
+            or y <= float(self.arena_y_min)
+            or y >= float(self.arena_y_max)
+        )
+
     def is_out_of_bounds(self) -> bool:
-        """Soft bounds: optional |y| corridor and/or x >= x_bound_max."""
+        """Soft bounds: arena rectangle, or original |y| corridor / x far wall."""
+        if bool(getattr(self, "use_arena_bounds", False)):
+            return self.is_out_of_arena()
         return self.is_out_of_y_bounds() or self.is_out_of_x_bounds()
 
     def get_full_state(self) -> np.ndarray:
@@ -941,10 +1328,13 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        # HJ / env action: vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw_rate in [-0.5, 0.5]
-        vx = float(np.clip(action[0], 0.0, 0.8))
-        vy = float(np.clip(action[1], -0.5, 0.5))
-        yaw_rate = float(np.clip(action[2], -0.5, 0.5))
+        # HJ / env action: default vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw in [-0.5, 0.5].
+        # Path pipeline may widen yaw via action_low/action_high.
+        low = np.asarray(self.action_low, dtype=np.float32).reshape(-1)
+        high = np.asarray(self.action_high, dtype=np.float32).reshape(-1)
+        vx = float(np.clip(action[0], float(low[0]), float(high[0])))
+        vy = float(np.clip(action[1], float(low[1]), float(high[1])))
+        yaw_rate = float(np.clip(action[2], float(low[2]), float(high[2])))
 
         self.commands[0, 0] = vx
         self.commands[0, 1] = vy
