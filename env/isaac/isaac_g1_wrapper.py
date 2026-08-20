@@ -14,12 +14,14 @@ import torch
 
 from env.isaac.waypoint_utils import (
     DEFAULT_ARENA_BOUNDS,
+    DEFAULT_DANGER_RADIUS_M,
     DEFAULT_MIN_START_GOAL_DIST,
     DEFAULT_PERP_OFFSET_M,
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     PASS_SIDE_CYCLE,
     PASS_SIDE_TRAIN,
+    compute_perp_sidestep_xy,
     generate_random_waypoint_sequence,
     sample_point_in_half_disk,
     sample_point_in_region,
@@ -210,6 +212,10 @@ class IsaacG1Wrapper:
         # Path pipeline: non-foot obstacle contact folds into h_s / l. Off for aisle.
         self.include_contact_in_hs = False
         self.contact_hs = -1.5
+        # Hold a_good sidestep target this many HJ steps after first HJ<0.
+        self.sidestep_hold_steps = 20
+        self._sidestep_xy: np.ndarray | None = None
+        self._sidestep_hold = 0
         self.stuck_contact_steps = int(stuck_contact_steps)
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
         # If True, geometrically passing the last waypoint also completes it
@@ -829,6 +835,8 @@ class IsaacG1Wrapper:
 
         self._advance_collect_controller()
         self._n_scene_resets = int(self._n_scene_resets) + 1
+        self._sidestep_xy = None
+        self._sidestep_hold = 0
 
         obs, _ = self.env.reset()
 
@@ -878,29 +886,8 @@ class IsaacG1Wrapper:
                 )
 
         waypoint_list = waypoints_to_list(self.waypoints)
-        self.current_waypoint_idx = 0
-        self.waypoint = waypoint_list[0].copy()
         start_xy = waypoint_list[0]
         goal_xy = waypoint_list[-1]
-
-        robot = self.env.unwrapped.scene["robot"]
-        robot_xy = start_xy.copy()
-        spawn_yaw = getattr(self, "_spawn_yaw", None)
-        if spawn_yaw is None:
-            spawn_quat = (1.0, 0.0, 0.0, 0.0)
-        else:
-            half = 0.5 * float(spawn_yaw)
-            spawn_quat = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
-        root_pose = self._pose_tensor(
-            (float(robot_xy[0]), float(robot_xy[1]), 0.8),
-            spawn_quat,
-        )
-        robot.write_root_pose_to_sim(root_pose)
-        if hasattr(robot, "write_root_velocity_to_sim"):
-            robot.write_root_velocity_to_sim(
-                torch.zeros(1, 6, device=self.device, dtype=torch.float32)
-            )
-        self._reset_stuck_counters()
 
         obstacle_positions: dict[str, tuple[float, float, float]] = {}
         if use_path_obs:
@@ -934,18 +921,39 @@ class IsaacG1Wrapper:
                 self._set_obstacle_pose(name, (x, y, z))
                 obstacle_positions[name] = (x, y, z)
         else:
-            # Robot faces +x; park bin ~2.5m behind spawn (same y) — out of front view.
             self._active_obstacles = []
             self._n_obstacles = 0
             behind_xy = (
-                float(robot_xy[0]) - 2.5,
-                float(robot_xy[1]),
+                float(start_xy[0]) - 2.5,
+                float(start_xy[1]),
             )
             for name in self._obstacle_names:
                 z = self._bin_z(name)
                 pos = (behind_xy[0], behind_xy[1], z)
                 self._set_obstacle_pose(name, pos)
                 obstacle_positions[name] = pos
+
+        waypoint_list = waypoints_to_list(self.waypoints)
+        self.current_waypoint_idx = 0
+        self.waypoint = waypoint_list[0].copy()
+        robot_xy = waypoint_list[0].copy()
+        robot = self.env.unwrapped.scene["robot"]
+        spawn_yaw = getattr(self, "_spawn_yaw", None)
+        if spawn_yaw is None:
+            spawn_quat = (1.0, 0.0, 0.0, 0.0)
+        else:
+            half = 0.5 * float(spawn_yaw)
+            spawn_quat = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
+        root_pose = self._pose_tensor(
+            (float(robot_xy[0]), float(robot_xy[1]), 0.8),
+            spawn_quat,
+        )
+        robot.write_root_pose_to_sim(root_pose)
+        if hasattr(robot, "write_root_velocity_to_sim"):
+            robot.write_root_velocity_to_sim(
+                torch.zeros(1, 6, device=self.device, dtype=torch.float32)
+            )
+        self._reset_stuck_counters()
 
         self.commands.zero_()
 
@@ -1278,6 +1286,54 @@ class IsaacG1Wrapper:
             [float(base_pos[0] - origin[0]), float(base_pos[1] - origin[1])],
             dtype=np.float64,
         )
+
+    def perp_sidestep_xy(self) -> np.ndarray | None:
+        """Fresh G: right triangle robot–nearest-bin–G, right angle at bin."""
+        xys = list(getattr(self, "_obstacle_xy_list", []) or [])
+        if not xys:
+            return None
+        robot_xy = self.get_robot_xy_local()
+        _, quat = self.get_robot_base_pose()
+        yaw = quat_to_yaw(np.asarray(quat, dtype=np.float64).reshape(-1))
+        kwargs = {
+            "radius": float(
+                getattr(self, "lidar_distance_threshold", DEFAULT_DANGER_RADIUS_M)
+            ),
+            "heading": yaw,
+        }
+        if bool(getattr(self, "use_arena_bounds", False)):
+            kwargs.update(
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+            )
+        return compute_perp_sidestep_xy(robot_xy, xys, **kwargs)
+
+    def update_sidestep_cache(self, use_sf: bool) -> bool:
+        """Hold G for ``sidestep_hold_steps`` consecutive HJ<0 steps.
+
+        First HJ<0 computes G. Recompute only after that many steps if still
+        HJ<0. Leaving HJ<0 clears the cache. Returns True if G was (re)computed.
+        """
+        if not use_sf:
+            self._sidestep_xy = None
+            self._sidestep_hold = 0
+            return False
+        hold_n = max(1, int(getattr(self, "sidestep_hold_steps", 20)))
+        refreshed = False
+        if self._sidestep_xy is None or int(self._sidestep_hold) >= hold_n:
+            self._sidestep_xy = self.perp_sidestep_xy()
+            self._sidestep_hold = 0
+            refreshed = True
+        self._sidestep_hold = int(self._sidestep_hold) + 1
+        return refreshed
+
+    def cached_sidestep_xy(self) -> np.ndarray | None:
+        xy = getattr(self, "_sidestep_xy", None)
+        if xy is None:
+            return None
+        return np.asarray(xy, dtype=np.float64).reshape(2)
 
     def is_out_of_y_bounds(self) -> bool:
         """True if |y - y_center| exceeds soft corridor. Disabled when y_bound <= 0."""

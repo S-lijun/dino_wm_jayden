@@ -3,21 +3,22 @@
 # scripts/run_train_HJ_humanoid_sac.sh).
 #
 # Each episode: start + 2 perpendicular transition waypoints + goal.
-# Arena rectangle x in [-2, 5], y in [-4, 2]; edge hit resets and is not
+# Arena rectangle x in [-1, 6], y in [-4, 2]; edge hit resets and is not
 # stored for updates. h_s = d_min - 1.5, plus non-foot obstacle contact
 # (left/right ankle_roll soles ignored) caps l at contact_hs=-1.5.
 # l uses a ±60° (120°) forward cone so labels match camera-visible
 # obstacles; outside the cone l=2.0. Episode cap 20000 sim steps ≈ 100s
 # (aisle default was 8000 ≈ 40s).
 # Obstacles: 10% none; else 50/50 one vs two bins, placed ±2.5 m off the
-# start-goal line. Dual RayCasters → min range is l.
+# start-goal line independently of vias (vias may land in a bin's 1.5 m
+# danger disk). Dual RayCasters → min range is l.
 # Formal collect alternates waypoint-only and Q-gate switch per episode.
-# λ_nom defaults to 0 (no action regularization). Switch episodes save a
+# λ_good=0.5 only when switch AND HJ<0; waypoint_good held 20 steps then refresh.
 # 2D top-down traj PNG (obstacles + dashed r=1.5 failure-set circles).
 #
 # Usage:
 #   bash scripts/run_train_HJ_humanoid_sac_path.sh
-#   bash scripts/run_train_HJ_humanoid_sac_path.sh --action_reg_coef 0.1
+#   bash scripts/run_train_HJ_humanoid_sac_path.sh --action_reg_coef 0.5
 #   bash scripts/run_train_HJ_humanoid_sac_path.sh --freeze_yaw
 #   bash scripts/run_train_HJ_humanoid_sac_path.sh \
 #     --resume_policy runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
@@ -51,11 +52,11 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] SAC path train -> runs/sac_hj_humanoid_path/"
-echo "[INFO] layout: start + 2 perp vias (±2.5m) + goal; arena x[-2,5] y[-4,2]"
-echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±2.5m"
+echo "[INFO] layout: start + 2 perp vias (±2.5m) + goal; arena x[-1,6] y[-4,2]"
+echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±2.5m (independent of vias)"
 echo "[INFO] collect: alternate waypoint / Q-gate switch each episode"
 echo "[INFO] buffer warmup 4000 waypoint steps then 4000 critic updates; buffer-size unchanged"
-echo "[INFO] λ_nom=0 (no action regularization); switch-ep 2D traj PNGs on"
+echo "[INFO] λ_good=0.5 on switch+HJ<0; a_good held 20 steps then refresh"
 echo "[INFO] l/h_s: lidar d_min-1.5 in ±60° (120°) cone; outside cone l=2; non-foot contact (ignore ankle_roll soles)"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
@@ -72,12 +73,13 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --buffer_warmup_steps 4000 \
   --critic_warmup_updates 4000 \
   --actor_bc_warmup_updates 0 \
-  --action_reg_coef 0.0 \
+  --action_reg_coef 0.5 \
+  --a_good_hold_steps 20 \
   --boundary_reg_coef 0.0 \
   --y_bound 0 \
   --use_arena_bounds \
-  --arena_x_min -2 \
-  --arena_x_max 5 \
+  --arena_x_min -1 \
+  --arena_x_max 6 \
   --arena_y_min -4 \
   --arena_y_max 2 \
   --skip_arena_oob_from_buffer \

@@ -386,6 +386,14 @@ class LatentHumanoidEnv(gym.Env):
         self.wrapper.contact_hs = float(value)
 
     @property
+    def sidestep_hold_steps(self) -> int:
+        return int(getattr(self.wrapper, "sidestep_hold_steps", 20))
+
+    @sidestep_hold_steps.setter
+    def sidestep_hold_steps(self, value: int) -> None:
+        self.wrapper.sidestep_hold_steps = max(1, int(value))
+
+    @property
     def perp_offset(self) -> float:
         return float(self.wrapper.perp_offset)
 
@@ -519,6 +527,8 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.include_contact_in_hs = True
         if getattr(args, "contact_hs", None) is not None:
             self.wrapper.contact_hs = float(args.contact_hs)
+        if getattr(args, "a_good_hold_steps", None) is not None:
+            self.wrapper.sidestep_hold_steps = max(1, int(args.a_good_hold_steps))
         yaw_limit = getattr(args, "yaw_limit", None)
         if yaw_limit is not None:
             yaw_limit = float(yaw_limit)
@@ -586,13 +596,27 @@ class LatentHumanoidEnv(gym.Env):
         )
         return self._clip_nav_cmd(cmd)
 
-    def compute_safe_side_nav_action(self) -> np.ndarray:
-        """Env-space action toward the closer fully-safe side waypoint (a_good).
+    def note_collect_use_sf(self, use_sf: bool) -> None:
+        """Update held a_good target: compute on first HJ<0, refresh every 20 SF steps."""
+        refreshed = self.wrapper.update_sidestep_cache(bool(use_sf))
+        if refreshed:
+            self._safe_side_nav.reset()
 
-        Picks (3.5, -0.5) or (3.5, -3.5) by XY distance. Does not touch the
-        episode waypoint or the nominal controller state.
-        """
+    def compute_safe_side_nav_action(self) -> np.ndarray:
+        """Env-space a_good: path uses a held perp-sidestep; aisle uses fixed sides."""
         base_pos, base_quat = self.wrapper.get_robot_base_pose()
+        use_path = (
+            str(getattr(self.wrapper, "waypoint_layout", "regions")) == "start_goal_perp"
+            or bool(getattr(self.wrapper, "path_obstacle_layout", False))
+        )
+        if use_path:
+            target = self.wrapper.cached_sidestep_xy()
+            if target is None:
+                target = self.wrapper.perp_sidestep_xy()
+            if target is None:
+                return np.zeros(3, dtype=np.float32)
+            cmd = self._safe_side_nav.compute_command(base_pos, base_quat, target)
+            return self._clip_nav_cmd(cmd)
         xy = np.asarray(base_pos[:2], dtype=np.float64)
         pts = [
             np.asarray(p, dtype=np.float64).reshape(2)

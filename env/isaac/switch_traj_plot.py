@@ -28,7 +28,16 @@ def _align_use_sf(n_pts: int, use_sf: np.ndarray | Sequence | None) -> np.ndarra
     return flags
 
 
-def _plot_colored_traj(ax, traj: np.ndarray, use_sf: np.ndarray | None) -> None:
+def _plot_colored_traj(
+    ax,
+    traj: np.ndarray,
+    use_sf: np.ndarray | None,
+    *,
+    nom_label: str = "nominal (HJ≥0)",
+    sf_label: str = "SF (HJ<0)",
+    linewidth: float = 1.8,
+    zorder: int = 4,
+) -> None:
     """Green segments while SF (HJ<0), red otherwise."""
     if traj.shape[0] == 1:
         ax.scatter(
@@ -36,8 +45,8 @@ def _plot_colored_traj(ax, traj: np.ndarray, use_sf: np.ndarray | None) -> None:
             traj[0, 1],
             c=_COLOR_NOM,
             s=18,
-            zorder=4,
-            label="nominal (HJ≥0)",
+            zorder=zorder,
+            label=nom_label,
         )
         return
     if traj.shape[0] < 2:
@@ -54,10 +63,10 @@ def _plot_colored_traj(ax, traj: np.ndarray, use_sf: np.ndarray | None) -> None:
             j += 1
         color = _COLOR_SF if is_sf else _COLOR_NOM
         if is_sf and not labeled_sf:
-            label = "SF (HJ<0)"
+            label = sf_label
             labeled_sf = True
         elif (not is_sf) and not labeled_nom:
-            label = "nominal (HJ≥0)"
+            label = nom_label
             labeled_nom = True
         else:
             label = None
@@ -66,8 +75,8 @@ def _plot_colored_traj(ax, traj: np.ndarray, use_sf: np.ndarray | None) -> None:
             traj[i - 1 : j, 1],
             "-",
             color=color,
-            linewidth=1.8,
-            zorder=4,
+            linewidth=linewidth,
+            zorder=zorder,
             label=label,
         )
         i = j

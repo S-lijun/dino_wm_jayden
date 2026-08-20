@@ -40,9 +40,11 @@ PASS_SIDE_CYCLE: tuple[str, ...] = ("left", "right", "middle")
 PASS_SIDE_TRAIN: tuple[str, ...] = ("left", "right")
 
 # Start–goal path layout (new SAC pipeline only; region layout is unchanged).
-DEFAULT_ARENA_BOUNDS: tuple[float, float, float, float] = (-2.0, 5.0, -4.0, 2.0)
+DEFAULT_ARENA_BOUNDS: tuple[float, float, float, float] = (-1.0, 6.0, -4.0, 2.0)
 DEFAULT_PERP_OFFSET_M: float = 2.5
 DEFAULT_MIN_START_GOAL_DIST: float = 4.0
+# l = d_min - this. Vias and bins are sampled independently (vias may sit inside disks).
+DEFAULT_DANGER_RADIUS_M: float = 1.5
 
 
 def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
@@ -179,6 +181,206 @@ def _clamp_to_rect(
     )
 
 
+def min_xy_dist_to_points(
+    pt: np.ndarray,
+    points: Sequence[np.ndarray] | None,
+) -> float:
+    if not points:
+        return float("inf")
+    p = np.asarray(pt, dtype=np.float64).reshape(2)
+    best = float("inf")
+    for q in points:
+        qq = np.asarray(q, dtype=np.float64).reshape(2)
+        d = float(np.hypot(p[0] - qq[0], p[1] - qq[1]))
+        if d < best:
+            best = d
+    return best
+
+
+def outside_danger_circles(
+    pt: np.ndarray,
+    obstacle_xys: Sequence[np.ndarray] | None,
+    radius: float,
+) -> bool:
+    """True iff ``pt`` is not in the union of radius-disks around obstacles."""
+    return min_xy_dist_to_points(pt, obstacle_xys) >= float(radius) - 1e-6
+
+
+def sample_start_goal_in_arena(
+    rng: np.random.Generator,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    min_start_goal_dist: float = DEFAULT_MIN_START_GOAL_DIST,
+    margin: float = 0.5,
+    max_tries: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample start and goal inside the arena inset, with a min separation."""
+    ix0, ix1 = float(x_min + margin), float(x_max - margin)
+    iy0, iy1 = float(y_min + margin), float(y_max - margin)
+    if ix1 <= ix0 or iy1 <= iy0:
+        raise ValueError("Arena inset is empty; increase bounds or reduce margin.")
+    last_err = "failed to sample start-goal"
+    for _ in range(int(max_tries)):
+        start = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        goal = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        dist = float(np.linalg.norm(goal - start))
+        if dist < float(min_start_goal_dist):
+            last_err = f"start-goal dist {dist:.2f} < {min_start_goal_dist}"
+            continue
+        return start, goal
+    raise RuntimeError(f"sample_start_goal_in_arena: {last_err}")
+
+
+def sample_perp_transition_waypoints(
+    rng: np.random.Generator,
+    start: np.ndarray,
+    goal: np.ndarray,
+    *,
+    perp_offset: float = DEFAULT_PERP_OFFSET_M,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    t_lo: float = 0.2,
+    t_hi: float = 0.8,
+    min_t_gap: float = 0.15,
+    max_tries: int = 64,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Two perp vias on start→goal, independent of obstacle placement.
+
+    Returns ``(trans1, trans2, spawn_yaw)`` with trans1 closer to start,
+    or ``None`` if no in-arena pair is found.
+    """
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    delta = goal - start
+    dist = float(np.linalg.norm(delta))
+    if dist < 1e-6:
+        raise ValueError("start and goal are coincident")
+    tangent = delta / dist
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    last_err = "failed to sample transition waypoints"
+    for _ in range(int(max_tries)):
+        t1 = float(rng.uniform(t_lo, t_hi))
+        t2 = float(rng.uniform(t_lo, t_hi))
+        if abs(t1 - t2) < float(min_t_gap):
+            last_err = "transition t too close"
+            continue
+        trans: list[np.ndarray] = []
+        ok = True
+        for t in (t1, t2):
+            foot = start + t * delta
+            sign = -1.0 if rng.random() < 0.5 else 1.0
+            chosen = None
+            for s in (sign, -sign):
+                pt = foot + s * float(perp_offset) * normal
+                if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.15):
+                    continue
+                chosen = pt
+                break
+            if chosen is None:
+                ok = False
+                last_err = "transition waypoint outside arena"
+                break
+            trans.append(chosen)
+        if not ok:
+            continue
+        d0 = float(np.linalg.norm(trans[0] - start))
+        d1 = float(np.linalg.norm(trans[1] - start))
+        if d1 < d0:
+            trans[0], trans[1] = trans[1], trans[0]
+        heading = trans[0] - start
+        if float(np.linalg.norm(heading)) < 1e-6:
+            heading = goal - start
+        spawn_yaw = float(np.arctan2(heading[1], heading[0]))
+        return trans[0], trans[1], spawn_yaw
+    return None
+
+
+def compute_perp_sidestep_xy(
+    robot_xy: np.ndarray,
+    obstacle_xys: Sequence[np.ndarray] | None,
+    *,
+    radius: float = DEFAULT_DANGER_RADIUS_M,
+    heading: float | None = None,
+    x_min: float | None = None,
+    x_max: float | None = None,
+    y_min: float | None = None,
+    y_max: float | None = None,
+    extra_offsets: tuple[float, ...] = (0.0, 0.2, 0.5, 1.0, 1.5),
+) -> np.ndarray | None:
+    """Safe point G: right triangle robot–nearest-obstacle–G, right angle at obstacle.
+
+    Two sides are equidistant from the robot. Prefer the G more in front of
+    the current heading so a held target does not reverse the robot.
+    """
+    obs = [
+        np.asarray(p, dtype=np.float64).reshape(2)
+        for p in (obstacle_xys or [])
+    ]
+    if not obs:
+        return None
+    robot = np.asarray(robot_xy, dtype=np.float64).reshape(2)
+    dists = [float(np.linalg.norm(robot - o)) for o in obs]
+    o = obs[int(np.argmin(np.asarray(dists)))]
+    v = o - robot
+    d = float(np.linalg.norm(v))
+    if d < 1e-6:
+        if heading is None:
+            fwd = np.array([1.0, 0.0], dtype=np.float64)
+        else:
+            fwd = np.array(
+                [float(np.cos(heading)), float(np.sin(heading))], dtype=np.float64
+            )
+    else:
+        fwd = v / d
+    n1 = np.array([-fwd[1], fwd[0]], dtype=np.float64)
+    n2 = -n1
+    if heading is None:
+        head = fwd
+    else:
+        head = np.array(
+            [float(np.cos(heading)), float(np.sin(heading))], dtype=np.float64
+        )
+
+    def in_arena(p: np.ndarray) -> bool:
+        if x_min is None:
+            return True
+        return _point_in_rect(
+            p, float(x_min), float(x_max), float(y_min), float(y_max), margin=0.05
+        )
+
+    scored: list[tuple[float, float, float, np.ndarray]] = []
+    for extra in extra_offsets:
+        r = float(radius) + float(extra)
+        batch: list[tuple[float, float, float, np.ndarray]] = []
+        for n in (n1, n2):
+            g = o + r * n
+            if min_xy_dist_to_points(g, obs) < float(radius) - 1e-6:
+                continue
+            if not in_arena(g):
+                continue
+            align = -float(np.dot(g - robot, head))
+            batch.append((float(extra), align, -min_xy_dist_to_points(g, obs), g))
+        if batch:
+            scored = batch
+            break
+    if not scored:
+        for n in (n1, n2):
+            g = o + float(radius) * n
+            align = -float(np.dot(g - robot, head))
+            scored.append((99.0, align, 0.0, g))
+    scored.sort(key=lambda t: (t[0], t[1], t[2]))
+    return scored[0][3]
+
+
 def sample_start_goal_perp_path(
     rng: np.random.Generator,
     *,
@@ -196,71 +398,45 @@ def sample_start_goal_perp_path(
 ) -> tuple[np.ndarray, list[str], float]:
     """Sample start, two perpendicular transition waypoints, and goal.
 
-    Transition waypoints sit on the start→goal segment, then are offset
-    perpendicularly by ``±perp_offset`` (random independent signs). They are
-    ordered so the one closer to the start comes first (no turning back).
+    Transition vias are offset ±perp_offset from the start–goal segment.
+    Obstacle placement is independent and may overlap these vias.
 
     Returns ``(waypoints (4, 2), names, spawn_yaw)``. ``spawn_yaw`` faces
     start → first transition waypoint.
     """
-    ix0, ix1 = float(x_min + margin), float(x_max - margin)
-    iy0, iy1 = float(y_min + margin), float(y_max - margin)
-    if ix1 <= ix0 or iy1 <= iy0:
-        raise ValueError("Arena inset is empty; increase bounds or reduce margin.")
-
     last_err = "failed to sample start-goal path"
     for _ in range(int(max_tries)):
-        start = np.array(
-            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        start, goal = sample_start_goal_in_arena(
+            rng,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            min_start_goal_dist=min_start_goal_dist,
+            margin=margin,
+            max_tries=max_tries,
         )
-        goal = np.array(
-            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        sampled = sample_perp_transition_waypoints(
+            rng,
+            start,
+            goal,
+            perp_offset=perp_offset,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            t_lo=t_lo,
+            t_hi=t_hi,
+            min_t_gap=min_t_gap,
+            max_tries=32,
         )
-        delta = goal - start
-        dist = float(np.linalg.norm(delta))
-        if dist < float(min_start_goal_dist):
-            last_err = f"start-goal dist {dist:.2f} < {min_start_goal_dist}"
+        if sampled is None:
+            last_err = "transition waypoint outside arena"
             continue
-        tangent = delta / dist
-        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
-
-        t1 = float(rng.uniform(t_lo, t_hi))
-        t2 = float(rng.uniform(t_lo, t_hi))
-        if abs(t1 - t2) < float(min_t_gap):
-            last_err = "transition t too close"
-            continue
-
-        trans: list[np.ndarray] = []
-        ok = True
-        for t in (t1, t2):
-            foot = start + t * delta
-            sign = -1.0 if rng.random() < 0.5 else 1.0
-            pt = foot + sign * float(perp_offset) * normal
-            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.3):
-                pt = foot - sign * float(perp_offset) * normal
-            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.15):
-                pt = _clamp_to_rect(pt, x_min, x_max, y_min, y_max, margin=0.15)
-            if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.05):
-                ok = False
-                last_err = "transition waypoint outside arena"
-                break
-            trans.append(pt)
-        if not ok:
-            continue
-
-        d0 = float(np.linalg.norm(trans[0] - start))
-        d1 = float(np.linalg.norm(trans[1] - start))
-        if d1 < d0:
-            trans[0], trans[1] = trans[1], trans[0]
-
-        heading = trans[0] - start
-        if float(np.linalg.norm(heading)) < 1e-6:
-            heading = goal - start
-        spawn_yaw = float(np.arctan2(heading[1], heading[0]))
-        wps = np.stack([start, trans[0], trans[1], goal], axis=0)
+        trans1, trans2, spawn_yaw = sampled
+        wps = np.stack([start, trans1, trans2, goal], axis=0)
         names = ["start", "trans1", "trans2", "goal"]
         return wps, names, spawn_yaw
-
     raise RuntimeError(f"sample_start_goal_perp_path: {last_err}")
 
 

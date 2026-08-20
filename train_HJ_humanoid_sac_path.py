@@ -5,13 +5,16 @@ Do not use this file as a drop-in replacement for the original pipeline.
 
 Layout:
   each episode samples start + goal inside the arena rectangle
-  x in [-2, 5], y in [-4, 2]; two transition waypoints offset ±2.5 m
+  x in [-1, 6], y in [-4, 2]; two transition waypoints offset ±2.5 m
   perpendicular to the start-goal segment, ordered near-start then near-goal.
   Hitting the rectangle edge resets; that transition is not stored for updates.
 
   h_s = lidar_min - 1.5; non-foot contact also labels failure (l <= -1.5).
   Foot soles left/right_ankle_roll_link are ignored. Yaw action in [-1, 1].
   Blue-bin placement is still the original fixed (3.5, -2) until specified.
+
+  Critic is LateFusionCritic: z and a each through an MLP to the same
+  width, then concat and a Q head. Old early-concat checkpoints will not load.
 """
 
 import argparse
@@ -99,8 +102,8 @@ parser.add_argument(
     action="store_true",
     help="Enable rectangular arena reset: x in [arena_x_min, arena_x_max], y in [arena_y_min, arena_y_max].",
 )
-parser.add_argument("--arena_x_min", type=float, default=-2.0)
-parser.add_argument("--arena_x_max", type=float, default=5.0)
+parser.add_argument("--arena_x_min", type=float, default=-1.0)
+parser.add_argument("--arena_x_max", type=float, default=6.0)
 parser.add_argument("--arena_y_min", type=float, default=-4.0)
 parser.add_argument("--arena_y_max", type=float, default=2.0)
 parser.add_argument(
@@ -254,11 +257,23 @@ parser.add_argument(
 parser.add_argument(
     "--action_reg_coef",
     type=float,
-    default=0.0,
+    default=0.5,
     help=(
-        "λ_nom for MSE(a_sf, target) in policy space. Default 0 (no "
-        "action regularization). With --switch_collect: target is a_nom if "
-        "Q(a_nom) >= threshold else a_good. Not cleared."
+        "λ for MSE(a_sf, a_good) in policy space, only on switch steps "
+        "that executed the safety filter (HJ(Q(a_nom))<0). Waypoint-only "
+        "episodes and switch steps with HJ>=0 are not regularized. "
+        "a_good is a held perp-sidestep of the nearest obstacle: computed "
+        "on first HJ<0, then reused for --a_good_hold_steps (default 20) "
+        "HJ-steps before refresh. 0 disables."
+    ),
+)
+parser.add_argument(
+    "--a_good_hold_steps",
+    type=int,
+    default=20,
+    help=(
+        "Reuse the same waypoint_good for this many consecutive SF "
+        "(HJ<0) steps, then recompute if still HJ<0."
     ),
 )
 parser.add_argument(
@@ -367,7 +382,7 @@ from PyHJ.trainer.offpolicy import OffpolicyTrainer
 from PyHJ.env import DummyVectorEnv
 from PyHJ.utils import WandbLogger
 from PyHJ.utils.net.common import Net
-from PyHJ.utils.net.continuous import ActorProb, Critic
+from PyHJ.utils.net.continuous import ActorProb
 from PyHJ.policy import avoid_SACPolicy_annealing
 
 _PROGRESS_BAR_LOSS_KEYS = ("loss/actor", "loss/critic1", "loss/critic2")
@@ -388,6 +403,7 @@ from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 from env.isaac.skip_update_buffer import SkipUpdateReplayBuffer
 from env.isaac.ckpt_utils import save_epoch_checkpoint
+from env.isaac.late_fusion_critic import make_late_fusion_critic
 
 
 def args_type(default):
@@ -444,7 +460,14 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"--resume_policy not found: {ckpt_path}")
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    policy.load_state_dict(state, strict=True)
+    try:
+        policy.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Failed to load checkpoint into LateFusionCritic. Old early-concat "
+            "SAC path weights (cat(z, a) at the first Linear) are incompatible "
+            f"— start a new run, do not --resume_policy. Path: {ckpt_path}"
+        ) from exc
     print(f"[INFO] Resumed policy from {ckpt_path}")
 
 
@@ -563,15 +586,13 @@ def main():
     )
 
     def _make_critic():
-        net = Net(
+        critic = make_late_fusion_critic(
             state_shape,
             action_shape,
             hidden_sizes=args.critic_net,
             activation=getattr(torch.nn, args.critic_activation),
-            concat=True,
             device=args.device,
         )
-        critic = Critic(net, device=args.device).to(args.device)
         optim = torch.optim.AdamW(
             critic.parameters(), lr=args.critic_lr, weight_decay=args.weight_decay_pyhj
         )
@@ -663,7 +684,7 @@ def main():
         return acts
 
     def _safe_side_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
-        """Policy-space a_good toward the closer fully-safe side waypoint."""
+        """Policy-space a_good toward the moving perp-sidestep of the nearest bin."""
         fns = train_envs.get_env_attr("compute_safe_side_nav_action")
         acts_env = np.stack(
             [np.asarray(fn(), dtype=np.float32).reshape(-1) for fn in fns],
@@ -705,6 +726,24 @@ def main():
         if freeze_yaw:
             act_good_t = _zero_yaw_act(act_good_t)
         return act_good_t
+
+    def _batch_use_sf_weight(batch, act_ref: torch.Tensor) -> torch.Tensor:
+        pol = getattr(batch, "policy", None)
+        use_sf = None if pol is None else getattr(pol, "use_sf", None)
+        n = int(act_ref.shape[0])
+        if use_sf is None:
+            return act_ref.new_zeros(n)
+        t = torch.as_tensor(use_sf, dtype=act_ref.dtype, device=act_ref.device).reshape(
+            -1
+        )
+        if t.numel() == 1 and n > 1:
+            t = t.expand(n)
+        elif t.numel() != n:
+            out = act_ref.new_zeros(n)
+            m = min(n, int(t.numel()))
+            out[:m] = t[:m]
+            return out
+        return t
 
     def _obs_to_tensor(obs) -> torch.Tensor:
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=args.device)
@@ -748,6 +787,12 @@ def main():
 
     _orig_policy_forward = policy.forward
 
+    def _note_use_sf(flags) -> None:
+        fns = train_envs.get_env_attr("note_collect_use_sf")
+        flags_np = np.asarray(flags, dtype=bool).reshape(-1)
+        for i, fn in enumerate(fns):
+            fn(bool(flags_np[i] if i < flags_np.size else False))
+
     def _env_collect_controller() -> str:
         try:
             modes = train_envs.get_env_attr("collect_controller")
@@ -773,24 +818,44 @@ def main():
             out.act = _zero_yaw_act(out.act)
         if getattr(policy, "_attach_act_nom", False):
             act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
-            pol_extra = Batch(act_nom=act_nom)
+            n = int(np.asarray(act_nom).reshape(-1, 3).shape[0])
+            zeros_good = np.zeros((n, 3), dtype=np.float32)
+            use_sf_np = np.zeros((n,), dtype=np.bool_)
+            pol_extra = Batch(
+                act_nom=act_nom,
+                use_sf=use_sf_np,
+                act_good=zeros_good,
+                q_nom=np.full((n,), np.nan, dtype=np.float32),
+            )
             mode = _env_collect_controller()
             if mode == "waypoint":
                 out.act = _as_act_like(out.act, act_nom)
                 policy.last_q_nom = None
                 policy.last_switch_use_sf = 0.0
+                _note_use_sf(False)
             elif mode == "switch":
                 q_nom = _q_nom_min(batch[input], act_nom)
                 use_sf = q_nom < switch_threshold
+                use_sf_np = np.asarray(use_sf, dtype=np.bool_).reshape(-1)
                 pol_extra.q_nom = np.asarray(q_nom, dtype=np.float32)
-                pol_extra.use_sf = np.asarray(use_sf, dtype=np.bool_)
+                pol_extra.use_sf = use_sf_np
                 out.act = _mix_switch_act(out.act, act_nom, use_sf)
                 policy.last_q_nom = float(q_nom.reshape(-1)[0])
-                policy.last_switch_use_sf = float(bool(use_sf.reshape(-1)[0]))
+                policy.last_switch_use_sf = float(bool(use_sf_np.reshape(-1)[0]))
+                _note_use_sf(use_sf_np)
+                if np.any(use_sf_np):
+                    pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
                 ls = getattr(policy, "log_state", None)
                 if isinstance(ls, dict):
-                    ls["switch_n"] = int(ls.get("switch_n", 0)) + int(use_sf.size)
-                    ls["switch_sf"] = int(ls.get("switch_sf", 0)) + int(use_sf.sum())
+                    ls["switch_n"] = int(ls.get("switch_n", 0)) + int(use_sf_np.size)
+                    ls["switch_sf"] = int(ls.get("switch_sf", 0)) + int(use_sf_np.sum())
+            else:
+                # Fully SF collect: every step uses the actor.
+                use_sf_np = np.ones((n,), dtype=np.bool_)
+                pol_extra.use_sf = use_sf_np
+                _note_use_sf(use_sf_np)
+                pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                policy.last_switch_use_sf = 1.0
             out.policy = pol_extra
         return out
 
@@ -829,35 +894,22 @@ def main():
             good_reg = act.new_zeros(())
             boundary_reg = act.new_zeros(())
             if action_reg_coef > 0.0 or boundary_reg_coef > 0.0:
-                act_nom = _batch_act_nom_tensor(batch, act)
-                if switch_collect and action_reg_coef > 0.0:
-                    # Q>=thr: pull a_sf → a_nom. Q<thr: a_nom is unsafe, pull
-                    # a_sf → a_good (closer fully-safe side waypoint).
-                    with torch.no_grad():
-                        q_nom = torch.min(
-                            policy.critic1(batch.obs, act_nom).flatten(),
-                            policy.critic2(batch.obs, act_nom).flatten(),
-                        )
-                    safe_w = (q_nom >= switch_threshold).to(dtype=act.dtype)
-                    unsafe_w = 1.0 - safe_w
-                    nom_reg_safe_frac = float(safe_w.mean().item())
-                    sq_nom = (act - act_nom).pow(2).mean(dim=-1)
+                if action_reg_coef > 0.0:
+                    # Only switch + HJ<0 (executed SF): pull π toward a_good.
+                    # Waypoint-only episodes and switch+HJ>=0 are not regularized.
+                    use_sf_w = _batch_use_sf_weight(batch, act)
                     act_good = _batch_act_good_tensor(batch, act)
                     if act_good is not None:
                         sq_good = (act - act_good).pow(2).mean(dim=-1)
-                        nom_reg = (sq_nom * safe_w + sq_good * unsafe_w).mean()
-                        good_denom = unsafe_w.sum().clamp(min=1.0)
-                        good_reg = (sq_good * unsafe_w).sum() / good_denom
-                    else:
-                        denom = safe_w.sum().clamp(min=1.0)
-                        nom_reg = (sq_nom * safe_w).sum() / denom
-                else:
-                    nom_reg = torch.nn.functional.mse_loss(act, act_nom)
-                boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
+                        valid = use_sf_w * (act_good.detach().abs().sum(dim=-1) > 1e-5)
+                        denom = valid.sum().clamp(min=1.0)
+                        good_reg = (sq_good * valid).sum() / denom
+                        if float(valid.sum().item()) > 0.0:
+                            actor_loss = actor_loss + action_reg_coef * good_reg
+                        nom_reg_safe_frac = float((1.0 - use_sf_w).mean().item())
                 if boundary_reg_coef > 0.0:
+                    boundary_reg = torch.relu(act.abs() - 0.8).pow(2).mean()
                     actor_loss = actor_loss + boundary_reg_coef * boundary_reg
-                if action_reg_coef > 0.0:
-                    actor_loss = actor_loss + action_reg_coef * nom_reg
 
             policy.actor1_optim.zero_grad()
             actor_loss.backward()
@@ -890,7 +942,7 @@ def main():
             "train/actor_abs_mean": act_abs_mean,
             "train/actor_sat_frac": act_sat_frac,
         }
-        if switch_collect:
+        if action_reg_coef > 0.0:
             result["train/nom_reg_safe_frac"] = nom_reg_safe_frac
             result["loss/good_reg"] = good_reg_v
         if alpha_loss_v is not None:
@@ -905,7 +957,9 @@ def main():
         f"[INFO] SAC avoid SF (path pipeline): gamma={args.gamma_pyhj}, "
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
-        f"λ_nom={action_reg_coef}, boundary={boundary_reg_coef}, "
+        f"λ_good={action_reg_coef} (switch+HJ<0, hold a_good "
+        f"{int(getattr(args, 'a_good_hold_steps', 20))} steps), "
+        f"boundary={boundary_reg_coef}, "
         f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
         + (
             f"+contact(ignore feet, cap={float(args.contact_hs):g})"
@@ -1065,6 +1119,9 @@ def main():
         )
         train_envs.set_env_attr("contact_hs", float(args.contact_hs))
         train_envs.set_env_attr(
+            "sidestep_hold_steps", int(getattr(args, "a_good_hold_steps", 20))
+        )
+        train_envs.set_env_attr(
             "skip_arena_oob_from_buffer",
             bool(args.skip_arena_oob_from_buffer),
         )
@@ -1102,9 +1159,13 @@ def main():
     def _waypoint_forward(batch, state=None, **kwargs):
         del batch, state, kwargs
         acts = _waypoint_acts_policy()
-        pol_extra = Batch(act_nom=acts.copy())
-        if switch_collect:
-            pol_extra.act_good = _safe_side_acts_policy()
+        n = int(np.asarray(acts).reshape(-1, 3).shape[0])
+        pol_extra = Batch(
+            act_nom=acts.copy(),
+            use_sf=np.zeros((n,), dtype=np.bool_),
+            act_good=np.zeros((n, 3), dtype=np.float32),
+            q_nom=np.full((n,), np.nan, dtype=np.float32),
+        )
         return Batch(act=acts, state=None, policy=pol_extra)
 
     def _waypoint_expl(act, batch):
