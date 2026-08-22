@@ -4,8 +4,7 @@
 #
 # Each episode: start + 2 perpendicular transition waypoints + goal.
 # Arena rectangle x in [-1, 6], y in [-4, 2]; edge hit resets and is not
-# stored for updates. h_s = d_min - 1.5, plus non-foot obstacle contact
-# (left/right ankle_roll soles ignored) caps l at contact_hs=-1.5.
+# stored for updates. h_s = d_min - 1.5; non-foot contact caps l at -1.5.
 # l uses a ±60° (120°) forward cone so labels match camera-visible
 # obstacles; outside the cone l=2.0. Episode cap 20000 sim steps ≈ 100s
 # (aisle default was 8000 ≈ 40s).
@@ -57,7 +56,8 @@ echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp 
 echo "[INFO] collect: alternate waypoint / Q-gate switch each episode"
 echo "[INFO] buffer warmup 4000 waypoint steps then 4000 critic updates; buffer-size unchanged"
 echo "[INFO] λ_good=0 (no a_good MSE); pass --action_reg_coef >0 to enable"
-echo "[INFO] l/h_s: lidar d_min-1.5 in ±60° (120°) cone; outside cone l=2; non-foot contact (ignore ankle_roll soles)"
+echo "[INFO] l/h_s: lidar d_min-1.5 in ±60° (120°) cone; outside cone l=2; +contact (non-foot → -1.5)"
+echo "[INFO] nom |v| resampled each waypoint visual step in [0.1, 0.9]"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --headless \
@@ -87,6 +87,9 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --lidar_h_half_fov_deg 60 \
   --include_contact_in_hs \
   --contact_hs -1.5 \
+  --randomize_nom_speed \
+  --nom_speed_min 0.1 \
+  --nom_speed_max 0.9 \
   --max_episode_steps 20000 \
   --yaw_limit 1.0 \
   --waypoint_layout start_goal_perp \

@@ -232,7 +232,7 @@ class IsaacG1Wrapper:
         # center minus danger radius (privileged label).
         self.hs_mode = str(getattr(args_cli, "hs_mode", "lidar"))
         self.collision_force_threshold = collision_force_threshold
-        # Path pipeline: non-foot obstacle contact folds into h_s / l. Off for aisle.
+        # Optional: fold non-foot contact into h_s / l. Path default is LiDAR-only.
         self.include_contact_in_hs = False
         self.contact_hs = -1.5
         # Hold a_good sidestep target this many HJ steps after first HJ<0.

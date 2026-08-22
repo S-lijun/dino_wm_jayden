@@ -9,8 +9,8 @@ Layout:
   perpendicular to the start-goal segment, ordered near-start then near-goal.
   Hitting the rectangle edge resets; that transition is not stored for updates.
 
-  h_s = lidar_min - 1.5; non-foot contact also labels failure (l <= -1.5).
-  Foot soles left/right_ankle_roll_link are ignored. Yaw action in [-1, 1].
+  h_s = lidar_min - 1.5 (LiDAR only; contact force is not folded in).
+  Yaw action in [-1, 1].
   Blue-bin placement is still the original fixed (3.5, -2) until specified.
 
   Default critic is LateFusionCritic: z and a each through an MLP to the
@@ -159,16 +159,16 @@ parser.add_argument(
 parser.add_argument(
     "--include_contact_in_hs",
     action="store_true",
-    default=True,
+    default=False,
     help=(
         "Fold non-foot obstacle contact into l/h_s (failure label). "
-        "Ignores left/right_ankle_roll_link (foot soles). Default on."
+        "Default off: h_s = lidar_min - threshold only."
     ),
 )
 parser.add_argument(
     "--no_include_contact_in_hs",
     action="store_true",
-    help="Supervise l from LiDAR only (ignore contact force).",
+    help="Supervise l from LiDAR only (ignore contact force). Default.",
 )
 parser.add_argument(
     "--contact_hs",
@@ -254,6 +254,27 @@ parser.add_argument(
     "--no_alternate_collect",
     action="store_true",
     help="Disable waypoint/switch episode alternation (pure SF collect).",
+)
+parser.add_argument(
+    "--randomize_nom_speed",
+    action="store_true",
+    help=(
+        "Each waypoint visual step samples controller |v| uniformly in "
+        "[--nom_speed_min, --nom_speed_max] (default [0.1, 0.9]). "
+        "Applies to waypoint a_nom only (not SF). Off: fixed max_speed (0.5)."
+    ),
+)
+parser.add_argument(
+    "--nom_speed_min",
+    type=float,
+    default=0.1,
+    help="Lower |v| when --randomize_nom_speed is on.",
+)
+parser.add_argument(
+    "--nom_speed_max",
+    type=float,
+    default=0.9,
+    help="Upper |v| when --randomize_nom_speed is on.",
 )
 parser.add_argument(
     "--buffer_warmup_steps",
@@ -532,8 +553,8 @@ def main():
         args.skip_arena_oob_from_buffer = True
     if bool(getattr(args, "no_include_contact_in_hs", False)):
         args.include_contact_in_hs = False
-    else:
-        args.include_contact_in_hs = True
+    elif not bool(getattr(args, "include_contact_in_hs", False)):
+        args.include_contact_in_hs = False
     if bool(getattr(args, "no_alternate_collect", False)):
         args.alternate_collect = False
     else:
@@ -891,9 +912,12 @@ def main():
                 out.act = _mix_switch_act(out.act, act_nom, use_sf)
                 policy.last_q_nom = float(q_nom.reshape(-1)[0])
                 policy.last_switch_use_sf = float(bool(use_sf_np.reshape(-1)[0]))
-                _note_use_sf(use_sf_np)
-                if np.any(use_sf_np):
-                    pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                if action_reg_coef > 0.0:
+                    _note_use_sf(use_sf_np)
+                    if np.any(use_sf_np):
+                        pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                else:
+                    _note_use_sf(False)
                 ls = getattr(policy, "log_state", None)
                 if isinstance(ls, dict):
                     ls["switch_n"] = int(ls.get("switch_n", 0)) + int(use_sf_np.size)
@@ -902,8 +926,11 @@ def main():
                 # Fully SF collect: every step uses the actor.
                 use_sf_np = np.ones((n,), dtype=np.bool_)
                 pol_extra.use_sf = use_sf_np
-                _note_use_sf(use_sf_np)
-                pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                if action_reg_coef > 0.0:
+                    _note_use_sf(use_sf_np)
+                    pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
+                else:
+                    _note_use_sf(False)
                 policy.last_switch_use_sf = 1.0
             out.policy = pol_extra
         return out
@@ -1013,7 +1040,7 @@ def main():
         + (
             f"+contact(ignore feet, cap={float(args.contact_hs):g})"
             if bool(args.include_contact_in_hs)
-            else ""
+            else " (lidar only)"
         )
         + f", lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
         + ", "
@@ -1021,7 +1048,12 @@ def main():
         f"freeze_yaw={freeze_yaw}, "
         f"alternate_collect={bool(args.alternate_collect)} "
         f"(waypoint ↔ switch), "
-        f"obstacles: absent_p={float(args.obstacle_absent_prob):g} "
+        + (
+            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/step, "
+            if bool(getattr(args, "randomize_nom_speed", False))
+            else "nom_|v|=0.5, "
+        )
+        + f"obstacles: absent_p={float(args.obstacle_absent_prob):g} "
         f"P(2|present)={float(args.two_obstacle_prob):g} max={int(args.max_n_obstacles)}"
     )
 
@@ -1168,6 +1200,15 @@ def main():
         )
         train_envs.set_env_attr("contact_hs", float(args.contact_hs))
         train_envs.set_env_attr(
+            "randomize_nom_speed", bool(getattr(args, "randomize_nom_speed", False))
+        )
+        train_envs.set_env_attr(
+            "nom_speed_min", float(getattr(args, "nom_speed_min", 0.1))
+        )
+        train_envs.set_env_attr(
+            "nom_speed_max", float(getattr(args, "nom_speed_max", 0.9))
+        )
+        train_envs.set_env_attr(
             "sidestep_hold_steps", int(getattr(args, "a_good_hold_steps", 20))
         )
         train_envs.set_env_attr(
@@ -1196,8 +1237,13 @@ def main():
         "[INFO] Collecting initial transitions with WaypointNavController "
         f"({path_desc}; arena {arena_desc}; "
         f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
-        f"{'+contact' if bool(args.include_contact_in_hs) else ''}; "
-        f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
+        f"{'+contact' if bool(args.include_contact_in_hs) else ' lidar-only'}; "
+        + (
+            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/step; "
+            if bool(getattr(args, "randomize_nom_speed", False))
+            else "nom_|v|=0.5; "
+        )
+        + f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
         f"yaw=±{float(args.yaw_limit):g}; "
         f"obstacles: absent_p={float(args.obstacle_absent_prob):g}, "
         f"P(2|present)={float(args.two_obstacle_prob):g}, "

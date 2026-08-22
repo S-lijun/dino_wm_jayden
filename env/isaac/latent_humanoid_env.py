@@ -176,6 +176,7 @@ class LatentHumanoidEnv(gym.Env):
         self._reset_timers()
         self.waypoint_nav.reset()
         self._safe_side_nav.reset()
+        self._resample_nom_speed()
         # Constructor warm-up reset is not a training episode; do not record.
         self._record_this_episode = False
         self._episode_frames = []
@@ -208,7 +209,8 @@ class LatentHumanoidEnv(gym.Env):
             f"x_bound_max={self.wrapper.x_bound_max}, "
             f"arena={'on ' + self._arena_str() if self.wrapper.use_arena_bounds else 'off'}, "
             f"h_s=d_min-{self.wrapper.lidar_distance_threshold:g}"
-            f"{('+contact→' + str(self.wrapper.contact_hs) if self.wrapper.include_contact_in_hs else '')}, "
+            f"{('+contact→' + str(self.wrapper.contact_hs) if self.wrapper.include_contact_in_hs else ' lidar-only')}, "
+            f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/step' if self._randomize_nom_speed else f'{self._episode_nom_speed:g}'}, "
             f"lidar_cone=±{float(getattr(self.wrapper, 'lidar_h_half_fov_deg', 90.0)):g}°, "
             f"yaw=[{self.action_space.low[2]:g},{self.action_space.high[2]:g}] "
             f"(OOB → truncate only, no h_s penalty), "
@@ -539,6 +541,10 @@ class LatentHumanoidEnv(gym.Env):
         self.skip_arena_oob_from_buffer = bool(
             getattr(args, "skip_arena_oob_from_buffer", False)
         )
+        self._randomize_nom_speed = bool(getattr(args, "randomize_nom_speed", False))
+        self._nom_speed_min = float(getattr(args, "nom_speed_min", 0.1))
+        self._nom_speed_max = float(getattr(args, "nom_speed_max", 0.9))
+        self._episode_nom_speed = float(getattr(self.wrapper, "max_speed", 0.5))
         thr = getattr(args, "lidar_distance_threshold", None)
         if thr is not None:
             self.wrapper.lidar_distance_threshold = float(thr)
@@ -600,6 +606,30 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.collect_controller = "waypoint"
 
     @property
+    def randomize_nom_speed(self) -> bool:
+        return bool(getattr(self, "_randomize_nom_speed", False))
+
+    @randomize_nom_speed.setter
+    def randomize_nom_speed(self, value: bool) -> None:
+        self._randomize_nom_speed = bool(value)
+
+    @property
+    def nom_speed_min(self) -> float:
+        return float(getattr(self, "_nom_speed_min", 0.1))
+
+    @nom_speed_min.setter
+    def nom_speed_min(self, value: float) -> None:
+        self._nom_speed_min = float(value)
+
+    @property
+    def nom_speed_max(self) -> float:
+        return float(getattr(self, "_nom_speed_max", 0.9))
+
+    @nom_speed_max.setter
+    def nom_speed_max(self, value: float) -> None:
+        self._nom_speed_max = float(value)
+
+    @property
     def obstacle_absent_prob(self) -> float:
         return float(self.wrapper.obstacle_absent_prob)
 
@@ -614,8 +644,29 @@ class LatentHumanoidEnv(gym.Env):
         # Next encode boundary after t=0 (reset already encoded the t=0 frame).
         self._next_visual_time_s = self.visual_period_s
 
+    def _resample_nom_speed(self) -> float:
+        """Sample waypoint-controller |v| (a_nom only; not the SF actor)."""
+        default = float(getattr(self.wrapper, "max_speed", 0.5))
+        if not bool(getattr(self, "_randomize_nom_speed", False)):
+            speed = default
+        else:
+            lo = float(getattr(self, "_nom_speed_min", 0.1))
+            hi = float(getattr(self, "_nom_speed_max", 0.9))
+            if hi < lo:
+                lo, hi = hi, lo
+            rng = getattr(self.wrapper, "_rng", None)
+            if rng is None:
+                speed = float(np.random.uniform(lo, hi))
+            else:
+                speed = float(rng.uniform(lo, hi))
+        self.waypoint_nav.max_speed = speed
+        self._episode_nom_speed = speed
+        return speed
+
     def compute_waypoint_nav_action(self) -> np.ndarray:
         """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint."""
+        if bool(getattr(self, "_randomize_nom_speed", False)):
+            self._resample_nom_speed()
         base_pos, base_quat = self.wrapper.get_robot_base_pose()
         cmd = self.waypoint_nav.compute_command(
             base_pos, base_quat, self.wrapper.waypoint
@@ -1007,6 +1058,7 @@ class LatentHumanoidEnv(gym.Env):
         self._reset_timers()
         self.waypoint_nav.reset()
         self._safe_side_nav.reset()
+        nom_speed = self._resample_nom_speed()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)
@@ -1022,6 +1074,7 @@ class LatentHumanoidEnv(gym.Env):
                 f"n_obstacles={reset_info.get('n_obstacles')} "
                 f"obstacle_xys={reset_info.get('obstacle_xys')} "
                 f"collect={reset_info.get('collect_controller')} "
+                f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/step' if self._randomize_nom_speed else f'{nom_speed:.3f}'} "
                 f"wp_names={reset_info.get('waypoint_region_names')} "
                 f"waypoints={reset_info.get('waypoints')}"
             )
