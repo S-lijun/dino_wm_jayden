@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
-# Test SAC HJ safety filter on the start–goal path layout.
-#
-# Each trial freezes the same scene:
-#   start + 2 perpendicular vias + goal
-#   0 or 1 bin (never two); when present, the 3rd waypoint (trans2) is inside
-#   the bin's danger disk (r=1.5)
-# then runs waypoint_only / SF-only / switching, writes 3 videos + 1 overlay PNG.
+# Test SAC lidar+joints HJ filter on the start–goal path layout.
 #
 # Usage:
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh \
-#     runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --num_runs 3
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --mode switching
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --easy
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> \
+#   bash scripts/run_test_HJ_humanoid_sac_lidar.sh \
+#     runs/sac_hj_humanoid_lidar/.../epoch_id_N/policy.pth
+#   bash scripts/run_test_HJ_humanoid_sac_lidar.sh <policy.pth> --num_runs 3
+#   bash scripts/run_test_HJ_humanoid_sac_lidar.sh <policy.pth> --easy
+#   bash scripts/run_test_HJ_humanoid_sac_lidar.sh <policy.pth> \
 #     --start_xy 0,-2 --via1_xy 2,-2 --via2_xy 4,-1 --goal_xy 5.5,-2 --bin_xy 4.5,-2
 
 set -euo pipefail
@@ -25,37 +18,29 @@ ISAAC_PYTHON="${ISAAC_PYTHON:-/workspace/isaaclab/_isaac_sim/python.sh}"
 POLICY_PATH="${1:?Usage: $0 /path/to/epoch_id_N/policy.pth}"
 shift || true
 
-WM_CKPT_DIR="${WM_CKPT_DIR:-/workspace}"
-WM_ENCODER="${WM_ENCODER:-wm_ckpt_18-27-17}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 
-# VNC DISPLAY=:1 + VirtualGL makes Isaac RTX crash in createHydraEngine.
 if [[ -n "${DISPLAY:-}" || -n "${VGL_DISPLAY:-}" ]]; then
   echo "[INFO] Unsetting DISPLAY=${DISPLAY-} VGL_DISPLAY=${VGL_DISPLAY-} for headless RTX"
   unset DISPLAY VGL_DISPLAY VNCGL_DISPLAY || true
 fi
 
-if [[ ! -f "${WM_CKPT_DIR}/${WM_ENCODER}/hydra.yaml" ]]; then
-  echo "[ERROR] Missing ${WM_CKPT_DIR}/${WM_ENCODER}/hydra.yaml"
-  exit 1
-fi
-
 mkdir -p "${MPLCONFIGDIR}"
 cd "${REPO_ROOT}"
 
-echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] policy: ${POLICY_PATH}"
-echo "[INFO] compare modes: waypoint_only / safe_only / switching"
-echo "[INFO] layout: start + trans1 + trans2 + goal; 0 or 1 bin; wp3 in danger r=1.5"
+echo "[INFO] lidar+joints test -> humanoid_test_sac_lidar/"
+echo "[INFO] h_s: geom XY − 1.5; compare waypoint / SF / switching"
 
-exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac_path.py \
+exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac_lidar.py \
   --headless \
   --visual_mode rtx_rgb \
-  --dino_ckpt_dir "${WM_CKPT_DIR}" \
-  --dino_encoder "${WM_ENCODER}" \
-  --with_proprio \
+  --obs_mode lidar_joint \
+  --hs_mode geom \
+  --critic-net 256 \
+  --control-net 256 \
   --config train_HJ_configs.yaml \
   --device cuda:0 \
   --policy_path "${POLICY_PATH}" \

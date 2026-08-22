@@ -81,8 +81,21 @@ class LatentHumanoidEnv(gym.Env):
         self.device = torch.device(device)
         self.with_proprio = with_proprio
         self.latent_h = latent_h
+        self.obs_mode = str(getattr(args, "obs_mode", "wm")).lower()
+        self.visual_feature = str(getattr(args, "visual_feature", "patch")).lower()
+        if self.visual_feature not in ("patch", "cls"):
+            raise ValueError(
+                f"Unknown visual_feature={self.visual_feature!r}; use 'patch' or 'cls'"
+            )
         self.wm = wm
-        self.wm.eval()
+        if self.obs_mode == "wm":
+            if wm is None:
+                raise ValueError("obs_mode='wm' requires a world-model encoder.")
+            self.wm.eval()
+        elif self.obs_mode == "lidar_joint":
+            self.wm = None
+        else:
+            raise ValueError(f"Unknown obs_mode={self.obs_mode!r}")
         self.max_episode_sim_steps = int(
             getattr(args, "max_episode_steps", max_episode_steps)
         )
@@ -152,6 +165,11 @@ class LatentHumanoidEnv(gym.Env):
             str(getattr(self.wrapper, "waypoint_layout", "regions")) == "start_goal_perp"
             or bool(getattr(self.wrapper, "path_obstacle_layout", False))
         )
+        print(
+            "[LatentHumanoidEnv] constructor reset_scene + first RTX frame "
+            "(silent for 1–3 min on a fresh Kit; not hung)",
+            flush=True,
+        )
         reset_info = self.wrapper.reset_scene(
             seed=None if use_path else getattr(args, "seed", None)
         )
@@ -165,6 +183,11 @@ class LatentHumanoidEnv(gym.Env):
         z = self.encode(obs)
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
+        )
+        print(
+            f"[LatentHumanoidEnv] obs_mode={self.obs_mode} "
+            f"visual_feature={self.visual_feature} "
+            f"hs_mode={self.wrapper.hs_mode} obs_dim={int(z.size)}"
         )
         yaw_limit = float(getattr(self.wrapper, "action_high")[2])
         self.action_space = Box(
@@ -555,6 +578,9 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.perp_offset = float(args.perp_offset)
         if getattr(args, "min_start_goal_dist", None) is not None:
             self.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
+        hs_mode = getattr(args, "hs_mode", None)
+        if hs_mode:
+            self.wrapper.hs_mode = str(hs_mode)
         if bool(getattr(args, "path_obstacle_layout", False)):
             self.wrapper.path_obstacle_layout = True
             self.wrapper.filter_lidar_to_active_obstacles = True
@@ -1130,6 +1156,8 @@ class LatentHumanoidEnv(gym.Env):
         return z_next, h_s, terminated, truncated, self._pyhj_info(end_reason, stuck)
 
     def _wm_num_hist(self) -> int:
+        if self.wm is None:
+            return 1
         return max(1, int(getattr(self.wm, "num_hist", 1)))
 
     def _split_raw_obs(self, obs: dict[str, Any] | tuple | list):
@@ -1173,6 +1201,10 @@ class LatentHumanoidEnv(gym.Env):
 
     def _reset_wm_history(self, obs: dict[str, Any] | tuple | list) -> None:
         """Repeat the first frame so the predictor has ``num_hist`` context."""
+        if self.obs_mode != "wm":
+            self._obs_hist = []
+            self._act_hist = []
+            return
         n = self._wm_num_hist()
         self._obs_hist = [self._copy_raw_obs(obs) for _ in range(n)]
         act_dim = int(np.prod(self.action_space.shape))
@@ -1181,6 +1213,8 @@ class LatentHumanoidEnv(gym.Env):
 
     def _push_wm_history(self, obs: dict[str, Any] | tuple | list, action) -> None:
         """After a step: new obs is current; executed action belongs to the previous frame."""
+        if self.obs_mode != "wm":
+            return
         n = self._wm_num_hist()
         self._obs_hist.append(self._copy_raw_obs(obs))
         self._obs_hist = self._obs_hist[-n:]
@@ -1196,8 +1230,13 @@ class LatentHumanoidEnv(gym.Env):
         on a ``num_hist`` window, with ``action_env`` as the action at the last
         (current) frame — matching ``scripts/pred_recon_wm_episode.py``.
         """
-        if self.wm.predictor is None:
+        if self.wm is None or self.wm.predictor is None:
             raise RuntimeError("World model has no predictor; cannot look ahead.")
+        if self.visual_feature == "cls":
+            raise RuntimeError(
+                "look-ahead is not supported with visual_feature=cls: the WM "
+                "predictor was trained on patch tokens, not CLS."
+            )
         n = self._wm_num_hist()
         if len(self._obs_hist) < n:
             raise RuntimeError("WM history is empty; call reset() first.")
@@ -1226,7 +1265,16 @@ class LatentHumanoidEnv(gym.Env):
             return self._flatten_latent_obs(z_obs)
 
     def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
-        """Encode visual + proprio into a flat latent vector via the world model."""
+        """Encode the current observation into the critic/actor state.
+
+        ``obs_mode=wm``: DINO latent from RGB (+ optional proprio).
+        ``visual_feature=patch``: flatten all DINOv2 patch tokens.
+        ``visual_feature=cls``: DINOv2 CLS token only (same frozen encoder).
+        ``obs_mode=lidar_joint``: 12-D legs ‖ full lidar ranges (ignores RGB).
+        """
+        if self.obs_mode == "lidar_joint":
+            return self.wrapper.get_lidar_joint_state()
+
         visual, proprio = self._split_raw_obs(obs)
 
         with torch.no_grad():
@@ -1241,8 +1289,28 @@ class LatentHumanoidEnv(gym.Env):
                     .unsqueeze(1)
                     .to(self.device)
                 )
-            lat = self.wm.encode_obs({"visual": vis_t, "proprio": prop_t})
+            lat = self._encode_obs_visual(vis_t, prop_t)
             return self._flatten_latent_obs(lat)
+
+    def _encode_obs_visual(self, vis_t: torch.Tensor, prop_t: torch.Tensor):
+        """WM ``encode_obs``, optionally swapping DINOv2 patch tokens for CLS."""
+        if self.visual_feature != "cls":
+            return self.wm.encode_obs({"visual": vis_t, "proprio": prop_t})
+        enc = getattr(self.wm, "encoder", None)
+        if enc is None or not hasattr(enc, "feature_key"):
+            raise RuntimeError(
+                "visual_feature=cls needs a DinoV2Encoder with feature_key "
+                "(x_norm_clstoken / x_norm_patchtokens)."
+            )
+        old_key = enc.feature_key
+        old_ndim = enc.latent_ndim
+        enc.feature_key = "x_norm_clstoken"
+        enc.latent_ndim = 1
+        try:
+            return self.wm.encode_obs({"visual": vis_t, "proprio": prop_t})
+        finally:
+            enc.feature_key = old_key
+            enc.latent_ndim = old_ndim
 
     def calculate_cost(self) -> float:
         return self.wrapper.calculate_cost()

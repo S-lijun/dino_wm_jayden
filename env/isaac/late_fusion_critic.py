@@ -94,6 +94,58 @@ class LateFusionCritic(nn.Module):
         return self.q_head(torch.cat([z_feat, a_feat], dim=1))
 
 
+def make_concat_critic(
+    state_shape,
+    action_shape,
+    hidden_sizes: Sequence[int],
+    activation: type[nn.Module],
+    device: Union[str, int, torch.device],
+):
+    """Q(cat(z, a)): first Linear sees z and the 3-D action together.
+
+    Intended for short z (DINOv2 CLS, 384-D). Do not use with ~70k patch z.
+    """
+    from PyHJ.utils.net.common import Net
+    from PyHJ.utils.net.continuous import Critic
+
+    net = Net(
+        state_shape,
+        action_shape,
+        hidden_sizes=hidden_sizes,
+        activation=activation,
+        concat=True,
+        device=device,
+    )
+    critic = Critic(net, device=device).to(device)
+    obs_dim = _flat_dim(state_shape)
+    act_dim = _flat_dim(action_shape)
+    hid = ",".join(str(h) for h in hidden_sizes)
+    print(
+        f"[INFO] ConcatCritic: cat(z({obs_dim}), a({act_dim})) → MLP[{hid}] → Q"
+    )
+    return critic
+
+
+def make_q_critic(
+    fusion: str,
+    state_shape,
+    action_shape,
+    hidden_sizes: Sequence[int],
+    activation: type[nn.Module],
+    device: Union[str, int, torch.device],
+):
+    fusion = str(fusion).lower()
+    if fusion == "late":
+        return make_late_fusion_critic(
+            state_shape, action_shape, hidden_sizes, activation, device
+        )
+    if fusion == "concat":
+        return make_concat_critic(
+            state_shape, action_shape, hidden_sizes, activation, device
+        )
+    raise ValueError(f"Unknown critic_fusion={fusion!r}; use 'late' or 'concat'")
+
+
 def make_late_fusion_critic(
     state_shape,
     action_shape,

@@ -1,26 +1,17 @@
 #!/usr/bin/env bash
-# Train SAC HJ safety filter with start-goal path layout (does NOT replace
-# scripts/run_train_HJ_humanoid_sac.sh).
+# CLS + concat-action variant of the start-goal path SAC pipeline.
+# Does NOT replace scripts/run_train_HJ_humanoid_sac_path.sh
+# (that one keeps patch tokens + late fusion).
 #
-# Each episode: start + 2 perpendicular transition waypoints + goal.
-# Arena rectangle x in [-1, 6], y in [-4, 2]; edge hit resets and is not
-# stored for updates. h_s = d_min - 1.5, plus non-foot obstacle contact
-# (left/right ankle_roll soles ignored) caps l at contact_hs=-1.5.
-# l uses a ±60° (120°) forward cone so labels match camera-visible
-# obstacles; outside the cone l=2.0. Episode cap 20000 sim steps ≈ 100s
-# (aisle default was 8000 ≈ 40s).
-# Obstacles: 10% none; else 50/50 one vs two bins, placed ±2.5 m off the
-# start-goal line independently of vias (vias may land in a bin's 1.5 m
-# danger disk). Dual RayCasters → min range is l.
-# Formal collect alternates waypoint-only and Q-gate switch per episode.
-# λ_good default 0 (no MSE to a_good). Pass --action_reg_coef >0 to enable.
-# 2D top-down traj PNG (obstacles + dashed r=1.5 failure-set circles).
+# Same layout / collect / h_s as the path pipeline, but:
+#   z = DINOv2 CLS (384) [+ proprio], no look-ahead
+#   Q = MLP(cat(z, a))  — 3-D action concat at the first Linear
+# Same frozen WM (wm_ckpt_18-27-17); only the extracted token changes.
 #
 # Usage:
-#   bash scripts/run_train_HJ_humanoid_sac_path.sh
-#   bash scripts/run_train_HJ_humanoid_sac_path.sh --action_reg_coef 0.5
-#   bash scripts/run_train_HJ_humanoid_sac_path.sh --freeze_yaw
-#   bash scripts/run_train_HJ_humanoid_sac_path.sh \
+#   bash scripts/run_train_HJ_humanoid_sac_path_cls.sh
+#   bash scripts/run_train_HJ_humanoid_sac_path_cls.sh --action_reg_coef 0.5
+#   bash scripts/run_train_HJ_humanoid_sac_path_cls.sh \
 #     --resume_policy runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
 
 set -euo pipefail
@@ -51,7 +42,8 @@ mkdir -p "${MPLCONFIGDIR}" "${REPO_ROOT}/runs"
 cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
-echo "[INFO] SAC path train -> runs/sac_hj_humanoid_path/"
+echo "[INFO] SAC path CLS+concat train -> runs/sac_hj_humanoid_path/"
+echo "[INFO] z=DINOv2 CLS (384); Q=MLP(cat(z, a)); no late fusion"
 echo "[INFO] layout: start + 2 perp vias (±2.5m) + goal; arena x[-1,6] y[-4,2]"
 echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±2.5m (independent of vias)"
 echo "[INFO] collect: alternate waypoint / Q-gate switch each episode"
@@ -64,6 +56,8 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --visual_mode rtx_rgb \
   --dino_ckpt_dir "${WM_CKPT_DIR}" \
   --dino_encoder "${WM_ENCODER}" \
+  --visual_feature cls \
+  --critic_fusion concat \
   --with_proprio \
   --config train_HJ_configs.yaml \
   --device cuda:0 \

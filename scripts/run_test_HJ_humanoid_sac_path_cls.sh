@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
-# Test SAC HJ safety filter on the start–goal path layout.
-#
-# Each trial freezes the same scene:
-#   start + 2 perpendicular vias + goal
-#   0 or 1 bin (never two); when present, the 3rd waypoint (trans2) is inside
-#   the bin's danger disk (r=1.5)
-# then runs waypoint_only / SF-only / switching, writes 3 videos + 1 overlay PNG.
+# Test the CLS + concat-action path SAC policy.
+# Does NOT replace scripts/run_test_HJ_humanoid_sac_path.sh
+# (that one loads patch + late-fusion checkpoints).
 #
 # Usage:
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh \
+#   bash scripts/run_test_HJ_humanoid_sac_path_cls.sh \
 #     runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --num_runs 3
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --mode switching
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> --easy
-#   bash scripts/run_test_HJ_humanoid_sac_path.sh <policy.pth> \
-#     --start_xy 0,-2 --via1_xy 2,-2 --via2_xy 4,-1 --goal_xy 5.5,-2 --bin_xy 4.5,-2
+#   bash scripts/run_test_HJ_humanoid_sac_path_cls.sh <policy.pth> --num_runs 3
+#   bash scripts/run_test_HJ_humanoid_sac_path_cls.sh <policy.pth> --mode switching
+#   bash scripts/run_test_HJ_humanoid_sac_path_cls.sh <policy.pth> --easy
 
 set -euo pipefail
 
@@ -47,6 +41,7 @@ cd "${REPO_ROOT}"
 
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] policy: ${POLICY_PATH}"
+echo "[INFO] visual_feature=cls critic_fusion=concat (no look-ahead)"
 echo "[INFO] compare modes: waypoint_only / safe_only / switching"
 echo "[INFO] layout: start + trans1 + trans2 + goal; 0 or 1 bin; wp3 in danger r=1.5"
 
@@ -55,6 +50,8 @@ exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac_path.py \
   --visual_mode rtx_rgb \
   --dino_ckpt_dir "${WM_CKPT_DIR}" \
   --dino_encoder "${WM_ENCODER}" \
+  --visual_feature cls \
+  --critic_fusion concat \
   --with_proprio \
   --config train_HJ_configs.yaml \
   --device cuda:0 \

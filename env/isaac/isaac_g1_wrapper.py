@@ -67,6 +67,22 @@ def landscape_output_size(img_res: tuple[int, int]) -> tuple[int, int]:
 # Backward-compatible alias for default landscape output (480×640).
 VISUAL_SIZE = landscape_output_size(DEFAULT_SENSOR_IMG_RES)
 
+# G1 12-DoF legs (no waist / arms). Order is left then right, hip→ankle.
+G1_LOWER_BODY_JOINTS: tuple[str, ...] = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+)
+
 
 def merge_ray_hits_multi(
     origin_np: np.ndarray,
@@ -208,6 +224,13 @@ class IsaacG1Wrapper:
         self.lidar_h_half_fov_deg = float(
             getattr(args_cli, "lidar_h_half_fov_deg", 90.0)
         )
+        # Must match LidarPatternCfg in this class (horizontal_res=2, channels=45).
+        self.lidar_horizontal_res_deg = 2.0
+        self.lidar_channels = 45
+        self.lidar_profile_clip = 6.0
+        # "lidar" = h_s from ray min (vision pipeline). "geom" = XY dist to bin
+        # center minus danger radius (privileged label).
+        self.hs_mode = str(getattr(args_cli, "hs_mode", "lidar"))
         self.collision_force_threshold = collision_force_threshold
         # Path pipeline: non-foot obstacle contact folds into h_s / l. Off for aisle.
         self.include_contact_in_hs = False
@@ -437,6 +460,11 @@ class IsaacG1Wrapper:
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
         self.device = self.env.unwrapped.device
         self.sim_dt = float(self.env.unwrapped.cfg.sim.dt)
+        try:
+            lidar0 = self.env.unwrapped.scene[self._lidar_sensor_names[0]]
+            self._lidar_n_rays = int(lidar0.data.ray_hits_w.shape[1])
+        except Exception:
+            self._lidar_n_rays = None
 
         # GUI + FULL_RENDERING blocks the Kit UI thread during long collect/train
         # loops → Windows "Isaac Sim (Not Responding)". Downgrade render mode.
@@ -489,6 +517,7 @@ class IsaacG1Wrapper:
         self._link_stuck_counters: np.ndarray | None = None
         self._active_obstacles: list[str] = []
         self._last_policy_obs = None
+        self._logged_first_rtx = False
         self._last_lidar_stats: dict[str, float] = {
             "lidar_min_distance": float("nan"),
             "lidar_min_distance_xy": float("nan"),
@@ -838,7 +867,12 @@ class IsaacG1Wrapper:
         self._sidestep_xy = None
         self._sidestep_hold = 0
 
+        print(
+            f"[IsaacG1Wrapper] reset_scene #{self._n_scene_resets}: env.reset()...",
+            flush=True,
+        )
         obs, _ = self.env.reset()
+        print("[IsaacG1Wrapper] env.reset() done", flush=True)
 
         use_path_obs = bool(getattr(self, "path_obstacle_layout", False)) or (
             str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp"
@@ -968,9 +1002,19 @@ class IsaacG1Wrapper:
                 getattr(self.camera.cfg, "update_period", 1.0 / 15.0) or (1.0 / 15.0)
             )
             warmup_steps = max(30, int(np.ceil(cam_period / max(self.sim_dt, 1e-6))) + 5)
-        for _ in range(warmup_steps):
+        print(
+            f"[IsaacG1Wrapper] RTX warmup {warmup_steps} sim steps "
+            f"(visual_mode={self.visual_mode})...",
+            flush=True,
+        )
+        for i in range(warmup_steps):
             self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands
             obs, _, _, _ = self.env.step(zero_actions)
+            if i == 0 or i + 1 == warmup_steps or (i + 1) % 10 == 0:
+                print(
+                    f"[IsaacG1Wrapper] RTX warmup {i + 1}/{warmup_steps}",
+                    flush=True,
+                )
 
         # Warp LiDAR meshes are static at spawn. Rebake after bins have been
         # teleported and PhysX/USD have been stepped, otherwise dual-bin l
@@ -1089,6 +1133,111 @@ class IsaacG1Wrapper:
                 best = d
         return best if np.isfinite(best) else float("nan")
 
+    def min_obstacle_xy_dist(self) -> float:
+        """Nearest active bin center in XY (meters). NaN if no obstacle."""
+        if not bool(getattr(self, "obstacle_present", True)):
+            return float("nan")
+        xys = getattr(self, "_obstacle_xy_list", None) or []
+        if not xys:
+            return float("nan")
+        robot_xy = self.get_robot_xy_local()
+        best = float("inf")
+        for p in xys:
+            d = float(np.hypot(float(p[0]) - float(robot_xy[0]), float(p[1]) - float(robot_xy[1])))
+            if d < best:
+                best = d
+        return best if np.isfinite(best) else float("nan")
+
+    def lidar_azimuth_count(self) -> int:
+        half = float(np.clip(getattr(self, "lidar_h_half_fov_deg", 90.0), 0.0, 180.0))
+        res = float(getattr(self, "lidar_horizontal_res_deg", 2.0))
+        return max(1, int(np.ceil((2.0 * half) / max(res, 1e-6))))
+
+    def lidar_scan_size(self) -> int:
+        """Expected ray count: channels × azimuths (Isaac LidarPattern flatten)."""
+        cached = getattr(self, "_lidar_n_rays", None)
+        if cached is not None:
+            return int(cached)
+        return int(getattr(self, "lidar_channels", 45)) * self.lidar_azimuth_count()
+
+    def _lower_body_joint_indices(self) -> np.ndarray:
+        cached = getattr(self, "_lower_body_joint_idx", None)
+        if cached is not None:
+            return cached
+        robot = self.env.unwrapped.scene["robot"]
+        names = getattr(robot, "joint_names", None)
+        if names is None:
+            names = robot.data.joint_names
+        names = list(names)
+        idx = []
+        missing = []
+        for name in G1_LOWER_BODY_JOINTS:
+            if name in names:
+                idx.append(int(names.index(name)))
+            else:
+                missing.append(name)
+        if missing:
+            raise KeyError(
+                f"G1 lower-body joints missing: {missing}. Available: {names}"
+            )
+        self._lower_body_joint_idx = np.asarray(idx, dtype=np.int64)
+        return self._lower_body_joint_idx
+
+    def get_lower_body_joint_pos(self) -> np.ndarray:
+        """12-D left/right hip–knee–ankle joint positions (radians)."""
+        robot = self.env.unwrapped.scene["robot"]
+        q = robot.data.joint_pos[0].detach().cpu().numpy()
+        return np.asarray(q[self._lower_body_joint_indices()], dtype=np.float32)
+
+    def get_lidar_range_scan(self) -> np.ndarray:
+        """Full lidar ranges in sensor order (meters): channels × azimuths.
+
+        Isaac ``LidarPattern`` flatten is (vertical channel, horizontal azim).
+        No min-pooling: all 45 elevation channels are kept. Miss / no
+        obstacle → ``lidar_profile_clip``. Multi-bin casters take per-ray min.
+        """
+        n = self.lidar_scan_size()
+        clip = float(getattr(self, "lidar_profile_clip", 6.0))
+        out = np.full((n,), clip, dtype=np.float32)
+        if not bool(getattr(self, "obstacle_present", True)):
+            return out
+
+        scene = self.env.unwrapped.scene
+        sensor_names = list(self._lidar_sensor_names)
+        if bool(getattr(self, "filter_lidar_to_active_obstacles", False)):
+            mapped = [
+                self._obstacle_lidar_names[name]
+                for name in self._active_obstacles
+                if name in getattr(self, "_obstacle_lidar_names", {})
+            ]
+            if not mapped:
+                return out
+            sensor_names = mapped
+        lidars = [scene[name] for name in sensor_names]
+        hits_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
+        n_rays = int(hits_list[0].shape[0])
+        self._lidar_n_rays = n_rays
+        if out.shape[0] != n_rays:
+            out = np.full((n_rays,), clip, dtype=np.float32)
+        origin = lidars[0].data.pos_w[0].detach().cpu().numpy()
+        max_d = float(getattr(lidars[0].cfg, "max_distance", 1e6))
+        _diff_w, ranges, _ranges_xy = merge_ray_hits_multi(origin, hits_list, max_d)
+        valid = (
+            np.isfinite(ranges)
+            & (ranges > 1e-4)
+            & (ranges < max_d * 0.999)
+        )
+        filled = np.where(valid, np.minimum(ranges, clip), clip)
+        return np.asarray(filled, dtype=np.float32).reshape(-1)
+
+    def get_lidar_joint_state(self) -> np.ndarray:
+        """Onboard observation: 12 joints ‖ full lidar ranges (normalized)."""
+        joints = self.get_lower_body_joint_pos()
+        scan = self.get_lidar_range_scan()
+        clip = float(getattr(self, "lidar_profile_clip", 6.0))
+        scan_n = np.clip(scan, 0.0, clip) / max(clip, 1e-6)
+        return np.concatenate([joints, scan_n], axis=0).astype(np.float32)
+
     def get_lidar_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
         # Despawned obstacle: ignore mesh hits entirely so l is not polluted.
         if not bool(getattr(self, "obstacle_present", True)):
@@ -1173,10 +1322,13 @@ class IsaacG1Wrapper:
     def get_safety_diagnostics(self) -> dict[str, float]:
         """Return LiDAR + contact fields for validation logging.
 
-        ``h_s`` is the continuous PyHJ avoid cost:
-        ``lidar_min_distance - lidar_distance_threshold`` (<0 unsafe, >0 safe).
-        If no valid hit in the forward cone (``lidar_h_half_fov_deg``),
-        set ``h_s = 2.0``.
+        ``h_s`` is the continuous PyHJ avoid cost (<0 unsafe, >0 safe).
+
+        - ``hs_mode=lidar`` (vision path): ``lidar_min - threshold``. No valid
+          hit in the forward cone → ``h_s = 2.0``.
+        - ``hs_mode=geom``: ``min_i ||xy_robot - xy_bin_i|| - threshold``.
+          No active obstacle → ``h_s = 2.0``. Not gated by the lidar cone.
+
         If ``include_contact_in_hs`` and a non-foot link hits (force above
         threshold), ``h_s = min(h_s, contact_hs)`` so contact is a failure
         label. Foot soles ``left/right_ankle_roll_link`` are ignored.
@@ -1185,19 +1337,28 @@ class IsaacG1Wrapper:
         contact = self.get_contact_collision()
         lidar_dist = self._last_lidar_stats.get("lidar_min_distance", float("nan"))
         lidar_xy = self._last_lidar_stats.get("lidar_min_distance_xy", float("nan"))
+        geom_xy = self.min_obstacle_xy_dist()
         lidar_unsafe = float(
             np.isfinite(lidar_dist) and lidar_dist < self.lidar_distance_threshold
         )
-        if np.isfinite(lidar_dist):
-            h_s = float(lidar_dist - self.lidar_distance_threshold)
+        hs_mode = str(getattr(self, "hs_mode", "lidar")).lower()
+        if hs_mode == "geom":
+            if np.isfinite(geom_xy):
+                h_s = float(geom_xy - self.lidar_distance_threshold)
+            else:
+                h_s = 2.0
         else:
-            # Forward cone clear / no hit: fixed safe margin for HJ (not NaN).
-            h_s = 2.0
+            if np.isfinite(lidar_dist):
+                h_s = float(lidar_dist - self.lidar_distance_threshold)
+            else:
+                # Forward cone clear / no hit: fixed safe margin for HJ (not NaN).
+                h_s = 2.0
         if bool(getattr(self, "include_contact_in_hs", False)) and float(contact) > 0.5:
             h_s = min(h_s, float(self.contact_hs))
         return {
             "lidar_min_distance": float(lidar_dist),
             "lidar_min_distance_xy": float(lidar_xy),
+            "lidar_geom_xy": float(geom_xy) if np.isfinite(geom_xy) else float("nan"),
             "contact_collision": float(contact),
             "lidar_unsafe": lidar_unsafe,
             "h_s": h_s,
@@ -1247,7 +1408,13 @@ class IsaacG1Wrapper:
             )
 
         if self.visual_mode == "rtx_rgb":
+            log_rtx = not self._logged_first_rtx
+            if log_rtx:
+                print("[IsaacG1Wrapper] reading first RTX RGB...", flush=True)
             visual = self._read_rtx_rgb_hwc()
+            if log_rtx:
+                print("[IsaacG1Wrapper] first RTX RGB ok", flush=True)
+                self._logged_first_rtx = True
         elif self.visual_mode == "depth_rgb":
             scene = self.env.unwrapped.scene
             depth_list = [

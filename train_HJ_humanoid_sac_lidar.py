@@ -1,7 +1,12 @@
-"""SAC HJ safety-filter training on Isaac G1 latent space (start-goal path layout).
+"""SAC HJ safety-filter on G1 joints + full lidar scan (path layout).
 
-Separate from ``train_HJ_humanoid_sac.py`` (aisle / hemisphere / left-right).
-Do not use this file as a drop-in replacement for the original pipeline.
+Separate from ``train_HJ_humanoid_sac_path.py`` (DINO visual latent).
+Same start-goal-perp layout / collect / late-fusion critic, but:
+
+  state  = 12 joints and full lidar, each encoded to 256 then cat to 512 z
+  critic = late-fuse z=512 with a encoded to 512
+  h_s    = min_i ||xy_robot - xy_bin_i|| - danger_radius  (privileged geometry)
+  no DINO world model
 
 Layout:
   each episode samples start + goal inside the arena rectangle
@@ -9,15 +14,8 @@ Layout:
   perpendicular to the start-goal segment, ordered near-start then near-goal.
   Hitting the rectangle edge resets; that transition is not stored for updates.
 
-  h_s = lidar_min - 1.5; non-foot contact also labels failure (l <= -1.5).
+  Non-foot contact also labels failure (l <= -1.5).
   Foot soles left/right_ankle_roll_link are ignored. Yaw action in [-1, 1].
-  Blue-bin placement is still the original fixed (3.5, -2) until specified.
-
-  Default critic is LateFusionCritic: z and a each through an MLP to the
-  same width, then concat and a Q head (patch-token z, ~73k-D).
-  Optional ``--visual_feature cls --critic_fusion concat``: DINOv2 CLS (384)
-  concatenated with the 3-D action at the first Linear. Default flags
-  keep the late-fusion patch pipeline unchanged.
 """
 
 import argparse
@@ -37,14 +35,42 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("SAC HJ on DINO latent Humanoid (start-goal path)")
+parser = argparse.ArgumentParser("SAC HJ on lidar+joints Humanoid (start-goal path)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
+parser.add_argument(
+    "--obs_mode",
+    type=str,
+    default="lidar_joint",
+    choices=["lidar_joint"],
+    help="Onboard state: 12-D legs concat full lidar ranges (all 45 channels).",
+)
+parser.add_argument(
+    "--hs_mode",
+    type=str,
+    default="geom",
+    choices=["geom", "lidar"],
+    help="HJ label: geom = XY dist to bin minus danger radius; lidar = ray min.",
+)
+parser.add_argument(
+    "--critic-net",
+    type=int,
+    nargs="*",
+    default=[256],
+    help="Lidar-stream MLP widths; last width is the 256-D stream. Default one layer.",
+)
+parser.add_argument(
+    "--control-net",
+    type=int,
+    nargs="*",
+    default=[256],
+    help="Actor lidar-stream MLP widths. Default one layer 256.",
+)
 parser.add_argument(
     "--dino_ckpt_dir",
     type=str,
     default="/workspace",
-    help="Parent dir of the WM run folder (joins with --dino_encoder)",
+    help="Unused in this pipeline (kept so leftover CLI flags do not error).",
 )
 parser.add_argument(
     "--config",
@@ -62,26 +88,6 @@ parser.add_argument(
     type=str,
     default="wm_ckpt_18-27-17",
     help="Encoder / WM run folder under dino_ckpt_dir",
-)
-parser.add_argument(
-    "--visual_feature",
-    type=str,
-    default="patch",
-    choices=["patch", "cls"],
-    help=(
-        "Visual tokens in z. 'patch' = all DINOv2 patch tokens (default). "
-        "'cls' = DINOv2 CLS only (384-D); does not retrain the WM."
-    ),
-)
-parser.add_argument(
-    "--critic_fusion",
-    type=str,
-    default="late",
-    choices=["late", "concat"],
-    help=(
-        "'late': encode z and a separately then fuse (default). "
-        "'concat': cat(z, a) into the first Linear (use with CLS)."
-    ),
 )
 parser.add_argument("--latent_h", default=False, action="store_true")
 parser.add_argument(
@@ -144,16 +150,15 @@ parser.add_argument(
     "--lidar_distance_threshold",
     type=float,
     default=1.5,
-    help="h_s = lidar_min - this (meters).",
+    help="Danger radius (m). geom h_s = min XY dist to bin − this.",
 )
 parser.add_argument(
     "--lidar_h_half_fov_deg",
     type=float,
     default=60.0,
     help=(
-        "Half-width (deg) of the forward cone used for l/h_s. "
-        "Inside ±this, l is the true min range; outside, l=2.0. "
-        "Default 60 → 120° FOV (camera-visible). Aisle pipeline keeps 90."
+        "Half-width (deg) of the onboard lidar profile (±this at 2°). "
+        "Lidar horizontal half-FOV (deg). Default 60 → ~60 azimuths × 45 channels."
     ),
 )
 parser.add_argument(
@@ -396,7 +401,6 @@ import numpy as np
 import torch
 import yaml
 import wandb
-from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
 from PyHJ.data import Batch, Collector, VectorReplayBuffer
@@ -404,9 +408,12 @@ from PyHJ.trainer import offpolicy_trainer
 from PyHJ.trainer.offpolicy import OffpolicyTrainer
 from PyHJ.env import DummyVectorEnv
 from PyHJ.utils import WandbLogger
-from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import ActorProb
 from PyHJ.policy import avoid_SACPolicy_annealing
+from env.isaac.lidar_joint_nets import (
+    make_dual_stream_actor_net,
+    make_dual_stream_critic,
+)
 
 _PROGRESS_BAR_LOSS_KEYS = ("loss/actor", "loss/critic1", "loss/critic2")
 
@@ -422,11 +429,9 @@ def _log_update_data_bar_filter(self, data, losses):
 
 OffpolicyTrainer.log_update_data = _log_update_data_bar_filter  # type: ignore[method-assign]
 
-from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 from env.isaac.skip_update_buffer import SkipUpdateReplayBuffer
 from env.isaac.ckpt_utils import save_epoch_checkpoint
-from env.isaac.late_fusion_critic import make_q_critic
 
 
 def args_type(default):
@@ -487,16 +492,18 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
         policy.load_state_dict(state, strict=True)
     except RuntimeError as exc:
         raise RuntimeError(
-            "Failed to load checkpoint: critic architecture mismatch. "
-            "Late-fusion (z_mlp/a_mlp) and concat (preprocess cat(z,a)) "
-            "weights are not interchangeable; also match --visual_feature "
-            f"(patch vs cls). Path: {ckpt_path}"
+            "Failed to load checkpoint into LateFusionCritic. Old early-concat "
+            "SAC path weights (cat(z, a) at the first Linear) are incompatible "
+            f"— start a new run, do not --resume_policy. Path: {ckpt_path}"
         ) from exc
     print(f"[INFO] Resumed policy from {ckpt_path}")
 
 
 def main():
     args = get_args_and_merge_config()
+    # YAML critic-net is 512 for the visual pipeline; keep the lidar CLI defaults.
+    args.critic_net = list(args_cli.critic_net)
+    args.control_net = list(args_cli.control_net)
 
     args.critic_lr = float(args.critic_lr)
     args.actor_lr = float(args.actor_lr)
@@ -511,20 +518,9 @@ def main():
     args.total_episodes = int(args.total_episodes)
     args.batch_size_pyhj = int(args.batch_size_pyhj)
     args.buffer_size = int(args.buffer_size)
-    args.dino_ckpt_dir = os.path.join(args.dino_ckpt_dir, args.dino_encoder)
+    args.obs_mode = str(getattr(args, "obs_mode", "lidar_joint"))
+    args.hs_mode = str(getattr(args, "hs_mode", "geom"))
     args.device = torch_device
-    args.visual_feature = str(getattr(args, "visual_feature", "patch")).lower()
-    args.critic_fusion = str(getattr(args, "critic_fusion", "late")).lower()
-    if args.visual_feature == "patch" and args.critic_fusion == "concat":
-        print(
-            "[WARN] critic_fusion=concat with patch z (~73k-D) will hide the "
-            "3-D action; use --critic_fusion late or --visual_feature cls."
-        )
-    if args.visual_feature == "cls" and args.critic_fusion == "late":
-        print(
-            "[INFO] CLS z with late fusion; pass --critic_fusion concat to "
-            "cat(CLS, action) at the first Linear."
-        )
     use_auto_alpha = bool(args.auto_alpha) and not bool(args.no_auto_alpha)
     if bool(getattr(args, "no_skip_arena_oob_from_buffer", False)):
         args.skip_arena_oob_from_buffer = False
@@ -557,17 +553,15 @@ def main():
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
-    run_tag = "sac-path"
-    if args.visual_feature == "cls" or args.critic_fusion == "concat":
-        run_tag = f"sac-path-{args.visual_feature}-{args.critic_fusion}"
+    run_tag = "sac-lidar"
     resume_epoch_for_name = 0
     if args.resume_policy:
         resume_epoch_for_name = _parse_resume_epoch_from_path(args.resume_policy)
-    run_name = f"{run_tag}-{args.dino_encoder}-{timestamp}"
+    run_name = f"{run_tag}-{timestamp}"
     if args.resume_policy:
         run_name = f"{run_name}-resume{resume_epoch_for_name}"
     wandb.init(
-        project="sac-hj-latent-humanoid",
+        project="sac-hj-lidar-humanoid",
         name=run_name,
         config=vars(args),
     )
@@ -579,39 +573,24 @@ def main():
     wandb.define_metric("loss/*", step_metric="trainer/env_step")
     wandb.define_metric("train/*", step_metric="trainer/env_step")
     wandb.define_metric("switch/*", step_metric="trainer/env_step")
-    tb_dir = f"runs/sac_hj_humanoid_path/{run_name}/logs"
+    tb_dir = f"runs/sac_hj_humanoid_lidar/{run_name}/logs"
     writer = SummaryWriter(log_dir=tb_dir)
     wb_logger = WandbLogger(update_interval=1, train_interval=10**9, test_interval=10**9)
     wb_logger.load(writer)
     logger = wb_logger
 
-    ckpt_dir = Path(args.dino_ckpt_dir)
-    hydra_cfg = ckpt_dir / "hydra.yaml"
-    snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
-    if not hydra_cfg.is_file():
-        raise FileNotFoundError(
-            f"WM hydra.yaml not found: {hydra_cfg}\n"
-            f"  Use --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17"
-        )
-    if not snapshot.is_file():
-        raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
-    print(f"[INFO] Loading WM from {ckpt_dir}")
     print(
-        f"[INFO] visual_feature={args.visual_feature} "
-        f"critic_fusion={args.critic_fusion}"
+        f"[INFO] lidar+joints SAC: obs_mode={args.obs_mode} hs_mode={args.hs_mode} "
+        f"critic_net={args.critic_net} control_net={args.control_net}"
     )
-    train_cfg = OmegaConf.load(str(hydra_cfg))
-    wm = load_model(snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device)
-    for p in wm.parameters():
-        p.requires_grad = True
 
     def make_env():
         return LatentHumanoidEnv(
             args,
-            wm,
+            None,
             args.device,
             args_cli,
-            with_proprio=args.with_proprio,
+            with_proprio=False,
             latent_h=args.latent_h,
             wandb_video_every=args.wandb_video_every,
         )
@@ -625,6 +604,10 @@ def main():
     action_space = train_envs.action_space[0]
     state_shape = state_space.shape
     action_shape = action_space.shape or action_space.n
+    print(
+        f"[INFO] state_shape={state_shape} action_shape={action_shape} "
+        f"(12 joints + {int(np.prod(state_shape)) - 12} lidar rays)"
+    )
     import gym
 
     policy_action_space = gym.spaces.Box(
@@ -634,8 +617,7 @@ def main():
     )
 
     def _make_critic():
-        critic = make_q_critic(
-            args.critic_fusion,
+        critic = make_dual_stream_critic(
             state_shape,
             action_shape,
             hidden_sizes=args.critic_net,
@@ -650,7 +632,7 @@ def main():
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
 
-    actor_net = Net(
+    actor_net = make_dual_stream_actor_net(
         state_shape,
         hidden_sizes=args.control_net,
         activation=getattr(torch.nn, args.actor_activation),
@@ -1339,7 +1321,7 @@ def main():
         policy.train(was_training)
         print("[INFO] Actor BC warmup done.")
 
-    log_path = Path(f"runs/sac_hj_humanoid_path/{run_name}")
+    log_path = Path(f"runs/sac_hj_humanoid_lidar/{run_name}")
     print(f"[INFO] Training epochs {start_epoch}..{end_epoch}; ckpts -> {log_path}")
     switch_traj_dir = log_path / "switch_traj"
     switch_traj_dir.mkdir(parents=True, exist_ok=True)

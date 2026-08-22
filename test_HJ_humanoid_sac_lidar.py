@@ -1,29 +1,12 @@
-"""Test SAC path-pipeline HJ safety filter on Isaac G1 latent humanoid.
+"""Test SAC lidar+joints HJ safety filter on Isaac G1 (path layout).
 
-Each trial freezes one start–goal–perp scene and runs three controllers
-  - waypoint_only
-  - safe_only (SF only)
-  - switching (Q-gate)
-then writes 3 videos + one overlay top-down PNG.
-
-Layout matches training: start + 2 perpendicular vias + goal.
-Obstacles: 0 or 1 bin (never two). When a bin is present, the third
-waypoint (trans2) is sampled inside the bin's danger disk (r=1.5).
-``--easy``: straight aisle start(0,-2)r=1 → wp2(2,-2)r=1.5 → wp3
-within 1 m of the fixed bin (4.5,-2) → goal(5.5,-2)r=1.
-Custom layout (all four waypoints required; bin optional)::
-
-  --start_xy 0,-2 --via1_xy 2,-2 --via2_xy 4,-1 --goal_xy 5.5,-2 --bin_xy 4.5,-2
+Matches ``train_HJ_humanoid_sac_lidar.py``: no DINO WM; state is 12-D
+legs plus full lidar ranges; ``h_s`` is geometric XY distance to the bin.
 
 Usage::
 
-  python test_HJ_humanoid_sac_path.py --headless --visual_mode rtx_rgb \\
-    --dino_ckpt_dir /workspace --dino_encoder wm_ckpt_18-27-17 --with_proprio \\
-    --policy_path runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
-
-CLS + concat critic (must match training)::
-
-    --visual_feature cls --critic_fusion concat --policy_path ...
+  python test_HJ_humanoid_sac_lidar.py --headless --visual_mode rtx_rgb \\
+    --policy_path runs/sac_hj_humanoid_lidar/.../epoch_id_N/policy.pth
 """
 
 from __future__ import annotations
@@ -60,25 +43,35 @@ EASY_BIN_XY = (4.5, -2.0)
 EASY_GOAL_REGION = {"center": (5.5, -2.0), "r": 1.0}
 EASY_WP3_MAX_DIST = 1.0
 
-parser = argparse.ArgumentParser("Test SAC HJ filter on path-layout Humanoid")
+parser = argparse.ArgumentParser("Test SAC HJ lidar+joints filter on path-layout Humanoid")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
+parser.add_argument(
+    "--obs_mode",
+    type=str,
+    default="lidar_joint",
+    choices=["lidar_joint"],
+)
+parser.add_argument(
+    "--hs_mode",
+    type=str,
+    default="geom",
+    choices=["geom", "lidar"],
+)
+parser.add_argument(
+    "--critic-net",
+    type=int,
+    nargs="*",
+    default=[256],
+)
+parser.add_argument(
+    "--control-net",
+    type=int,
+    nargs="*",
+    default=[256],
+)
 parser.add_argument("--dino_ckpt_dir", type=str, default="/workspace")
 parser.add_argument("--dino_encoder", type=str, default="wm_ckpt_18-27-17")
-parser.add_argument(
-    "--visual_feature",
-    type=str,
-    default="patch",
-    choices=["patch", "cls"],
-    help="Must match training: 'patch' (default) or 'cls'.",
-)
-parser.add_argument(
-    "--critic_fusion",
-    type=str,
-    default="late",
-    choices=["late", "concat"],
-    help="Must match training: 'late' (default) or 'concat'.",
-)
 parser.add_argument("--config", type=str, default="train_HJ_configs.yaml")
 parser.add_argument("--with_proprio", action="store_true")
 parser.add_argument(
@@ -231,20 +224,20 @@ import gym
 import numpy as np
 import torch
 import yaml
-from omegaconf import OmegaConf
 
 from PyHJ.policy import avoid_SACPolicy_annealing
-from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import ActorProb
 
-from wm_load import load_model
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 from env.isaac.waypoint_utils import (
     _point_in_rect,
     sample_point_in_region,
     sample_start_goal_perp_path,
 )
-from env.isaac.late_fusion_critic import make_q_critic
+from env.isaac.lidar_joint_nets import (
+    make_dual_stream_actor_net,
+    make_dual_stream_critic,
+)
 from env.isaac.switch_traj_plot import _plot_colored_traj
 
 
@@ -324,8 +317,7 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
     )
 
     def _make_critic():
-        critic = make_q_critic(
-            getattr(args, "critic_fusion", "late"),
+        critic = make_dual_stream_critic(
             state_shape,
             action_shape,
             hidden_sizes=args.critic_net,
@@ -337,7 +329,7 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
 
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
-    actor_net = Net(
+    actor_net = make_dual_stream_actor_net(
         state_shape,
         hidden_sizes=args.control_net,
         activation=getattr(torch.nn, args.actor_activation),
@@ -393,26 +385,17 @@ def resolve_policy_path(ckpt_path: str | Path) -> Path:
     )
 
 
-def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str, critic_fusion: str = "late") -> None:
+def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     ckpt_path = resolve_policy_path(ckpt_path)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     missing, unexpected = policy.load_state_dict(state, strict=False)
-    fusion = str(critic_fusion).lower()
-    late_missing = [k for k in missing if "critic" in k and "z_mlp" in k]
-    concat_as_late = any("preprocess" in k for k in unexpected)
-    late_as_concat = any("z_mlp" in k for k in unexpected) or any(
-        "preprocess" in k and "critic" in k for k in missing
-    )
-    if fusion == "late" and (late_missing or concat_as_late):
+    critic_missing = [k for k in missing if "critic" in k and "z_mlp" in k]
+    old_concat = any("preprocess" in k for k in unexpected)
+    if critic_missing or old_concat:
         raise RuntimeError(
-            "This checkpoint is concat critic (cat(z, a)), not LateFusionCritic. "
-            "Pass --critic_fusion concat --visual_feature cls (matching training). "
-            f"missing={len(missing)} unexpected={len(unexpected)}"
-        )
-    if fusion == "concat" and late_as_concat:
-        raise RuntimeError(
-            "This checkpoint is LateFusionCritic, not concat. "
-            "Drop --critic_fusion concat (default late + patch). "
+            "This checkpoint is the old early-concat critic (cat(z, a) at the "
+            "first Linear). LateFusionCritic cannot load it — retrain with "
+            "train_HJ_humanoid_sac_path.py. "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
     if missing:
@@ -1224,20 +1207,14 @@ def simulate_one(
 
 def main():
     args = get_args_and_merge_config()
+    args.critic_net = list(args_cli.critic_net)
+    args.control_net = list(args_cli.control_net)
     _validate_custom_layout_args(args)
     args.policy_path = str(resolve_policy_path(args.policy_path))
     args.device = torch_device
-    args.dino_ckpt_dir = os.path.join(args.dino_ckpt_dir, args.dino_encoder)
-    args.visual_feature = str(getattr(args, "visual_feature", "patch")).lower()
-    args.critic_fusion = str(getattr(args, "critic_fusion", "late")).lower()
+    args.obs_mode = str(getattr(args, "obs_mode", "lidar_joint"))
+    args.hs_mode = str(getattr(args, "hs_mode", "geom"))
     save_video = bool(args.save_video) and not bool(args.no_save_video)
-
-    look_ahead = bool(getattr(args, "look_ahead", False))
-    if look_ahead and args.visual_feature == "cls":
-        raise ValueError(
-            "--look_ahead is incompatible with --visual_feature cls "
-            "(WM predictor is patch-token only)."
-        )
 
     np.random.seed(int(getattr(args, "seed", 0)))
     torch.manual_seed(int(getattr(args, "seed", 0)))
@@ -1246,46 +1223,36 @@ def main():
 
     stamp = datetime.now().strftime("%m%d_%H%M%S")
     out_dir = (
-        Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac_path") / stamp
+        Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac_lidar") / stamp
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     modes = list(COMPARE_MODES) if args.mode == "compare" else [args.mode]
+    look_ahead = bool(getattr(args, "look_ahead", False))
+    if look_ahead:
+        raise ValueError("look_ahead needs the DINO WM; not supported in lidar+joints test.")
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] modes={modes} policy={args.policy_path}")
     print(
-        f"[INFO] visual_feature={args.visual_feature} "
-        f"critic_fusion={args.critic_fusion}"
+        f"[INFO] obs_mode={args.obs_mode} hs_mode={args.hs_mode} "
+        f"critic_net={args.critic_net}"
     )
     print(
         "[INFO] look_ahead="
         f"{look_ahead} (gate={'V(z_t+1)' if look_ahead else 'Q(z_t, a_nom)'})"
     )
 
-    ckpt_dir = Path(args.dino_ckpt_dir)
-    hydra_cfg = ckpt_dir / "hydra.yaml"
-    snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
-    if not hydra_cfg.is_file():
-        raise FileNotFoundError(f"WM hydra.yaml not found: {hydra_cfg}")
-    train_cfg = OmegaConf.load(str(hydra_cfg))
-    wm = load_model(snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device)
-    wm.eval()
-    for p in wm.parameters():
-        p.requires_grad = False
-
     env = LatentHumanoidEnv(
         args,
-        wm,
+        None,
         args.device,
         args_cli,
-        with_proprio=bool(args.with_proprio),
+        with_proprio=False,
         latent_h=False,
         wandb_video_every=0,
     )
     configure_path_eval(env, args)
     policy = build_policy(env, args, args.device)
-    load_policy_checkpoint(
-        policy, args.policy_path, args.device, critic_fusion=args.critic_fusion
-    )
+    load_policy_checkpoint(policy, args.policy_path, args.device)
     env.policy_for_log = policy
     env.log_rollout_to_wandb = False
 
