@@ -16,13 +16,20 @@ from env.isaac.waypoint_utils import (
     DEFAULT_ARENA_BOUNDS,
     DEFAULT_DANGER_RADIUS_M,
     DEFAULT_MIN_START_GOAL_DIST,
+    DEFAULT_N_FREE_WAYPOINTS,
     DEFAULT_PERP_OFFSET_M,
+    DEFAULT_START_GOAL_REGION_R,
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
+    DEFAULT_VIA_REGION_R,
+    LAYOUT_BIN_SIDE_DISK,
+    LAYOUT_START_GOAL_PERP,
     PASS_SIDE_CYCLE,
     PASS_SIDE_TRAIN,
     compute_perp_sidestep_xy,
     generate_random_waypoint_sequence,
+    is_path_waypoint_layout,
+    sample_bin_side_disk_episode,
     sample_point_in_half_disk,
     sample_point_in_region,
     sample_perp_points_on_segment,
@@ -167,7 +174,7 @@ class IsaacG1Wrapper:
         env_prim_root: str = "/World/envs/env_0",
         lidar_distance_threshold: float = 1.0,
         collision_force_threshold: float = 0.1,
-        stuck_contact_steps: int = 50,
+        stuck_contact_steps: int = 300,
         waypoint_stop_thresh: float = 0.1,
         # Soft corridor about aisle centerline y_center (waypoints/bin at y=-2).
         y_bound: float = 0.0,
@@ -235,11 +242,14 @@ class IsaacG1Wrapper:
         # Optional: fold non-foot contact into h_s / l. Path default is LiDAR-only.
         self.include_contact_in_hs = False
         self.contact_hs = -1.5
-        # Hold a_good sidestep target this many HJ steps after first HJ<0.
+        # Hold G this many HJ<0 steps then refresh. <=0: hold until HJ>=0, no refresh.
         self.sidestep_hold_steps = 20
         self._sidestep_xy: np.ndarray | None = None
         self._sidestep_hold = 0
-        self.stuck_contact_steps = int(stuck_contact_steps)
+        self._held_a_good: np.ndarray | None = None
+        self.stuck_contact_steps = int(
+            getattr(args_cli, "stuck_contact_steps", stuck_contact_steps)
+        )
         self.waypoint_stop_thresh = float(waypoint_stop_thresh)
         # If True, geometrically passing the last waypoint also completes it
         # (needed for switch-collect train: pass-side left|right is the goal).
@@ -256,15 +266,21 @@ class IsaacG1Wrapper:
         self.arena_x_max = float(DEFAULT_ARENA_BOUNDS[1])
         self.arena_y_min = float(DEFAULT_ARENA_BOUNDS[2])
         self.arena_y_max = float(DEFAULT_ARENA_BOUNDS[3])
-        # "regions" = original start/front/left|right. "start_goal_perp" = new path.
+        # "regions" = original start/front/left|right.
+        # "start_goal_perp" = start + 2 perp vias + goal.
+        # "bin_side_disk" = start/goal disks + one bin-side via disk.
         self.waypoint_layout = "regions"
         self.perp_offset = float(DEFAULT_PERP_OFFSET_M)
         self.min_start_goal_dist = float(DEFAULT_MIN_START_GOAL_DIST)
+        self.start_goal_region_r = float(DEFAULT_START_GOAL_REGION_R)
+        self.via_region_r = float(DEFAULT_VIA_REGION_R)
+        self.n_free_waypoints = int(DEFAULT_N_FREE_WAYPOINTS)
         self.arena_sample_margin = 0.5
         self._spawn_yaw: float | None = None
+        self._layout_obstacle_xys: list[np.ndarray] = []
         # Env-space velocity clip. Original pipeline: yaw in [-0.5, 0.5].
-        self.action_low = np.array([0.0, -0.5, -0.5], dtype=np.float32)
-        self.action_high = np.array([0.8, 0.5, 0.5], dtype=np.float32)
+        self.action_low = np.array([0.0, -1.0, -0.5], dtype=np.float32)
+        self.action_high = np.array([1.0, 1.0, 0.5], dtype=np.float32)
         # Copy defaults (start disk r=1, front disk r=0.5, left|right r=0.5, middle point).
         if trajectory_regions is not None:
             self.trajectory_regions = trajectory_regions
@@ -384,10 +400,11 @@ class IsaacG1Wrapper:
         env_cfg.decimation = 1
         env_cfg.sim.render_interval = 1
         env_cfg.terminations.base_contact = None
+        # Green velocity-command arrow sits above the head and can enter RTX RGB
+        # when the torso pitches (e.g. nom-action noise). Keep it out of DINO.
+        env_cfg.commands.base_velocity.debug_vis = False
 
-        use_path_spawn = bool(getattr(args_cli, "path_obstacle_layout", False)) or (
-            str(getattr(args_cli, "waypoint_layout", "regions")) == "start_goal_perp"
-        )
+        use_path_spawn = self._is_path_pipeline(args_cli=args_cli)
         for i, name in enumerate(self._obstacle_names):
             spec = self._obstacle_specs[name]
             # Path layout teleports bins every reset onto the start–goal
@@ -575,6 +592,21 @@ class IsaacG1Wrapper:
         self._set_obstacle_pose(name, pos)
         return pos
 
+    def _is_path_pipeline(self, args_cli: Any | None = None) -> bool:
+        """True for start-goal arena layouts (perp vias or bin-side disks)."""
+        src = args_cli if args_cli is not None else self
+        layout = str(
+            getattr(src, "waypoint_layout", getattr(self, "waypoint_layout", "regions"))
+        )
+        path_obs = bool(
+            getattr(
+                src,
+                "path_obstacle_layout",
+                getattr(self, "path_obstacle_layout", False),
+            )
+        )
+        return is_path_waypoint_layout(layout) or path_obs
+
     def _choose_n_path_obstacles(self, rng: np.random.Generator) -> int:
         absent_p = float(self.obstacle_absent_prob)
         if absent_p > 0.0 and float(rng.random()) < absent_p:
@@ -653,9 +685,33 @@ class IsaacG1Wrapper:
         - ``spawn_hemisphere_pass=True`` (formal train only): alternate spawn
           half-disk coupled to matching left/right (no front/middle).
         - ``waypoint_layout="start_goal_perp"``: start + 2 perp vias + goal.
+        - ``waypoint_layout="bin_side_disk"``: start/goal disks + one via disk
+          beside a single bin, or 6 free arena waypoints when the bin is absent.
         """
         self._spawn_yaw = None
-        if str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp":
+        self._layout_obstacle_xys = []
+        layout = str(getattr(self, "waypoint_layout", "regions"))
+        if layout == LAYOUT_BIN_SIDE_DISK:
+            sampled = sample_bin_side_disk_episode(
+                rng,
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+                min_start_goal_dist=float(self.min_start_goal_dist),
+                box_perp_offset=float(self.perp_offset),
+                start_goal_region_r=float(self.start_goal_region_r),
+                via_region_r=float(self.via_region_r),
+                absent_prob=float(self.obstacle_absent_prob),
+                n_free_waypoints=int(self.n_free_waypoints),
+            )
+            self._spawn_yaw = float(sampled["spawn_yaw"])
+            self._layout_obstacle_xys = [
+                np.asarray(p, dtype=np.float64).reshape(2).copy()
+                for p in sampled["obstacle_xys"]
+            ]
+            return sampled["waypoints"], list(sampled["names"])
+        if layout == LAYOUT_START_GOAL_PERP:
             wps, names, spawn_yaw = sample_start_goal_perp_path(
                 rng,
                 x_min=float(self.arena_x_min),
@@ -856,9 +912,7 @@ class IsaacG1Wrapper:
         if seed is not None:
             # Path layout: do not reseed from yaml train seed=0, or every
             # bash run repeats the same buffer trajectories.
-            use_path = bool(getattr(self, "path_obstacle_layout", False)) or (
-                str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp"
-            )
+            use_path = self._is_path_pipeline()
             if not use_path:
                 self._rng = np.random.default_rng(seed)
 
@@ -866,6 +920,7 @@ class IsaacG1Wrapper:
         self._n_scene_resets = int(self._n_scene_resets) + 1
         self._sidestep_xy = None
         self._sidestep_hold = 0
+        self._held_a_good = None
 
         print(
             f"[IsaacG1Wrapper] reset_scene #{self._n_scene_resets}: env.reset()...",
@@ -873,10 +928,16 @@ class IsaacG1Wrapper:
         )
         obs, _ = self.env.reset()
         print("[IsaacG1Wrapper] env.reset() done", flush=True)
+        # Isaac reset returns before PhysX/RTX have applied the new state.
+        # The next CUDA write_root_pose can look hung on Windows without this.
+        try:
+            sim = self.env.unwrapped.sim
+            if hasattr(sim, "forward"):
+                sim.forward()
+        except Exception:
+            pass
 
-        use_path_obs = bool(getattr(self, "path_obstacle_layout", False)) or (
-            str(getattr(self, "waypoint_layout", "regions")) == "start_goal_perp"
-        )
+        use_path_obs = self._is_path_pipeline()
 
         if fixed_layout is not None:
             self.waypoints = np.asarray(fixed_layout["waypoints"], dtype=np.float64).copy()
@@ -935,6 +996,12 @@ class IsaacG1Wrapper:
                 extra_n = int(fixed_layout.get("n_obstacles", len(extra_xy)))
                 if extra_n == 0:
                     extra_xy = []
+            elif str(getattr(self, "waypoint_layout", "regions")) == LAYOUT_BIN_SIDE_DISK:
+                extra_xy = [
+                    np.asarray(p, dtype=np.float64).reshape(2)
+                    for p in getattr(self, "_layout_obstacle_xys", [])
+                ]
+                extra_n = len(extra_xy)
             obstacle_positions = self._place_path_obstacles(
                 self._rng,
                 start_xy,
@@ -1478,20 +1545,29 @@ class IsaacG1Wrapper:
         return compute_perp_sidestep_xy(robot_xy, xys, **kwargs)
 
     def update_sidestep_cache(self, use_sf: bool) -> bool:
-        """Hold G for ``sidestep_hold_steps`` consecutive HJ<0 steps.
+        """Hold G while HJ<0. ``use_sf`` here means HJ(Q(a_nom))<0, not env gate.
 
-        First HJ<0 computes G. Recompute only after that many steps if still
-        HJ<0. Leaving HJ<0 clears the cache. Returns True if G was (re)computed.
+        First HJ<0 computes G. If ``sidestep_hold_steps`` <= 0, keep that G
+        until HJ>=0 (clears cache and frozen a_good). If > 0, also refresh G
+        every that many consecutive HJ<0 steps (legacy). Returns True iff G
+        was (re)computed this call.
         """
         if not use_sf:
             self._sidestep_xy = None
             self._sidestep_hold = 0
+            self._held_a_good = None
             return False
-        hold_n = max(1, int(getattr(self, "sidestep_hold_steps", 20)))
+        hold_n = int(getattr(self, "sidestep_hold_steps", 20))
+        if hold_n <= 0:
+            if self._sidestep_xy is None:
+                self._sidestep_xy = self.perp_sidestep_xy()
+                return True
+            return False
         refreshed = False
         if self._sidestep_xy is None or int(self._sidestep_hold) >= hold_n:
             self._sidestep_xy = self.perp_sidestep_xy()
             self._sidestep_hold = 0
+            self._held_a_good = None
             refreshed = True
         self._sidestep_hold = int(self._sidestep_hold) + 1
         return refreshed
@@ -1551,8 +1627,8 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        # HJ / env action: default vx in [0, 0.8]; vy in [-0.5, 0.5]; yaw in [-0.5, 0.5].
-        # Path pipeline may widen yaw via action_low/action_high.
+        # HJ / env action: vx in [0, 1]; vy in [-1, 1]; yaw from action_low/high
+        # (path pipeline may widen yaw via --yaw_limit).
         low = np.asarray(self.action_low, dtype=np.float32).reshape(-1)
         high = np.asarray(self.action_high, dtype=np.float32).reshape(-1)
         vx = float(np.clip(action[0], float(low[0]), float(high[0])))

@@ -72,7 +72,7 @@ exec "${ISAAC_PYTHON}" test_HJ_humanoid_sac_path.py \
   --lidar_distance_threshold 1.5 \
   --lidar_h_half_fov_deg 60 \
   --include_contact_in_hs \
-  --contact_hs -1.5 \
+  --contact_hs -2.5 \
   --yaw_limit 1.0 \
   --waypoint_layout start_goal_perp \
   --perp_offset 2.5 \

@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from PyHJ.utils.net.common import Net
-from PyHJ.utils.net.continuous import ActorProb
+from PyHJ.utils.net.continuous import ActorProb, Critic
 from env.isaac.late_fusion_critic import LateFusionCritic
 
 
@@ -39,28 +39,65 @@ def resolve_policy_path(p: str | Path) -> Path:
     raise FileNotFoundError(f"policy not found: {p}")
 
 
+def _strip_module(sd: dict, prefix: str) -> dict:
+    skip = prefix + "_old."
+    out = {}
+    for k, v in sd.items():
+        if k.startswith(skip) or not k.startswith(prefix + "."):
+            continue
+        out[k[len(prefix) + 1 :]] = v
+    return out
+
+
 def load_nets(ckpt: Path, device: str):
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
-    obs_dim = int(sd["critic1.z_mlp.model.0.weight"].shape[1])
-    act_dim = int(sd["critic1.a_mlp.model.0.weight"].shape[1])
     hidden = (512, 512, 512)
+    fusion = "late" if "critic1.z_mlp.model.0.weight" in sd else "concat"
+    if fusion == "late":
+        obs_dim = int(sd["critic1.z_mlp.model.0.weight"].shape[1])
+        act_dim = int(sd["critic1.a_mlp.model.0.weight"].shape[1])
 
-    def make_critic():
-        return LateFusionCritic(
-            obs_dim, act_dim, hidden_sizes=hidden, activation=torch.nn.ReLU, device=device
-        ).to(device)
+        def make_critic():
+            return LateFusionCritic(
+                obs_dim,
+                act_dim,
+                hidden_sizes=hidden,
+                activation=torch.nn.ReLU,
+                device=device,
+            ).to(device)
+
+    else:
+        w0 = sd["critic1.preprocess.model.model.0.weight"]
+        in_dim = int(w0.shape[1])
+        act_dim = 3
+        obs_dim = in_dim - act_dim
+
+        def make_critic():
+            net = Net(
+                obs_dim,
+                act_dim,
+                hidden_sizes=hidden,
+                activation=torch.nn.ReLU,
+                concat=True,
+                device=device,
+            )
+            return Critic(net, device=device).to(device)
 
     c1, c2 = make_critic(), make_critic()
-    c1.load_state_dict({k[len("critic1.") :]: v for k, v in sd.items() if k.startswith("critic1.") and not k.startswith("critic1_old.")})
-    c2.load_state_dict({k[len("critic2.") :]: v for k, v in sd.items() if k.startswith("critic2.") and not k.startswith("critic2_old.")})
+    c1.load_state_dict(_strip_module(sd, "critic1"), strict=True)
+    c2.load_state_dict(_strip_module(sd, "critic2"), strict=True)
     c1.eval()
     c2.eval()
 
-    actor_net = Net(obs_dim, hidden_sizes=hidden, activation=torch.nn.ReLU, device=device)
-    actor = ActorProb(actor_net, act_dim, max_action=1.0, unbounded=True, device=device).to(device)
-    actor.load_state_dict({k[len("actor1.") :]: v for k, v in sd.items() if k.startswith("actor1.") and not k.startswith("actor1_old.")})
+    actor_net = Net(
+        obs_dim, hidden_sizes=hidden, activation=torch.nn.ReLU, device=device
+    )
+    actor = ActorProb(
+        actor_net, act_dim, max_action=1.0, unbounded=True, device=device
+    ).to(device)
+    actor.load_state_dict(_strip_module(sd, "actor1"), strict=True)
     actor.eval()
-    return c1, c2, actor, obs_dim, act_dim, sd
+    return c1, c2, actor, obs_dim, act_dim, sd, fusion
 
 
 @torch.no_grad()
@@ -82,21 +119,29 @@ def main():
     device = args.device if torch.cuda.is_available() else "cpu"
     print(f"[INFO] ckpt={ckpt}")
     print(f"[INFO] device={device}")
-    c1, c2, actor, obs_dim, act_dim, sd = load_nets(ckpt, device)
-    print(f"[INFO] obs_dim={obs_dim} act_dim={act_dim}")
-    print("[INFO] critic is LateFusion: z_mlp + a_mlp (3->128->512) + q_head(1024->512->1)")
-
-    w_z = sd["critic1.q_head.model.0.weight"]  # (512, 1024)
-    rms_z_half = _rms(w_z[:, :512])
-    rms_a_half = _rms(w_z[:, 512:])
-    print(
-        f"[INFO] q_head first Linear RMS: z-half={rms_z_half:.4f} a-half={rms_a_half:.4f} "
-        f"ratio a/z={rms_a_half / max(rms_z_half, 1e-12):.3f}"
-    )
-    print(
-        f"[INFO] a_mlp[0] RMS={_rms(sd['critic1.a_mlp.model.0.weight']):.4f} "
-        f"z_mlp[0] RMS={_rms(sd['critic1.z_mlp.model.0.weight']):.6f}"
-    )
+    c1, c2, actor, obs_dim, act_dim, sd, fusion = load_nets(ckpt, device)
+    print(f"[INFO] obs_dim={obs_dim} act_dim={act_dim} fusion={fusion}")
+    if fusion == "late":
+        print("[INFO] critic is LateFusion: z_mlp + a_mlp + q_head")
+        w_z = sd["critic1.q_head.model.0.weight"]
+        rms_z_half = _rms(w_z[:, :512])
+        rms_a_half = _rms(w_z[:, 512:])
+        print(
+            f"[INFO] q_head first Linear RMS: z-half={rms_z_half:.4f} "
+            f"a-half={rms_a_half:.4f} ratio a/z={rms_a_half / max(rms_z_half, 1e-12):.3f}"
+        )
+    else:
+        w0 = sd["critic1.preprocess.model.model.0.weight"]
+        rms_z = _rms(w0[:, :obs_dim])
+        rms_a = _rms(w0[:, obs_dim:])
+        print(
+            "[INFO] critic is concat: first Linear sees cat(z, a) "
+            f"in={int(w0.shape[1])} (z={obs_dim} + a={act_dim})"
+        )
+        print(
+            f"[INFO] first Linear RMS: z-cols={rms_z:.4f} a-cols={rms_a:.4f} "
+            f"ratio a/z={rms_a / max(rms_z, 1e-12):.3f}"
+        )
 
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
@@ -177,7 +222,7 @@ def main():
     elif mean_range < 0.05:
         print("WEAK: Q moves with a, but only a little.")
     else:
-        print("OK: Q depends on a (late fusion is not ignoring the action).")
+        print("OK: Q depends on a (critic is not ignoring the action).")
 
 
 if __name__ == "__main__":

@@ -48,9 +48,10 @@ echo "[INFO] layout: start + 2 perp vias (±2.5m) + goal; arena x[-1,6] y[-4,2]"
 echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±2.5m (independent of vias)"
 echo "[INFO] collect: alternate waypoint / Q-gate switch each episode"
 echo "[INFO] buffer warmup 4000 waypoint steps then 4000 critic updates; buffer-size unchanged"
-echo "[INFO] λ_good=0 (no a_good MSE); pass --action_reg_coef >0 to enable"
-echo "[INFO] l/h_s: lidar d_min-1.5 in ±60° (120°) cone; outside cone l=2; +contact (non-foot → -1.5)"
-echo "[INFO] nom |v| resampled each waypoint visual step in [0.1, 0.9]"
+echo "[INFO] λ_good=0 (no a_good MSE); pass --action_reg_coef >0: HJ<0 any controller, freeze a_good until HJ>=0"
+echo "[INFO] l/h_s: lidar d_min-1.5 in ±60° (120°) cone; outside cone l=2; +contact (non-foot → -2.5)"
+echo "[INFO] nom |v| ~ U[0.05, 0.95] once per episode"
+echo "[INFO] nom (vx,vy,yaw) += N(0, σ) with σ~{0.05,0.2,0.4} once per episode; a_sf untouched"
 
 exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --headless \
@@ -69,7 +70,7 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --critic_warmup_updates 4000 \
   --actor_bc_warmup_updates 0 \
   --action_reg_coef 0 \
-  --a_good_hold_steps 20 \
+  --a_good_hold_steps 0 \
   --boundary_reg_coef 0.0 \
   --y_bound 0 \
   --use_arena_bounds \
@@ -81,10 +82,14 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --lidar_distance_threshold 1.5 \
   --lidar_h_half_fov_deg 60 \
   --include_contact_in_hs \
-  --contact_hs -1.5 \
+  --contact_hs -2.5 \
   --randomize_nom_speed \
-  --nom_speed_min 0.1 \
-  --nom_speed_max 0.9 \
+  --nom_speed_min 0.05 \
+  --nom_speed_max 0.95 \
+  --nom_speed_mean 0.5 \
+  --nom_speed_std 0.3 \
+  --nom_act_noise \
+  --nom_act_noise_stds 0.05,0.2,0.4 \
   --max_episode_steps 20000 \
   --yaw_limit 1.0 \
   --waypoint_layout start_goal_perp \

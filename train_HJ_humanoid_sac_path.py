@@ -173,7 +173,7 @@ parser.add_argument(
 parser.add_argument(
     "--contact_hs",
     type=float,
-    default=-1.5,
+    default=-2.5,
     help="l/h_s cap when a non-foot link is in contact (must be < 0).",
 )
 parser.add_argument(
@@ -259,22 +259,59 @@ parser.add_argument(
     "--randomize_nom_speed",
     action="store_true",
     help=(
-        "Each waypoint visual step samples controller |v| uniformly in "
-        "[--nom_speed_min, --nom_speed_max] (default [0.1, 0.9]). "
-        "Applies to waypoint a_nom only (not SF). Off: fixed max_speed (0.5)."
+        "Each episode samples controller |v| once from "
+        "Uniform[--nom_speed_min, --nom_speed_max] and holds it. a_nom only. "
+        "Off: fixed max_speed (0.5)."
     ),
 )
 parser.add_argument(
     "--nom_speed_min",
     type=float,
-    default=0.1,
-    help="Lower |v| when --randomize_nom_speed is on.",
+    default=0.05,
+    help="Lower bound of Uniform |v| when --randomize_nom_speed is on.",
 )
 parser.add_argument(
     "--nom_speed_max",
     type=float,
-    default=0.9,
-    help="Upper |v| when --randomize_nom_speed is on.",
+    default=0.95,
+    help="Upper bound of Uniform |v| when --randomize_nom_speed is on.",
+)
+parser.add_argument(
+    "--nom_speed_mean",
+    type=float,
+    default=0.5,
+    help="Gaussian mean of |v| when --randomize_nom_speed is on.",
+)
+parser.add_argument(
+    "--nom_speed_std",
+    type=float,
+    default=0.3,
+    help="Gaussian std of |v| when --randomize_nom_speed is on.",
+)
+parser.add_argument(
+    "--nom_act_noise",
+    action="store_true",
+    help=(
+        "After a_nom is computed (including |v| resample), add independent "
+        "N(0, σ) to vx, vy, yaw, then clip. a_nom only. σ is chosen once "
+        "per episode from --nom_act_noise_stds (else --nom_act_noise_std)."
+    ),
+)
+parser.add_argument(
+    "--nom_act_noise_std",
+    type=float,
+    default=0.2,
+    help="Fixed Gaussian std if --nom_act_noise_stds is empty.",
+)
+parser.add_argument(
+    "--nom_act_noise_stds",
+    type=str,
+    default="0.05,0.2,0.4",
+    help=(
+        "Comma-separated episode-wise σ for a_nom (vx,vy,yaw). Each episode "
+        "picks one uniformly, then every step uses N(0, σ). a_sf never. "
+        "Empty string: fall back to --nom_act_noise_std."
+    ),
 )
 parser.add_argument(
     "--buffer_warmup_steps",
@@ -303,21 +340,20 @@ parser.add_argument(
     type=float,
     default=0.0,
     help=(
-        "λ for MSE(a_sf, a_good) in policy space, only on switch steps "
-        "that executed the safety filter (HJ(Q(a_nom))<0). Waypoint-only "
-        "episodes and switch steps with HJ>=0 are not regularized. "
-        "a_good is a held perp-sidestep of the nearest obstacle: computed "
-        "on first HJ<0, then reused for --a_good_hold_steps (default 20) "
-        "HJ-steps before refresh. Default 0 (disabled)."
+        "λ for MSE(a_sf, a_good) in policy space whenever HJ(Q(a_nom))<0, "
+        "whether the env ran waypoint or the safety filter. HJ>=0: no "
+        "regularizer that step. a_good is the perp-sidestep action computed "
+        "on the first HJ<0 of a stretch and frozen until HJ>=0. Default 0 "
+        "(disabled)."
     ),
 )
 parser.add_argument(
     "--a_good_hold_steps",
     type=int,
-    default=20,
+    default=0,
     help=(
-        "Reuse the same waypoint_good for this many consecutive SF "
-        "(HJ<0) steps, then recompute if still HJ<0."
+        "<=0 (default): freeze a_good until HJ>=0. >0: legacy refresh of G "
+        "every this many consecutive HJ<0 steps."
     ),
 )
 parser.add_argument(
@@ -799,8 +835,12 @@ def main():
 
     def _batch_use_sf_weight(batch, act_ref: torch.Tensor) -> torch.Tensor:
         pol = getattr(batch, "policy", None)
-        use_sf = None if pol is None else getattr(pol, "use_sf", None)
         n = int(act_ref.shape[0])
+        use_sf = None
+        if pol is not None:
+            use_sf = getattr(pol, "use_good_reg", None)
+            if use_sf is None:
+                use_sf = getattr(pol, "use_sf", None)
         if use_sf is None:
             return act_ref.new_zeros(n)
         t = torch.as_tensor(use_sf, dtype=act_ref.dtype, device=act_ref.device).reshape(
@@ -835,7 +875,7 @@ def main():
         return q.detach().cpu().numpy().reshape(-1)
 
     def _mix_switch_act(act_sf, act_nom, use_sf: np.ndarray):
-        """Keep SF act where use_sf else a_nom. Matches act_sf type."""
+        """Keep raw SF act where use_sf else a_nom. Do not noise a_sf."""
         use_sf = np.asarray(use_sf, dtype=bool).reshape(-1)
         if isinstance(act_sf, torch.Tensor):
             act_nom_t = torch.as_tensor(
@@ -862,6 +902,39 @@ def main():
         flags_np = np.asarray(flags, dtype=bool).reshape(-1)
         for i, fn in enumerate(fns):
             fn(bool(flags_np[i] if i < flags_np.size else False))
+
+    def _frozen_act_good(n: int, hj_neg: np.ndarray, *, zero_yaw: bool) -> np.ndarray:
+        """Policy-space a_good: compute on first HJ<0, freeze until HJ>=0."""
+        out = np.zeros((n, 3), dtype=np.float32)
+        hj_neg = np.asarray(hj_neg, dtype=bool).reshape(-1)
+        if not np.any(hj_neg):
+            return out
+        held_list = train_envs.get_env_attr("held_a_good")
+        held0 = held_list[0] if held_list else None
+        if held0 is None:
+            acts = _safe_side_acts_policy(zero_yaw=zero_yaw)
+            held0 = np.asarray(acts, dtype=np.float32).reshape(-1, 3)[0]
+            train_envs.set_env_attr("held_a_good", held0.copy())
+        else:
+            held0 = np.asarray(held0, dtype=np.float32).reshape(3)
+        out[:] = held0.reshape(1, 3)
+        return out
+
+    def _attach_good_reg(pol_extra, obs, act_nom, n: int) -> None:
+        """If λ>0, regularize on HJ(Q(a_nom))<0 regardless of collect controller."""
+        if action_reg_coef <= 0.0:
+            _note_use_sf(False)
+            return
+        q_nom = getattr(pol_extra, "q_nom", None)
+        q_arr = None if q_nom is None else np.asarray(q_nom, dtype=np.float32).reshape(-1)
+        if q_arr is None or q_arr.size == 0 or not np.isfinite(q_arr).all():
+            q_arr = np.asarray(_q_nom_min(obs, act_nom), dtype=np.float32).reshape(-1)
+            pol_extra.q_nom = q_arr
+        hj_neg = q_arr < float(switch_threshold)
+        hj_neg = np.asarray(hj_neg, dtype=np.bool_).reshape(-1)
+        pol_extra.use_good_reg = hj_neg
+        _note_use_sf(hj_neg)
+        pol_extra.act_good = _frozen_act_good(n, hj_neg, zero_yaw=freeze_yaw)
 
     def _env_collect_controller() -> str:
         try:
@@ -894,15 +967,14 @@ def main():
             pol_extra = Batch(
                 act_nom=act_nom,
                 use_sf=use_sf_np,
+                use_good_reg=np.zeros((n,), dtype=np.bool_),
                 act_good=zeros_good,
                 q_nom=np.full((n,), np.nan, dtype=np.float32),
             )
             mode = _env_collect_controller()
             if mode == "waypoint":
                 out.act = _as_act_like(out.act, act_nom)
-                policy.last_q_nom = None
                 policy.last_switch_use_sf = 0.0
-                _note_use_sf(False)
             elif mode == "switch":
                 q_nom = _q_nom_min(batch[input], act_nom)
                 use_sf = q_nom < switch_threshold
@@ -912,12 +984,6 @@ def main():
                 out.act = _mix_switch_act(out.act, act_nom, use_sf)
                 policy.last_q_nom = float(q_nom.reshape(-1)[0])
                 policy.last_switch_use_sf = float(bool(use_sf_np.reshape(-1)[0]))
-                if action_reg_coef > 0.0:
-                    _note_use_sf(use_sf_np)
-                    if np.any(use_sf_np):
-                        pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
-                else:
-                    _note_use_sf(False)
                 ls = getattr(policy, "log_state", None)
                 if isinstance(ls, dict):
                     ls["switch_n"] = int(ls.get("switch_n", 0)) + int(use_sf_np.size)
@@ -926,12 +992,11 @@ def main():
                 # Fully SF collect: every step uses the actor.
                 use_sf_np = np.ones((n,), dtype=np.bool_)
                 pol_extra.use_sf = use_sf_np
-                if action_reg_coef > 0.0:
-                    _note_use_sf(use_sf_np)
-                    pol_extra.act_good = _safe_side_acts_policy(zero_yaw=freeze_yaw)
-                else:
-                    _note_use_sf(False)
                 policy.last_switch_use_sf = 1.0
+            _attach_good_reg(pol_extra, batch[input], act_nom, n)
+            if np.isfinite(np.asarray(pol_extra.q_nom, dtype=np.float32)).any():
+                q0 = float(np.asarray(pol_extra.q_nom, dtype=np.float32).reshape(-1)[0])
+                policy.last_q_nom = q0
             out.policy = pol_extra
         return out
 
@@ -971,8 +1036,7 @@ def main():
             boundary_reg = act.new_zeros(())
             if action_reg_coef > 0.0 or boundary_reg_coef > 0.0:
                 if action_reg_coef > 0.0:
-                    # Only switch + HJ<0 (executed SF): pull π toward a_good.
-                    # Waypoint-only episodes and switch+HJ>=0 are not regularized.
+                    # HJ(Q(a_nom))<0, any collect controller: pull π toward frozen a_good.
                     use_sf_w = _batch_use_sf_weight(batch, act)
                     act_good = _batch_act_good_tensor(batch, act)
                     if act_good is not None:
@@ -1033,8 +1097,9 @@ def main():
         f"[INFO] SAC avoid SF (path pipeline): gamma={args.gamma_pyhj}, "
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
-        f"λ_good={action_reg_coef} (switch+HJ<0, hold a_good "
-        f"{int(getattr(args, 'a_good_hold_steps', 20))} steps), "
+        f"λ_good={action_reg_coef} (any controller, HJ(Q(a_nom))<0; "
+        f"freeze a_good until HJ>=0, hold_steps="
+        f"{int(getattr(args, 'a_good_hold_steps', 0))}), "
         f"boundary={boundary_reg_coef}, "
         f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
         + (
@@ -1049,9 +1114,18 @@ def main():
         f"alternate_collect={bool(args.alternate_collect)} "
         f"(waypoint ↔ switch), "
         + (
-            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/step, "
+            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/ep, "
             if bool(getattr(args, "randomize_nom_speed", False))
             else "nom_|v|=0.5, "
+        )
+        + (
+            (
+                f"nom_act_σ∈{{{str(getattr(args, 'nom_act_noise_stds', '')).strip()}}}/ep, "
+                if str(getattr(args, "nom_act_noise_stds", "")).strip()
+                else f"nom_act_N(0,{float(args.nom_act_noise_std):g}), "
+            )
+            if bool(getattr(args, "nom_act_noise", False))
+            else ""
         )
         + f"obstacles: absent_p={float(args.obstacle_absent_prob):g} "
         f"P(2|present)={float(args.two_obstacle_prob):g} max={int(args.max_n_obstacles)}"
@@ -1116,7 +1190,7 @@ def main():
     logger.log_update_data = log_update_data_synced  # type: ignore[method-assign]
 
     def exploration_noise_stash(act, batch):
-        """SAC explores via rsample; do not replace actions. Stash env act."""
+        """Do not add collect noise. a_nom noise is in waypoint |v| only; a_sf stays raw."""
         del batch
         try:
             if freeze_yaw:
@@ -1203,13 +1277,28 @@ def main():
             "randomize_nom_speed", bool(getattr(args, "randomize_nom_speed", False))
         )
         train_envs.set_env_attr(
-            "nom_speed_min", float(getattr(args, "nom_speed_min", 0.1))
+            "nom_speed_min", float(getattr(args, "nom_speed_min", 0.05))
         )
         train_envs.set_env_attr(
-            "nom_speed_max", float(getattr(args, "nom_speed_max", 0.9))
+            "nom_speed_max", float(getattr(args, "nom_speed_max", 0.95))
         )
         train_envs.set_env_attr(
-            "sidestep_hold_steps", int(getattr(args, "a_good_hold_steps", 20))
+            "nom_speed_mean", float(getattr(args, "nom_speed_mean", 0.5))
+        )
+        train_envs.set_env_attr(
+            "nom_speed_std", float(getattr(args, "nom_speed_std", 0.3))
+        )
+        train_envs.set_env_attr(
+            "nom_act_noise", bool(getattr(args, "nom_act_noise", False))
+        )
+        train_envs.set_env_attr(
+            "nom_act_noise_std", float(getattr(args, "nom_act_noise_std", 0.2))
+        )
+        train_envs.set_env_attr(
+            "nom_act_noise_stds", str(getattr(args, "nom_act_noise_stds", "") or "")
+        )
+        train_envs.set_env_attr(
+            "sidestep_hold_steps", int(getattr(args, "a_good_hold_steps", 0))
         )
         train_envs.set_env_attr(
             "skip_arena_oob_from_buffer",
@@ -1239,9 +1328,18 @@ def main():
         f"h_s=d_min-{float(args.lidar_distance_threshold):g}"
         f"{'+contact' if bool(args.include_contact_in_hs) else ' lidar-only'}; "
         + (
-            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/step; "
+            f"nom_|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/ep; "
             if bool(getattr(args, "randomize_nom_speed", False))
             else "nom_|v|=0.5; "
+        )
+        + (
+            (
+                f"nom_act_σ∈{{{str(getattr(args, 'nom_act_noise_stds', '')).strip()}}}/ep; "
+                if str(getattr(args, "nom_act_noise_stds", "")).strip()
+                else f"nom_act_N(0,{float(args.nom_act_noise_std):g}); "
+            )
+            if bool(getattr(args, "nom_act_noise", False))
+            else ""
         )
         + f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
         f"yaw=±{float(args.yaw_limit):g}; "
@@ -1258,6 +1356,7 @@ def main():
         pol_extra = Batch(
             act_nom=acts.copy(),
             use_sf=np.zeros((n,), dtype=np.bool_),
+            use_good_reg=np.zeros((n,), dtype=np.bool_),
             act_good=np.zeros((n, 3), dtype=np.float32),
             q_nom=np.full((n,), np.nan, dtype=np.float32),
         )

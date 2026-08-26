@@ -45,6 +45,20 @@ DEFAULT_PERP_OFFSET_M: float = 2.5
 DEFAULT_MIN_START_GOAL_DIST: float = 4.0
 # l = d_min - this. Vias and bins are sampled independently (vias may sit inside disks).
 DEFAULT_DANGER_RADIUS_M: float = 1.5
+# bin_side_disk: one bin ±1 m off the start–goal *centers* line; via disks r=1
+# touch the bin center; start/goal are disks r=1 around those centers.
+LAYOUT_START_GOAL_PERP = "start_goal_perp"
+LAYOUT_BIN_SIDE_DISK = "bin_side_disk"
+PATH_WAYPOINT_LAYOUTS = frozenset({LAYOUT_START_GOAL_PERP, LAYOUT_BIN_SIDE_DISK})
+DEFAULT_BOX_PERP_OFFSET_M: float = 1.0
+DEFAULT_START_GOAL_REGION_R: float = 1.0
+DEFAULT_VIA_REGION_R: float = 1.0
+DEFAULT_N_FREE_WAYPOINTS: int = 6
+
+
+def is_path_waypoint_layout(layout: str) -> bool:
+    """True for arena start–goal pipelines (not the original aisle regions)."""
+    return str(layout) in PATH_WAYPOINT_LAYOUTS
 
 
 def waypoints_to_list(waypoint: np.ndarray) -> list[np.ndarray]:
@@ -318,8 +332,9 @@ def compute_perp_sidestep_xy(
 ) -> np.ndarray | None:
     """Safe point G: right triangle robot–nearest-obstacle–G, right angle at obstacle.
 
-    Two sides are equidistant from the robot. Prefer the G more in front of
-    the current heading so a held target does not reverse the robot.
+    Two lateral G are equidistant from the robot. Pick the one whose bearing
+    from the robot is closer to the current heading (larger cosine / smaller
+    yaw error) so a held a_good does not reverse the robot.
     """
     obs = [
         np.asarray(p, dtype=np.float64).reshape(2)
@@ -349,6 +364,11 @@ def compute_perp_sidestep_xy(
         head = np.array(
             [float(np.cos(heading)), float(np.sin(heading))], dtype=np.float64
         )
+    head_n = float(np.linalg.norm(head))
+    if head_n < 1e-8:
+        head = fwd
+    else:
+        head = head / head_n
 
     def in_arena(p: np.ndarray) -> bool:
         if x_min is None:
@@ -356,6 +376,13 @@ def compute_perp_sidestep_xy(
         return _point_in_rect(
             p, float(x_min), float(x_max), float(y_min), float(y_max), margin=0.05
         )
+
+    def heading_cosine(g: np.ndarray) -> float:
+        vec = g - robot
+        dist = float(np.hypot(vec[0], vec[1]))
+        if dist < 1e-8:
+            return -1.0
+        return float(np.dot(vec / dist, head))
 
     scored: list[tuple[float, float, float, np.ndarray]] = []
     for extra in extra_offsets:
@@ -367,16 +394,22 @@ def compute_perp_sidestep_xy(
                 continue
             if not in_arena(g):
                 continue
-            align = -float(np.dot(g - robot, head))
-            batch.append((float(extra), align, -min_xy_dist_to_points(g, obs), g))
+            # Sort key: smaller extra, then larger heading cosine (closer to yaw).
+            batch.append(
+                (
+                    float(extra),
+                    -heading_cosine(g),
+                    -min_xy_dist_to_points(g, obs),
+                    g,
+                )
+            )
         if batch:
             scored = batch
             break
     if not scored:
         for n in (n1, n2):
             g = o + float(radius) * n
-            align = -float(np.dot(g - robot, head))
-            scored.append((99.0, align, 0.0, g))
+            scored.append((99.0, -heading_cosine(g), 0.0, g))
     scored.sort(key=lambda t: (t[0], t[1], t[2]))
     return scored[0][3]
 
@@ -520,6 +553,183 @@ def sample_perp_points_on_segment(
             continue
         return pts
     raise RuntimeError(f"sample_perp_points_on_segment: {last_err}")
+
+
+def sample_disk_in_arena(
+    rng: np.random.Generator,
+    center: np.ndarray,
+    radius: float,
+    *,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    margin: float = 0.05,
+    max_tries: int = 64,
+) -> np.ndarray:
+    """Uniform sample in a disk, rejected / clamped to the arena inset."""
+    cfg = {"center": np.asarray(center, dtype=np.float64).reshape(2), "r": float(radius)}
+    for _ in range(int(max_tries)):
+        pt = sample_point_in_region(cfg, rng)
+        if _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=margin):
+            return pt
+    return _clamp_to_rect(
+        sample_point_in_region(cfg, rng), x_min, x_max, y_min, y_max, margin=margin
+    )
+
+
+def _spawn_yaw_along(from_xy: np.ndarray, to_xy: np.ndarray) -> float:
+    heading = np.asarray(to_xy, dtype=np.float64).reshape(2) - np.asarray(
+        from_xy, dtype=np.float64
+    ).reshape(2)
+    if float(np.linalg.norm(heading)) < 1e-6:
+        return 0.0
+    return float(np.arctan2(heading[1], heading[0]))
+
+
+def sample_free_arena_waypoints(
+    rng: np.random.Generator,
+    n: int = DEFAULT_N_FREE_WAYPOINTS,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    margin: float = 0.5,
+    min_pairwise: float = 0.8,
+    max_tries: int = 512,
+) -> tuple[np.ndarray, list[str], float]:
+    """``n`` random in-arena waypoints (no obstacle). First point is spawn."""
+    n = max(1, int(n))
+    ix0, ix1 = float(x_min + margin), float(x_max - margin)
+    iy0, iy1 = float(y_min + margin), float(y_max - margin)
+    if ix1 <= ix0 or iy1 <= iy0:
+        raise ValueError("Arena inset is empty; increase bounds or reduce margin.")
+    pts: list[np.ndarray] = []
+    last_err = "failed to sample free waypoints"
+    for _ in range(int(max_tries)):
+        cand = np.array([rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64)
+        if any(float(np.linalg.norm(cand - q)) < float(min_pairwise) for q in pts):
+            last_err = "pairwise too close"
+            continue
+        pts.append(cand)
+        if len(pts) >= n:
+            wps = np.stack(pts, axis=0)
+            names = [f"free{i}" for i in range(n)]
+            yaw = _spawn_yaw_along(wps[0], wps[1] if n > 1 else wps[0] + np.array([1.0, 0.0]))
+            return wps, names, yaw
+    while len(pts) < n:
+        pts.append(
+            np.array([rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64)
+        )
+    wps = np.stack(pts[:n], axis=0)
+    names = [f"free{i}" for i in range(n)]
+    yaw = _spawn_yaw_along(wps[0], wps[1] if n > 1 else wps[0] + np.array([1.0, 0.0]))
+    return wps, names, yaw
+
+
+def sample_bin_side_disk_episode(
+    rng: np.random.Generator,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    min_start_goal_dist: float = DEFAULT_MIN_START_GOAL_DIST,
+    box_perp_offset: float = DEFAULT_BOX_PERP_OFFSET_M,
+    start_goal_region_r: float = DEFAULT_START_GOAL_REGION_R,
+    via_region_r: float = DEFAULT_VIA_REGION_R,
+    absent_prob: float = 0.1,
+    n_free_waypoints: int = DEFAULT_N_FREE_WAYPOINTS,
+    t_lo: float = 0.3,
+    t_hi: float = 0.7,
+    max_tries: int = 256,
+) -> dict[str, Any]:
+    """One episode of the bin-side-disk layout.
+
+    10% (``absent_prob``): no bin, ``n_free_waypoints`` random arena points.
+
+    90%: sample start/goal *centers* with |S-G| >= min_start_goal_dist, place
+    one bin ±box_perp_offset on the perpendicular of that segment, then two
+    disks of radius ``via_region_r`` whose edges touch the bin center (centers
+    = bin ± via_region_r along the same normal). Pick one disk 50/50 and
+    sample the via there. Actual start/goal waypoints are sampled in disks of
+    radius ``start_goal_region_r`` around the centers.
+
+    Returns dict with ``waypoints``, ``names``, ``spawn_yaw``, ``obstacle_xys``.
+    """
+    if float(rng.random()) < float(absent_prob):
+        wps, names, yaw = sample_free_arena_waypoints(
+            rng,
+            n=int(n_free_waypoints),
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+        )
+        return {
+            "waypoints": wps,
+            "names": names,
+            "spawn_yaw": yaw,
+            "obstacle_xys": [],
+        }
+
+    r_sg = float(start_goal_region_r)
+    r_via = float(via_region_r)
+    box_off = float(box_perp_offset)
+    last_err = "failed to sample bin-side-disk layout"
+    for _ in range(int(max_tries)):
+        start_c, goal_c = sample_start_goal_in_arena(
+            rng,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            min_start_goal_dist=min_start_goal_dist,
+            margin=max(0.5, r_sg),
+            max_tries=max_tries,
+        )
+        delta = goal_c - start_c
+        dist = float(np.linalg.norm(delta))
+        if dist < 1e-6:
+            last_err = "coincident start/goal centers"
+            continue
+        tangent = delta / dist
+        normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+        t = float(rng.uniform(float(t_lo), float(t_hi)))
+        foot = start_c + t * delta
+        sign = -1.0 if rng.random() < 0.5 else 1.0
+        box = None
+        for s in (sign, -sign):
+            cand = foot + s * box_off * normal
+            if _point_in_rect(cand, x_min, x_max, y_min, y_max, margin=0.15):
+                box = cand
+                break
+        if box is None:
+            last_err = "bin outside arena"
+            continue
+        via_centers = (box + r_via * normal, box - r_via * normal)
+        side = 0 if rng.random() < 0.5 else 1
+        via_c = via_centers[side]
+        start_wp = sample_disk_in_arena(
+            rng, start_c, r_sg, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max
+        )
+        goal_wp = sample_disk_in_arena(
+            rng, goal_c, r_sg, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max
+        )
+        via_wp = sample_disk_in_arena(
+            rng, via_c, r_via, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max
+        )
+        wps = np.stack([start_wp, via_wp, goal_wp], axis=0)
+        names = ["start", "via_plus" if side == 0 else "via_minus", "goal"]
+        yaw = _spawn_yaw_along(start_wp, via_wp)
+        return {
+            "waypoints": wps,
+            "names": names,
+            "spawn_yaw": yaw,
+            "obstacle_xys": [np.asarray(box, dtype=np.float64).reshape(2).copy()],
+        }
+    raise RuntimeError(f"sample_bin_side_disk_episode: {last_err}")
 
 
 def quat_to_yaw(quat: np.ndarray) -> float:

@@ -14,8 +14,11 @@ from PIL import Image
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
+    LAYOUT_BIN_SIDE_DISK,
+    LAYOUT_START_GOAL_PERP,
     SAFE_SIDE_WAYPOINTS,
     WaypointNavController,
+    is_path_waypoint_layout,
 )
 
 # Match datasets/humanoid_dset.py and collect_humanoid_dataset.py
@@ -25,6 +28,9 @@ DEFAULT_VISUAL_FPS = 15.0
 DEFAULT_MAX_EPISODE_SIM_STEPS = 8000
 DEFAULT_WANDB_VIDEO_EVERY = 1
 DEFAULT_WANDB_VIDEO_SIZE = (120, 160)  # (H, W) for uploaded rollouts
+# Env-space velocity box (yaw still comes from --yaw_limit).
+ENV_VX_RANGE = (0.0, 1.0)
+ENV_VY_RANGE = (-1.0, 1.0)
 
 
 class LatentHumanoidEnv(gym.Env):
@@ -162,7 +168,9 @@ class LatentHumanoidEnv(gym.Env):
             raise NotImplementedError("FailureClassifier latent_h is not wired for Isaac G1 yet.")
 
         use_path = (
-            str(getattr(self.wrapper, "waypoint_layout", "regions")) == "start_goal_perp"
+            is_path_waypoint_layout(
+                getattr(self.wrapper, "waypoint_layout", "regions")
+            )
             or bool(getattr(self.wrapper, "path_obstacle_layout", False))
         )
         print(
@@ -192,8 +200,8 @@ class LatentHumanoidEnv(gym.Env):
         )
         yaw_limit = float(getattr(self.wrapper, "action_high")[2])
         self.action_space = Box(
-            low=np.array([0.0, -0.5, -yaw_limit], dtype=np.float32),
-            high=np.array([0.8, 0.5, yaw_limit], dtype=np.float32),
+            low=np.array([ENV_VX_RANGE[0], ENV_VY_RANGE[0], -yaw_limit], dtype=np.float32),
+            high=np.array([ENV_VX_RANGE[1], ENV_VY_RANGE[1], yaw_limit], dtype=np.float32),
             dtype=np.float32,
         )
         self.wrapper.action_low = np.asarray(self.action_space.low, dtype=np.float32)
@@ -210,7 +218,18 @@ class LatentHumanoidEnv(gym.Env):
             f"arena={'on ' + self._arena_str() if self.wrapper.use_arena_bounds else 'off'}, "
             f"h_s=d_min-{self.wrapper.lidar_distance_threshold:g}"
             f"{('+contact→' + str(self.wrapper.contact_hs) if self.wrapper.include_contact_in_hs else ' lidar-only')}, "
-            f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/step' if self._randomize_nom_speed else f'{self._episode_nom_speed:g}'}, "
+            f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/ep' if self._randomize_nom_speed else f'{self._episode_nom_speed:g}'}, "
+            f"nom_act="
+            + (
+                (
+                    f"N(0,σ)/ep σ∈{self._nom_act_noise_stds}"
+                    if self._nom_act_noise_stds
+                    else f"N(0,{self._nom_act_noise_std:g})"
+                )
+                if self._nom_act_noise
+                else "off"
+            )
+            + ", "
             f"lidar_cone=±{float(getattr(self.wrapper, 'lidar_h_half_fov_deg', 90.0)):g}°, "
             f"yaw=[{self.action_space.low[2]:g},{self.action_space.high[2]:g}] "
             f"(OOB → truncate only, no h_s penalty), "
@@ -226,8 +245,13 @@ class LatentHumanoidEnv(gym.Env):
             return {"center": np.asarray(v["center"]).tolist(), "r": v["r"]}
 
         layout = str(getattr(self.wrapper, "waypoint_layout", "regions"))
-        if layout == "start_goal_perp":
+        if layout == LAYOUT_START_GOAL_PERP:
             seq_desc = "start → trans1 → trans2 → goal (resampled XY each episode)"
+        elif layout == LAYOUT_BIN_SIDE_DISK:
+            seq_desc = (
+                "90%: start-disk(r) → one via in a bin-side disk (edge touches "
+                "bin center) → goal-disk(r); 10%: 6 free arena waypoints, no bin"
+            )
         else:
             seq_desc = (
                 f"sequence={DEFAULT_TRAJECTORY_REGION_SEQUENCE} "
@@ -416,7 +440,18 @@ class LatentHumanoidEnv(gym.Env):
 
     @sidestep_hold_steps.setter
     def sidestep_hold_steps(self, value: int) -> None:
-        self.wrapper.sidestep_hold_steps = max(1, int(value))
+        self.wrapper.sidestep_hold_steps = int(value)
+
+    @property
+    def held_a_good(self):
+        return getattr(self.wrapper, "_held_a_good", None)
+
+    @held_a_good.setter
+    def held_a_good(self, value) -> None:
+        if value is None:
+            self.wrapper._held_a_good = None
+            return
+        self.wrapper._held_a_good = np.asarray(value, dtype=np.float32).reshape(3)
 
     @property
     def perp_offset(self) -> float:
@@ -425,6 +460,30 @@ class LatentHumanoidEnv(gym.Env):
     @perp_offset.setter
     def perp_offset(self, value: float) -> None:
         self.wrapper.perp_offset = float(value)
+
+    @property
+    def start_goal_region_r(self) -> float:
+        return float(getattr(self.wrapper, "start_goal_region_r", 1.0))
+
+    @start_goal_region_r.setter
+    def start_goal_region_r(self, value: float) -> None:
+        self.wrapper.start_goal_region_r = float(value)
+
+    @property
+    def via_region_r(self) -> float:
+        return float(getattr(self.wrapper, "via_region_r", 1.0))
+
+    @via_region_r.setter
+    def via_region_r(self, value: float) -> None:
+        self.wrapper.via_region_r = float(value)
+
+    @property
+    def n_free_waypoints(self) -> int:
+        return int(getattr(self.wrapper, "n_free_waypoints", 6))
+
+    @n_free_waypoints.setter
+    def n_free_waypoints(self, value: int) -> None:
+        self.wrapper.n_free_waypoints = int(value)
 
     @property
     def min_start_goal_dist(self) -> float:
@@ -542,9 +601,17 @@ class LatentHumanoidEnv(gym.Env):
             getattr(args, "skip_arena_oob_from_buffer", False)
         )
         self._randomize_nom_speed = bool(getattr(args, "randomize_nom_speed", False))
-        self._nom_speed_min = float(getattr(args, "nom_speed_min", 0.1))
-        self._nom_speed_max = float(getattr(args, "nom_speed_max", 0.9))
+        self._nom_speed_min = float(getattr(args, "nom_speed_min", 0.05))
+        self._nom_speed_max = float(getattr(args, "nom_speed_max", 0.95))
+        self._nom_speed_mean = float(getattr(args, "nom_speed_mean", 0.5))
+        self._nom_speed_std = float(getattr(args, "nom_speed_std", 0.3))
         self._episode_nom_speed = float(getattr(self.wrapper, "max_speed", 0.5))
+        self._nom_act_noise = bool(getattr(args, "nom_act_noise", False))
+        self._nom_act_noise_std = float(getattr(args, "nom_act_noise_std", 0.2))
+        self._nom_act_noise_stds = self._parse_nom_act_noise_stds(
+            getattr(args, "nom_act_noise_stds", "")
+        )
+        self._episode_nom_act_noise_std = float(self._nom_act_noise_std)
         thr = getattr(args, "lidar_distance_threshold", None)
         if thr is not None:
             self.wrapper.lidar_distance_threshold = float(thr)
@@ -557,15 +624,15 @@ class LatentHumanoidEnv(gym.Env):
         if getattr(args, "contact_hs", None) is not None:
             self.wrapper.contact_hs = float(args.contact_hs)
         if getattr(args, "a_good_hold_steps", None) is not None:
-            self.wrapper.sidestep_hold_steps = max(1, int(args.a_good_hold_steps))
+            self.wrapper.sidestep_hold_steps = int(args.a_good_hold_steps)
         yaw_limit = getattr(args, "yaw_limit", None)
         if yaw_limit is not None:
             yaw_limit = float(yaw_limit)
             self.wrapper.action_low = np.array(
-                [0.0, -0.5, -yaw_limit], dtype=np.float32
+                [ENV_VX_RANGE[0], ENV_VY_RANGE[0], -yaw_limit], dtype=np.float32
             )
             self.wrapper.action_high = np.array(
-                [0.8, 0.5, yaw_limit], dtype=np.float32
+                [ENV_VX_RANGE[1], ENV_VY_RANGE[1], yaw_limit], dtype=np.float32
             )
         layout = getattr(args, "waypoint_layout", None)
         if layout:
@@ -584,6 +651,12 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.perp_offset = float(args.perp_offset)
         if getattr(args, "min_start_goal_dist", None) is not None:
             self.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
+        if getattr(args, "start_goal_region_r", None) is not None:
+            self.wrapper.start_goal_region_r = float(args.start_goal_region_r)
+        if getattr(args, "via_region_r", None) is not None:
+            self.wrapper.via_region_r = float(args.via_region_r)
+        if getattr(args, "n_free_waypoints", None) is not None:
+            self.wrapper.n_free_waypoints = int(args.n_free_waypoints)
         hs_mode = getattr(args, "hs_mode", None)
         if hs_mode:
             self.wrapper.hs_mode = str(hs_mode)
@@ -615,7 +688,7 @@ class LatentHumanoidEnv(gym.Env):
 
     @property
     def nom_speed_min(self) -> float:
-        return float(getattr(self, "_nom_speed_min", 0.1))
+        return float(getattr(self, "_nom_speed_min", 0.05))
 
     @nom_speed_min.setter
     def nom_speed_min(self, value: float) -> None:
@@ -623,11 +696,88 @@ class LatentHumanoidEnv(gym.Env):
 
     @property
     def nom_speed_max(self) -> float:
-        return float(getattr(self, "_nom_speed_max", 0.9))
+        return float(getattr(self, "_nom_speed_max", 0.95))
 
     @nom_speed_max.setter
     def nom_speed_max(self, value: float) -> None:
         self._nom_speed_max = float(value)
+
+    @property
+    def nom_speed_mean(self) -> float:
+        return float(getattr(self, "_nom_speed_mean", 0.5))
+
+    @nom_speed_mean.setter
+    def nom_speed_mean(self, value: float) -> None:
+        self._nom_speed_mean = float(value)
+
+    @property
+    def nom_speed_std(self) -> float:
+        return float(getattr(self, "_nom_speed_std", 0.2))
+
+    @nom_speed_std.setter
+    def nom_speed_std(self, value: float) -> None:
+        self._nom_speed_std = max(0.0, float(value))
+
+    @property
+    def nom_act_noise(self) -> bool:
+        return bool(getattr(self, "_nom_act_noise", False))
+
+    @nom_act_noise.setter
+    def nom_act_noise(self, value: bool) -> None:
+        self._nom_act_noise = bool(value)
+
+    @property
+    def nom_act_noise_std(self) -> float:
+        return float(getattr(self, "_nom_act_noise_std", 0.2))
+
+    @nom_act_noise_std.setter
+    def nom_act_noise_std(self, value: float) -> None:
+        self._nom_act_noise_std = float(value)
+
+    @property
+    def nom_act_noise_stds(self) -> list[float]:
+        return list(getattr(self, "_nom_act_noise_stds", []) or [])
+
+    @nom_act_noise_stds.setter
+    def nom_act_noise_stds(self, value) -> None:
+        self._nom_act_noise_stds = self._parse_nom_act_noise_stds(value)
+
+    @staticmethod
+    def _parse_nom_act_noise_stds(value) -> list[float]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return [float(x) for x in value if float(x) >= 0.0]
+        s = str(value).strip()
+        if not s:
+            return []
+        out: list[float] = []
+        for part in s.replace(" ", "").split(","):
+            if not part:
+                continue
+            std = float(part)
+            if std < 0.0:
+                raise ValueError(f"nom_act_noise_stds must be >= 0, got {std}")
+            out.append(std)
+        return out
+
+    def _resample_episode_nom_act_noise_std(self) -> float:
+        """Pick σ for this episode. a_nom only; a_sf never uses this."""
+        if not bool(getattr(self, "_nom_act_noise", False)):
+            self._episode_nom_act_noise_std = 0.0
+            return 0.0
+        stds = list(getattr(self, "_nom_act_noise_stds", []) or [])
+        rng = getattr(self.wrapper, "_rng", None)
+        if stds:
+            if rng is None:
+                idx = int(np.random.randint(0, len(stds)))
+            else:
+                idx = int(rng.integers(0, len(stds)))
+            std = float(stds[idx])
+        else:
+            std = float(getattr(self, "_nom_act_noise_std", 0.2))
+        self._episode_nom_act_noise_std = std
+        return std
 
     @property
     def obstacle_absent_prob(self) -> float:
@@ -645,17 +795,19 @@ class LatentHumanoidEnv(gym.Env):
         self._next_visual_time_s = self.visual_period_s
 
     def _resample_nom_speed(self) -> float:
-        """Sample waypoint-controller |v| (a_nom only; not the SF actor)."""
+        """Sample waypoint-controller |v| once per episode. Never applied to a_sf."""
         default = float(getattr(self.wrapper, "max_speed", 0.5))
         if not bool(getattr(self, "_randomize_nom_speed", False)):
             speed = default
         else:
-            lo = float(getattr(self, "_nom_speed_min", 0.1))
-            hi = float(getattr(self, "_nom_speed_max", 0.9))
+            lo = float(getattr(self, "_nom_speed_min", 0.05))
+            hi = float(getattr(self, "_nom_speed_max", 0.95))
             if hi < lo:
                 lo, hi = hi, lo
             rng = getattr(self.wrapper, "_rng", None)
-            if rng is None:
+            if hi <= lo:
+                speed = lo
+            elif rng is None:
                 speed = float(np.random.uniform(lo, hi))
             else:
                 speed = float(rng.uniform(lo, hi))
@@ -663,27 +815,51 @@ class LatentHumanoidEnv(gym.Env):
         self._episode_nom_speed = speed
         return speed
 
+    def _perturb_nom_action(self, cmd: np.ndarray) -> np.ndarray:
+        """Isotropic Gaussian on (vx, vy, yaw) after a_nom. Never used on a_sf."""
+        if not bool(getattr(self, "_nom_act_noise", False)):
+            return cmd
+        std = float(getattr(self, "_episode_nom_act_noise_std", 0.0))
+        if std <= 0.0:
+            return cmd
+        rng = getattr(self.wrapper, "_rng", None)
+        if rng is None:
+            noise = np.random.normal(0.0, std, size=3).astype(np.float32)
+        else:
+            noise = rng.normal(0.0, std, size=3).astype(np.float32)
+        return np.asarray(cmd, dtype=np.float32).reshape(3) + noise
+
     def compute_waypoint_nav_action(self) -> np.ndarray:
-        """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint."""
-        if bool(getattr(self, "_randomize_nom_speed", False)):
-            self._resample_nom_speed()
+        """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint.
+
+        Coverage noise is a_nom-only: |v| is sampled once per episode, then
+        optional N(0, σ) on (vx, vy, yaw) with σ also fixed for the episode,
+        then clip. a_sf never enters this path.
+        """
+        self.waypoint_nav.max_speed = float(
+            getattr(self, "_episode_nom_speed", getattr(self.wrapper, "max_speed", 0.5))
+        )
         base_pos, base_quat = self.wrapper.get_robot_base_pose()
         cmd = self.waypoint_nav.compute_command(
             base_pos, base_quat, self.wrapper.waypoint
         )
+        cmd = self._perturb_nom_action(cmd)
         return self._clip_nav_cmd(cmd)
 
     def note_collect_use_sf(self, use_sf: bool) -> None:
-        """Update held a_good target: compute on first HJ<0, refresh every 20 SF steps."""
+        """Update held sidestep G from HJ<0 (not from who executed in the env)."""
         refreshed = self.wrapper.update_sidestep_cache(bool(use_sf))
         if refreshed:
             self._safe_side_nav.reset()
+            self.wrapper._held_a_good = None
 
     def compute_safe_side_nav_action(self) -> np.ndarray:
         """Env-space a_good: path uses a held perp-sidestep; aisle uses fixed sides."""
         base_pos, base_quat = self.wrapper.get_robot_base_pose()
         use_path = (
-            str(getattr(self.wrapper, "waypoint_layout", "regions")) == "start_goal_perp"
+            is_path_waypoint_layout(
+                getattr(self.wrapper, "waypoint_layout", "regions")
+            )
             or bool(getattr(self.wrapper, "path_obstacle_layout", False))
         )
         if use_path:
@@ -1059,6 +1235,7 @@ class LatentHumanoidEnv(gym.Env):
         self.waypoint_nav.reset()
         self._safe_side_nav.reset()
         nom_speed = self._resample_nom_speed()
+        act_std = self._resample_episode_nom_act_noise_std()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
         z = self.encode(obs)
@@ -1074,7 +1251,8 @@ class LatentHumanoidEnv(gym.Env):
                 f"n_obstacles={reset_info.get('n_obstacles')} "
                 f"obstacle_xys={reset_info.get('obstacle_xys')} "
                 f"collect={reset_info.get('collect_controller')} "
-                f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/step' if self._randomize_nom_speed else f'{nom_speed:.3f}'} "
+                f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/ep=' + f'{nom_speed:.3f}' if self._randomize_nom_speed else f'{nom_speed:.3f}'} "
+                f"nom_act_σ={act_std:g} "
                 f"wp_names={reset_info.get('waypoint_region_names')} "
                 f"waypoints={reset_info.get('waypoints')}"
             )
