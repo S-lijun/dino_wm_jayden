@@ -44,8 +44,8 @@ cd "${REPO_ROOT}"
 echo "[INFO] WM: ${WM_CKPT_DIR}/${WM_ENCODER}"
 echo "[INFO] SAC path CLS+concat train -> runs/sac_hj_humanoid_path/"
 echo "[INFO] z=DINOv2 CLS (384); Q=MLP(cat(z, a)); no late fusion"
-echo "[INFO] layout: start + 2 perp vias (±2.5m) + goal; arena x[-1,6] y[-4,2]"
-echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±2.5m (independent of vias)"
+echo "[INFO] layout: start → goal (straight); arena x[-1,6] y[-4,2]"
+echo "[INFO] obstacles: 10% none; else 50/50 one vs two bins on start-goal perp ±1.5m"
 echo "[INFO] collect: alternate waypoint / Q-gate switch each episode"
 echo "[INFO] buffer warmup 4000 waypoint steps then 4000 critic updates; buffer-size unchanged"
 echo "[INFO] λ_good=0 (no a_good MSE); pass --action_reg_coef >0: HJ<0 any controller, freeze a_good until HJ>=0"
@@ -89,11 +89,12 @@ exec "${ISAAC_PYTHON}" train_HJ_humanoid_sac_path.py \
   --nom_speed_mean 0.5 \
   --nom_speed_std 0.3 \
   --nom_act_noise \
-  --nom_act_noise_stds 0.05,0.2,0.4 \
+  --nom_act_noise_dist uniform \
+  --nom_act_noise_std 0.2 \
   --max_episode_steps 20000 \
   --yaw_limit 1.0 \
-  --waypoint_layout start_goal_perp \
-  --perp_offset 2.5 \
+  --waypoint_layout start_goal \
+  --perp_offset 1.5 \
   --min_start_goal_dist 4.0 \
   --max_n_obstacles 2 \
   --path_obstacle_layout \

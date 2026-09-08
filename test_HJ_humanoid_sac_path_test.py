@@ -13,6 +13,12 @@ Custom layout (4 waypoints required; 0/1/2 bins)::
   --bin_xy 4,0 --bin_xy 4,-2
   --bin_xy none
 
+Multiple scenes in one launch (repeat --scene; each is start via1 via2 goal [bin...])::
+
+  --scene 0,0 2,0 4.0,0.0 5.5,0 4,0 \\
+  --scene 0,0 2,0 4.0,0.5 5.5,0 4,0 \\
+  --scene 0,0 2,0 4.0,0.0 5.5,0 none
+
 Usage::
 
     python test_HJ_humanoid_sac_path_test.py --headless --visual_mode rtx_rgb \\
@@ -76,6 +82,15 @@ parser.add_argument(
     default="concat",
     choices=["late", "concat"],
     help="Must match training (this script defaults to concat).",
+)
+parser.add_argument(
+    "--z_fuse_frames",
+    type=int,
+    default=1,
+    help=(
+        "Average the last N full z vectors (visual + proprio). "
+        "Must match training. 1 = single-frame z. Default 1."
+    ),
 )
 parser.add_argument("--config", type=str, default="train_HJ_configs.yaml")
 parser.add_argument(
@@ -161,7 +176,21 @@ parser.add_argument(
     help=(
         "Blue-bin XY as 'x,y'. Repeat for a second bin, or 'x1,y1;x2,y2'. "
         "'none' = no bin. Only valid with custom waypoints. "
-        "Omit: no bin."
+        "Omit: no bin. Ignored if --scene is set."
+    ),
+)
+parser.add_argument(
+    "--scene",
+    action="append",
+    nargs="+",
+    default=None,
+    metavar="XY",
+    help=(
+        "One eval scene: start via1 via2 goal [bin [bin2]]. Repeat the flag "
+        "to queue more scenes; this process runs them in order (one trial "
+        "each). Example: --scene 0,0 2,0 4,0 5.5,0 4,0. Use 'none' for no "
+        "bin. Mutually exclusive with --start_xy / --easy. Do not use ';' "
+        "inside the spec (PowerShell treats it as a new statement)."
     ),
 )
 parser.add_argument(
@@ -195,15 +224,29 @@ parser.add_argument(
 parser.add_argument(
     "--danger_radius",
     type=float,
-    default=1.5,
-    help="Failure-set / LiDAR margin radius (m). Third via is inside this disk.",
+    default=1.0,
+    help="Plot / failure-set disk (m). Default 1 to match h_s = d_min-1.",
 )
-parser.add_argument("--lidar_distance_threshold", type=float, default=1.5)
+parser.add_argument(
+    "--lidar_distance_threshold",
+    type=float,
+    default=1.0,
+    help="h_s = lidar_d_min - this. Dashed obstacle circle uses the same radius.",
+)
 parser.add_argument("--lidar_h_half_fov_deg", type=float, default=60.0)
 parser.add_argument("--include_contact_in_hs", action="store_true", default=True)
 parser.add_argument("--no_include_contact_in_hs", action="store_true")
 parser.add_argument("--contact_hs", type=float, default=-2.5)
 parser.add_argument("--yaw_limit", type=float, default=1.0)
+parser.add_argument(
+    "--freeze_yaw",
+    action="store_true",
+    default=False,
+    help=(
+        "Force yaw (dim 2) to 0 on the SF action only; a_nom keeps its yaw. "
+        "Q(a_sf) is probed on the same zeroed action. Default: off."
+    ),
+)
 parser.add_argument("--y_bound", type=float, default=0.0)
 parser.add_argument("--use_arena_bounds", action="store_true", default=True)
 parser.add_argument("--arena_x_min", type=float, default=-1.0)
@@ -456,6 +499,22 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str, critic_fu
     print(f"[INFO] Loaded SAC policy from {ckpt_path}")
 
 
+FREEZE_YAW = False
+
+
+def _zero_yaw_act(act: np.ndarray) -> np.ndarray:
+    """Force yaw (dim 2) to 0 when --freeze_yaw is on. No-op otherwise.
+
+    Policy- and env-space yaw share a symmetric range, so 0 maps to 0 in both.
+    """
+    out = np.asarray(act, dtype=np.float32)
+    if not FREEZE_YAW or out.ndim < 1 or out.shape[-1] < 3:
+        return out
+    out = out.copy()
+    out[..., 2] = 0.0
+    return out
+
+
 @torch.no_grad()
 def q_value(policy, z: np.ndarray, act_policy: np.ndarray, device: str) -> float:
     z_t = torch.as_tensor(z, dtype=torch.float32, device=device)
@@ -502,8 +561,10 @@ def actor_policy_and_env(policy, z: np.ndarray, device: str) -> tuple[np.ndarray
     act_pol = policy(Batch(obs=z_t, info=Batch())).act
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
-    act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
-    act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
+    act_pol = _zero_yaw_act(np.asarray(act_pol, dtype=np.float32).reshape(-1))
+    act_env = _zero_yaw_act(
+        np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
+    )
     policy.train(was_training)
     return act_pol, act_env
 
@@ -551,6 +612,8 @@ def _no_bin_run_ids(num_runs: int, every: int, rng: np.random.Generator) -> set[
 
 
 def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
+    global FREEZE_YAW
+    FREEZE_YAW = bool(getattr(args, "freeze_yaw", False))
     env.wrapper.waypoint_layout = "start_goal_perp"
     env.wrapper.path_obstacle_layout = True
     env.wrapper.filter_lidar_to_active_obstacles = True
@@ -584,6 +647,7 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
     )
     env.nom_act_noise_std = float(args.nom_act_noise_std)
     env.nom_act_noise_stds = []
+    env.z_fuse_frames = int(getattr(args, "z_fuse_frames", 1))
     if not env.randomize_nom_speed:
         env._episode_nom_speed = 0.5
         env.waypoint_nav.max_speed = 0.5
@@ -610,11 +674,12 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
         f"[INFO] path eval: layout={layout_tag} "
         f"arena=x[{args.arena_x_min:g},{args.arena_x_max:g}] "
         f"y[{args.arena_y_min:g},{args.arena_y_max:g}] "
-        f"danger_r={float(args.danger_radius):g} "
+        f"danger_r={float(args.lidar_distance_threshold):g} "
         f"goal_r={float(args.goal_radius):g} "
         f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}° "
         f"contact_hs={float(args.contact_hs):g} "
-        f"nom {nom_v}{nom_a} a_sf=eval mean"
+        f"nom {nom_v}{nom_a} a_sf=eval mean "
+        f"freeze_yaw={FREEZE_YAW}"
     )
 
 
@@ -780,6 +845,118 @@ def _xy2(val) -> np.ndarray:
     return xy
 
 
+def _scene_flag_list(args) -> list[list[str]]:
+    raw = getattr(args, "scene", None)
+    if not raw:
+        return []
+    out: list[list[str]] = []
+    for item in raw:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            tokens = [str(t).strip() for t in item if str(t).strip()]
+        else:
+            tokens = [str(item).strip()] if str(item).strip() else []
+        if tokens:
+            out.append(tokens)
+    return out
+
+
+def _parse_scene_tokens(
+    tokens: list[str], *, max_n_obstacles: int = 2
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]:
+    """start via1 via2 goal [bin [bin2] | none]."""
+    parts = [str(t).strip() for t in tokens if str(t).strip()]
+    if len(parts) == 1:
+        parts = [
+            p.strip()
+            for p in parts[0].replace("|", " ").replace(";", " ").split()
+            if p.strip()
+        ]
+    if len(parts) < 4:
+        raise ValueError(
+            "--scene needs start via1 via2 goal [bin...], got "
+            + repr(" ".join(parts))
+        )
+    start = _xy2(parts[0])
+    trans1 = _xy2(parts[1])
+    trans2 = _xy2(parts[2])
+    goal = _xy2(parts[3])
+    bins = _parse_bin_list(parts[4:] if len(parts) > 4 else None)
+    if len(bins) > int(max_n_obstacles):
+        raise ValueError(
+            f"--scene has {len(bins)} bins but --max_n_obstacles={max_n_obstacles}"
+        )
+    return start, trans1, trans2, goal, bins
+
+
+def build_layout_from_waypoints(
+    start,
+    trans1,
+    trans2,
+    goal,
+    bins: list[np.ndarray] | None = None,
+    *,
+    spawn_yaw: float | None = None,
+    log: bool = True,
+) -> dict:
+    """Freeze start, via1, via2, goal, and 0/1/2 bins."""
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    trans1 = np.asarray(trans1, dtype=np.float64).reshape(2)
+    trans2 = np.asarray(trans2, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    wps = np.stack([start, trans1, trans2, goal], axis=0)
+    names = ["start", "trans1", "trans2", "goal"]
+    heading = trans1 - start
+    if float(np.linalg.norm(heading)) < 1e-6:
+        heading = np.array([1.0, 0.0], dtype=np.float64)
+    yaw = (
+        float(spawn_yaw)
+        if spawn_yaw is not None
+        else float(np.arctan2(heading[1], heading[0]))
+    )
+    bins = list(bins or [])
+    obstacle_xys = [(float(b[0]), float(b[1])) for b in bins]
+    if log:
+        if obstacle_xys:
+            dists = [
+                float(np.linalg.norm(np.asarray(xy) - trans2)) for xy in obstacle_xys
+            ]
+            print(
+                f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
+                f"via2={trans2.tolist()} goal={goal.tolist()} "
+                f"bins={obstacle_xys} via2–bin={dists} "
+                f"spawn_yaw={yaw:.3f}"
+            )
+        else:
+            print(
+                f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
+                f"via2={trans2.tolist()} goal={goal.tolist()} bin=none "
+                f"spawn_yaw={yaw:.3f}"
+            )
+    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
+    return {
+        "waypoints": wps,
+        "waypoint_region_names": names,
+        "spawn_yaw": yaw,
+        "obstacle_xys": obstacle_xys,
+        "n_obstacles": int(len(obstacle_xys)),
+        "obstacle_present": bool(obstacle_xys),
+        "blue_bin_xy": blue,
+        "robot_xy": np.asarray(start, dtype=np.float64).copy(),
+    }
+
+
+def _copy_layout(layout: dict) -> dict:
+    return {
+        **layout,
+        "waypoints": np.asarray(layout["waypoints"], dtype=np.float64).copy(),
+        "robot_xy": np.asarray(layout["robot_xy"], dtype=np.float64).copy(),
+        "obstacle_xys": list(layout["obstacle_xys"]),
+        "waypoint_region_names": list(layout["waypoint_region_names"]),
+    }
+
+
 def _custom_waypoint_flags(args) -> dict[str, bool]:
     return {
         "start_xy": _parse_xy(getattr(args, "start_xy", None)) is not None,
@@ -798,6 +975,7 @@ def _validate_custom_layout_args(args) -> None:
     flags = _custom_waypoint_flags(args)
     any_wp = any(flags.values())
     all_wp = all(flags.values())
+    scenes = _scene_flag_list(args)
     bins = _parse_bin_list(getattr(args, "bin_xy", None))
     bin_set = bool(bins) or (
         getattr(args, "bin_xy", None) is not None
@@ -805,6 +983,11 @@ def _validate_custom_layout_args(args) -> None:
     )
     spawn_set = getattr(args, "spawn_yaw", None) is not None
     easy = bool(getattr(args, "easy", False))
+    if scenes and (easy or any_wp or bin_set):
+        raise ValueError(
+            "--scene is mutually exclusive with --easy / --start_xy / "
+            "--via1_xy / --via2_xy / --goal_xy / --bin_xy"
+        )
     if easy and (any_wp or bin_set or spawn_set):
         raise ValueError(
             "--easy is mutually exclusive with --start_xy/--via1_xy/--via2_xy/"
@@ -816,11 +999,16 @@ def _validate_custom_layout_args(args) -> None:
             "custom layout requires all four waypoints; missing "
             + ", ".join(f"--{k}" for k in missing)
         )
-    if (bin_set or spawn_set) and not all_wp:
+    if (bin_set or spawn_set) and not all_wp and not scenes:
         raise ValueError(
             "--bin_xy / --spawn_yaw require a full custom layout "
-            "(--start_xy --via1_xy --via2_xy --goal_xy)"
+            "(--start_xy --via1_xy --via2_xy --goal_xy) or --scene"
         )
+    if scenes:
+        max_n = int(getattr(args, "max_n_obstacles", 2))
+        for tokens in scenes:
+            _parse_scene_tokens(tokens, max_n_obstacles=max_n)
+        return
     if len(bins) > int(getattr(args, "max_n_obstacles", 2)):
         raise ValueError(
             f"got {len(bins)} bins but --max_n_obstacles="
@@ -830,49 +1018,40 @@ def _validate_custom_layout_args(args) -> None:
 
 def build_custom_path_eval_layout(args) -> dict:
     """Freeze start, via1, via2, goal, and 0/1/2 bins from CLI XY flags."""
-    start = _xy2(args.start_xy)
-    trans1 = _xy2(args.via1_xy)
-    trans2 = _xy2(args.via2_xy)
-    goal = _xy2(args.goal_xy)
-    wps = np.stack([start, trans1, trans2, goal], axis=0)
-    names = ["start", "trans1", "trans2", "goal"]
-    heading = trans1 - start
-    if float(np.linalg.norm(heading)) < 1e-6:
-        heading = np.array([1.0, 0.0], dtype=np.float64)
-    spawn_yaw = (
-        float(args.spawn_yaw)
-        if getattr(args, "spawn_yaw", None) is not None
-        else float(np.arctan2(heading[1], heading[0]))
-    )
     bins = _parse_bin_list(getattr(args, "bin_xy", None))
-    obstacle_xys = [(float(b[0]), float(b[1])) for b in bins]
-    if obstacle_xys:
-        dists = [
-            float(np.linalg.norm(np.asarray(xy) - trans2)) for xy in obstacle_xys
-        ]
-        print(
-            f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
-            f"via2={trans2.tolist()} goal={goal.tolist()} "
-            f"bins={obstacle_xys} via2–bin={dists} "
-            f"spawn_yaw={spawn_yaw:.3f}"
+    return build_layout_from_waypoints(
+        _xy2(args.start_xy),
+        _xy2(args.via1_xy),
+        _xy2(args.via2_xy),
+        _xy2(args.goal_xy),
+        bins,
+        spawn_yaw=getattr(args, "spawn_yaw", None),
+        log=True,
+    )
+
+
+def build_scene_eval_layouts(args) -> list[dict]:
+    """One frozen layout per --scene (queued in CLI order)."""
+    yaw = getattr(args, "spawn_yaw", None)
+    max_n = int(getattr(args, "max_n_obstacles", 2))
+    layouts: list[dict] = []
+    for i, tokens in enumerate(_scene_flag_list(args)):
+        start, trans1, trans2, goal, bins = _parse_scene_tokens(
+            tokens, max_n_obstacles=max_n
         )
-    else:
-        print(
-            f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
-            f"via2={trans2.tolist()} goal={goal.tolist()} bin=none "
-            f"spawn_yaw={spawn_yaw:.3f}"
+        print(f"[INFO] scene {i:02d}")
+        layouts.append(
+            build_layout_from_waypoints(
+                start,
+                trans1,
+                trans2,
+                goal,
+                bins,
+                spawn_yaw=yaw,
+                log=True,
+            )
         )
-    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
-    return {
-        "waypoints": wps,
-        "waypoint_region_names": names,
-        "spawn_yaw": spawn_yaw,
-        "obstacle_xys": obstacle_xys,
-        "n_obstacles": int(len(obstacle_xys)),
-        "obstacle_present": bool(obstacle_xys),
-        "blue_bin_xy": blue,
-        "robot_xy": np.asarray(start, dtype=np.float64).copy(),
-    }
+    return layouts
 
 
 def sample_easy_path_eval_layout(rng: np.random.Generator, args) -> dict:
@@ -975,7 +1154,7 @@ def sample_path_eval_layout(
         obstacle_xys = [(float(p[0]), float(p[1])) for p in pts]
         print(
             f"[INFO] train-like bins n={n_bins} xy={obstacle_xys} "
-            f"(perp ±{float(args.perp_offset):g} m)"
+            f"(perp band ±{float(args.perp_offset):g} m)"
         )
     blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
     return {
@@ -1175,6 +1354,7 @@ def simulate_one(
     fixed_layout: dict,
     seed: int | None = None,
     look_ahead: bool = False,
+    file_tag: str | None = None,
 ) -> dict:
     z, info = env.reset(seed=seed, options={"fixed_layout": fixed_layout})
     layout = fixed_layout
@@ -1280,12 +1460,13 @@ def simulate_one(
     else:
         end_reason = "max_visual_steps"
 
+    tag = file_tag or f"run{run_id:02d}"
     video_path = None
     if save_video and frames:
         try:
             import imageio.v2 as imageio
 
-            video_path = str(out_dir / f"{mode}_run{run_id:02d}.mp4")
+            video_path = str(out_dir / f"{mode}_{tag}.mp4")
             imageio.mimsave(video_path, frames, fps=int(round(env.visual_fps)))
             print(f"[INFO] Saved video: {video_path} ({len(frames)} frames)")
         except Exception as exc:  # noqa: BLE001
@@ -1298,6 +1479,7 @@ def simulate_one(
     result = {
         "mode": mode,
         "run_id": run_id,
+        "file_tag": tag,
         "end_reason": end_reason,
         "success": success,
         "visual_steps": int(info.get("episode_step", step + 1)),
@@ -1370,7 +1552,9 @@ def main():
     print(f"[INFO] modes={modes} policy={args.policy_path}")
     print(
         f"[INFO] visual_feature={args.visual_feature} "
-        f"critic_fusion={args.critic_fusion}"
+        f"critic_fusion={args.critic_fusion} "
+        f"z_fuse_frames={int(getattr(args, 'z_fuse_frames', 1))} "
+        f"freeze_yaw={bool(getattr(args, 'freeze_yaw', False))}"
     )
     print(
         "[INFO] look_ahead="
@@ -1415,25 +1599,35 @@ def main():
     results = []
     base_seed = int(getattr(args, "seed", 0))
     layout_rng = np.random.default_rng(base_seed + 91)
-    no_bin_every = int(getattr(args, "no_bin_every", 2))
     easy = bool(getattr(args, "easy", False))
+    scene_layouts = build_scene_eval_layouts(args) if _scene_flag_list(args) else []
     custom = _custom_waypoints_complete(args)
     custom_layout = build_custom_path_eval_layout(args) if custom else None
-    if custom:
-        no_bin_ids = set()
+    if scene_layouts:
+        n_trials = len(scene_layouts)
+        if int(args.num_runs) != 1:
+            print(
+                f"[INFO] --scene: {n_trials} queued layouts; "
+                f"ignoring --num_runs={int(args.num_runs)}"
+            )
+        print(
+            f"[INFO] {n_trials} scene(s) from --scene; one compare trial each"
+        )
+    elif custom:
+        n_trials = int(args.num_runs)
         print(
             "[INFO] custom layout frozen for all trials "
             f"(n_bins={int(custom_layout['n_obstacles'])}); "
             "ignores --easy and --no_bin_every"
         )
     elif easy:
-        no_bin_ids = set()
+        n_trials = int(args.num_runs)
         print(
             "[INFO] --easy: straight line start(0,-2)r=1 → wp2(2,-2)r=1.5 → "
             "wp3 within 1 m of bin; bin fixed (4.5,-2); goal(5.5,-2)r=1. Always one bin."
         )
     else:
-        no_bin_ids = set()
+        n_trials = int(args.num_runs)
         print(
             "[INFO] no custom XY: sample train-like path "
             f"(absent_p={float(args.obstacle_absent_prob):g}, "
@@ -1448,28 +1642,28 @@ def main():
         float(args.arena_y_max),
     )
 
-    for run_id in range(int(args.num_runs)):
-        if custom:
-            layout = {
-                **custom_layout,
-                "waypoints": np.asarray(custom_layout["waypoints"], dtype=np.float64).copy(),
-                "robot_xy": np.asarray(custom_layout["robot_xy"], dtype=np.float64).copy(),
-                "obstacle_xys": list(custom_layout["obstacle_xys"]),
-                "waypoint_region_names": list(custom_layout["waypoint_region_names"]),
-            }
+    for run_id in range(n_trials):
+        if scene_layouts:
+            layout = _copy_layout(scene_layouts[run_id])
             with_bin = bool(layout["obstacle_present"])
+            file_tag = f"scene{run_id:02d}"
+        elif custom:
+            layout = _copy_layout(custom_layout)
+            with_bin = bool(layout["obstacle_present"])
+            file_tag = f"run{run_id:02d}"
         else:
-            with_bin = True if easy else None
             if easy:
                 layout = sample_easy_path_eval_layout(layout_rng, args)
             else:
                 layout = sample_path_eval_layout(layout_rng, args)
             with_bin = bool(layout["obstacle_present"])
+            file_tag = f"run{run_id:02d}"
         trial_seed = base_seed + run_id
         print(
-            f"\n=== Trial {run_id + 1}/{args.num_runs} modes={modes} "
+            f"\n=== Trial {run_id + 1}/{n_trials} tag={file_tag} modes={modes} "
             f"bin={'present' if with_bin else 'absent'} "
-            f"waypoints={layout['waypoints'].tolist()} ==="
+            f"waypoints={layout['waypoints'].tolist()} "
+            f"bins={layout['obstacle_xys']} ==="
         )
         mode_trajs: dict[str, np.ndarray] = {}
         mode_ends: dict[str, str] = {}
@@ -1488,6 +1682,7 @@ def main():
                 fixed_layout=layout,
                 seed=trial_seed,
                 look_ahead=look_ahead,
+                file_tag=file_tag,
             )
             results.append(r)
             mode_trajs[mode] = r["traj"]
@@ -1496,11 +1691,11 @@ def main():
 
         if args.mode == "compare" and len(modes) > 1:
             _save_compare_traj(
-                out_path=out_dir / f"run{run_id:02d}_compare_traj.png",
+                out_path=out_dir / f"{file_tag}_compare_traj.png",
                 mode_trajs=mode_trajs,
                 mode_ends=mode_ends,
                 layout=layout,
-                danger_radius=float(args.danger_radius),
+                danger_radius=float(args.lidar_distance_threshold),
                 goal_radius=float(args.goal_radius),
                 arena=arena,
                 run_id=run_id,
@@ -1516,13 +1711,23 @@ def main():
         f"modes={modes}",
         f"easy={easy}",
         f"custom={custom}",
-        f"danger_radius={float(args.danger_radius)}",
+        f"n_scenes={len(scene_layouts)}",
+        f"danger_radius={float(args.lidar_distance_threshold)}",
         f"goal_radius={float(args.goal_radius)}",
-        f"trials={int(args.num_runs)}",
+        f"trials={n_trials}",
         f"nom_speed={bool(args.randomize_nom_speed)} "
         f"nom_act_noise={bool(args.nom_act_noise)}",
     ]
-    if custom and custom_layout is not None:
+    if scene_layouts:
+        for i, lay in enumerate(scene_layouts):
+            wps = np.asarray(lay["waypoints"], dtype=np.float64)
+            bin_txt = list(lay["obstacle_xys"]) if lay["obstacle_present"] else "none"
+            lines.append(
+                f"scene{i:02d}="
+                f"start={wps[0].tolist()} via1={wps[1].tolist()} "
+                f"via2={wps[2].tolist()} goal={wps[3].tolist()} bin={bin_txt}"
+            )
+    elif custom and custom_layout is not None:
         wps = np.asarray(custom_layout["waypoints"], dtype=np.float64)
         bin_txt = (
             list(custom_layout["obstacle_xys"])
@@ -1561,9 +1766,15 @@ def main():
                     f" Qnom={r['q_probe_mean_nom']:.3f} Qsf={r['q_probe_mean_sf']:.3f} "
                     f"Qrand={r['q_probe_mean_rand']:.3f}"
                 )
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            bin_txt = (
+                "absent"
+                if not r["layout"]["obstacle_present"]
+                else r["layout"]["obstacle_xys"]
+            )
             lines.append(
-                f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
-                f"bin={'absent' if not r['layout']['obstacle_present'] else 'present'} "
+                f"  {tag}: end={r['end_reason']} success={r['success']} "
+                f"bin={bin_txt} "
                 f"steps={r['visual_steps']} int={r['hj_interventions']} "
                 f"viol={r['constraint_violations']} minQ={r['min_q_nom']}{qline}"
             )

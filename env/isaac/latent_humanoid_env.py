@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
 from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     LAYOUT_BIN_SIDE_DISK,
+    LAYOUT_START_GOAL,
     LAYOUT_START_GOAL_PERP,
     SAFE_SIDE_WAYPOINTS,
     WaypointNavController,
@@ -132,6 +134,8 @@ class LatentHumanoidEnv(gym.Env):
         # WM predictor history (visual frames + executed actions) for z_{t+1} look-ahead.
         self._obs_hist: list[dict[str, np.ndarray]] = []
         self._act_hist: list[np.ndarray] = []
+        self._z_fuse_frames = max(1, int(getattr(args, "z_fuse_frames", 5)))
+        self._z_fuse_hist: deque[np.ndarray] = deque(maxlen=self._z_fuse_frames)
         # Formal-train switch episodes: 2D traj PNG (off by default / original pipeline).
         self.record_switch_traj = False
         self.switch_traj_dir = ""
@@ -219,21 +223,12 @@ class LatentHumanoidEnv(gym.Env):
             f"h_s=d_min-{self.wrapper.lidar_distance_threshold:g}"
             f"{('+contact→' + str(self.wrapper.contact_hs) if self.wrapper.include_contact_in_hs else ' lidar-only')}, "
             f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/ep' if self._randomize_nom_speed else f'{self._episode_nom_speed:g}'}, "
-            f"nom_act="
-            + (
-                (
-                    f"N(0,σ)/ep σ∈{self._nom_act_noise_stds}"
-                    if self._nom_act_noise_stds
-                    else f"N(0,{self._nom_act_noise_std:g})"
-                )
-                if self._nom_act_noise
-                else "off"
-            )
-            + ", "
+            f"nom_act={self._nom_act_noise_log()}, "
             f"lidar_cone=±{float(getattr(self.wrapper, 'lidar_h_half_fov_deg', 90.0)):g}°, "
             f"yaw=[{self.action_space.low[2]:g},{self.action_space.high[2]:g}] "
             f"(OOB → truncate only, no h_s penalty), "
             f"wm_num_hist={self._wm_num_hist()}, "
+            f"z_fuse_frames={self._z_fuse_frames}, "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
         def _region_summary(v: dict) -> dict:
@@ -245,7 +240,9 @@ class LatentHumanoidEnv(gym.Env):
             return {"center": np.asarray(v["center"]).tolist(), "r": v["r"]}
 
         layout = str(getattr(self.wrapper, "waypoint_layout", "regions"))
-        if layout == LAYOUT_START_GOAL_PERP:
+        if layout == LAYOUT_START_GOAL:
+            seq_desc = "start → goal (straight; resampled XY each episode)"
+        elif layout == LAYOUT_START_GOAL_PERP:
             seq_desc = "start → trans1 → trans2 → goal (resampled XY each episode)"
         elif layout == LAYOUT_BIN_SIDE_DISK:
             seq_desc = (
@@ -401,6 +398,16 @@ class LatentHumanoidEnv(gym.Env):
     @waypoint_layout.setter
     def waypoint_layout(self, value: str) -> None:
         self.wrapper.waypoint_layout = str(value)
+
+    @property
+    def z_fuse_frames(self) -> int:
+        return int(getattr(self, "_z_fuse_frames", 1))
+
+    @z_fuse_frames.setter
+    def z_fuse_frames(self, value: int) -> None:
+        n = max(1, int(value))
+        self._z_fuse_frames = n
+        self._z_fuse_hist = deque(maxlen=n)
 
     @property
     def lidar_distance_threshold(self) -> float:
@@ -611,6 +618,12 @@ class LatentHumanoidEnv(gym.Env):
         self._nom_act_noise_stds = self._parse_nom_act_noise_stds(
             getattr(args, "nom_act_noise_stds", "")
         )
+        dist = str(getattr(args, "nom_act_noise_dist", "gaussian")).lower()
+        if dist not in ("gaussian", "uniform"):
+            raise ValueError(
+                f"nom_act_noise_dist must be 'gaussian' or 'uniform', got {dist!r}"
+            )
+        self._nom_act_noise_dist = dist
         self._episode_nom_act_noise_std = float(self._nom_act_noise_std)
         thr = getattr(args, "lidar_distance_threshold", None)
         if thr is not None:
@@ -655,6 +668,9 @@ class LatentHumanoidEnv(gym.Env):
             self.wrapper.start_goal_region_r = float(args.start_goal_region_r)
         if getattr(args, "via_region_r", None) is not None:
             self.wrapper.via_region_r = float(args.via_region_r)
+        n_fuse = getattr(args, "z_fuse_frames", None)
+        if n_fuse is not None:
+            self.z_fuse_frames = int(n_fuse)
         if getattr(args, "n_free_waypoints", None) is not None:
             self.wrapper.n_free_waypoints = int(args.n_free_waypoints)
         hs_mode = getattr(args, "hs_mode", None)
@@ -742,6 +758,33 @@ class LatentHumanoidEnv(gym.Env):
     def nom_act_noise_stds(self, value) -> None:
         self._nom_act_noise_stds = self._parse_nom_act_noise_stds(value)
 
+    @property
+    def nom_act_noise_dist(self) -> str:
+        return str(getattr(self, "_nom_act_noise_dist", "gaussian"))
+
+    @nom_act_noise_dist.setter
+    def nom_act_noise_dist(self, value) -> None:
+        dist = str(value or "gaussian").lower()
+        if dist not in ("gaussian", "uniform"):
+            raise ValueError(
+                f"nom_act_noise_dist must be 'gaussian' or 'uniform', got {dist!r}"
+            )
+        self._nom_act_noise_dist = dist
+
+    def _nom_act_noise_log(self) -> str:
+        if not bool(getattr(self, "_nom_act_noise", False)):
+            return "off"
+        dist = str(getattr(self, "_nom_act_noise_dist", "gaussian")).lower()
+        stds = list(getattr(self, "_nom_act_noise_stds", []) or [])
+        w = float(getattr(self, "_nom_act_noise_std", 0.2))
+        if dist == "uniform":
+            if stds:
+                return f"U[-w,w]/ep w∈{stds} vx indep, vy=yaw"
+            return f"U[-{w:g},{w:g}] vx indep, vy=yaw"
+        if stds:
+            return f"N(0,σ)/ep σ∈{stds} vx indep, vy=yaw"
+        return f"N(0,{w:g}) vx indep, vy=yaw"
+
     @staticmethod
     def _parse_nom_act_noise_stds(value) -> list[float]:
         if value is None:
@@ -762,7 +805,7 @@ class LatentHumanoidEnv(gym.Env):
         return out
 
     def _resample_episode_nom_act_noise_std(self) -> float:
-        """Pick σ for this episode. a_nom only; a_sf never uses this."""
+        """Pick episode half-width (uniform) or σ (Gaussian). a_nom only."""
         if not bool(getattr(self, "_nom_act_noise", False)):
             self._episode_nom_act_noise_std = 0.0
             return 0.0
@@ -816,25 +859,44 @@ class LatentHumanoidEnv(gym.Env):
         return speed
 
     def _perturb_nom_action(self, cmd: np.ndarray) -> np.ndarray:
-        """Isotropic Gaussian on (vx, vy, yaw) after a_nom. Never used on a_sf."""
+        """Coverage noise on a_nom (vx, vy, yaw). Never on a_sf.
+
+        vx is independent. vy and yaw share one draw so their signs match
+        (left/right translation and turn stay consistent).
+
+        ``uniform``: vx += U[-w,w], ε~U[-w,w] then vy+=ε, yaw+=ε.
+        ``gaussian``: vx += N(0,σ), ε~N(0,σ) then vy+=ε, yaw+=ε.
+        """
         if not bool(getattr(self, "_nom_act_noise", False)):
             return cmd
-        std = float(getattr(self, "_episode_nom_act_noise_std", 0.0))
-        if std <= 0.0:
+        width = float(getattr(self, "_episode_nom_act_noise_std", 0.0))
+        if width <= 0.0:
             return cmd
         rng = getattr(self.wrapper, "_rng", None)
-        if rng is None:
-            noise = np.random.normal(0.0, std, size=3).astype(np.float32)
+        dist = str(getattr(self, "_nom_act_noise_dist", "gaussian")).lower()
+        if dist == "uniform":
+            if rng is None:
+                vx_n = float(np.random.uniform(-width, width))
+                lat_n = float(np.random.uniform(-width, width))
+            else:
+                vx_n = float(rng.uniform(-width, width))
+                lat_n = float(rng.uniform(-width, width))
         else:
-            noise = rng.normal(0.0, std, size=3).astype(np.float32)
+            if rng is None:
+                vx_n = float(np.random.normal(0.0, width))
+                lat_n = float(np.random.normal(0.0, width))
+            else:
+                vx_n = float(rng.normal(0.0, width))
+                lat_n = float(rng.normal(0.0, width))
+        noise = np.array([vx_n, lat_n, lat_n], dtype=np.float32)
         return np.asarray(cmd, dtype=np.float32).reshape(3) + noise
 
     def compute_waypoint_nav_action(self) -> np.ndarray:
         """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint.
 
-        Coverage noise is a_nom-only: |v| is sampled once per episode, then
-        optional N(0, σ) on (vx, vy, yaw) with σ also fixed for the episode,
-        then clip. a_sf never enters this path.
+        Coverage noise is a_nom-only: |v| is Uniform once per episode, then
+        optional uniform/Gaussian on vx (independent) and a shared draw on
+        (vy, yaw), then clip. a_sf never enters this path.
         """
         self.waypoint_nav.max_speed = float(
             getattr(self, "_episode_nom_speed", getattr(self.wrapper, "max_speed", 0.5))
@@ -1238,6 +1300,7 @@ class LatentHumanoidEnv(gym.Env):
         act_std = self._resample_episode_nom_act_noise_std()
         self._start_episode_recording()
         obs = self.wrapper.get_raw_obs()
+        self._reset_z_fuse_hist()
         z = self.encode(obs)
         self._reset_wm_history(obs)
         l_val = float(self.wrapper.calculate_cost())
@@ -1495,14 +1558,34 @@ class LatentHumanoidEnv(gym.Env):
             z_obs, _ = self.wm.separate_emb(z_next)
             return self._flatten_latent_obs(z_obs)
 
-    def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
-        """Encode the current observation into the critic/actor state.
+    def _reset_z_fuse_hist(self) -> None:
+        hist = getattr(self, "_z_fuse_hist", None)
+        if hist is not None:
+            hist.clear()
 
-        ``obs_mode=wm``: DINO latent from RGB (+ optional proprio).
-        ``visual_feature=patch``: flatten all DINOv2 patch tokens.
-        ``visual_feature=cls``: DINOv2 CLS token only (same frozen encoder).
-        ``obs_mode=lidar_joint``: 12-D legs ‖ full lidar ranges (ignores RGB).
+    def _fuse_z(self, z: np.ndarray) -> np.ndarray:
+        """Mean of the last ``z_fuse_frames`` full z vectors (visual + proprio).
+
+        ``z_fuse_frames <= 1`` is the original single-frame path. On episode
+        start the buffer is padded with the first z so the window is full.
         """
+        z = np.asarray(z, dtype=np.float32).reshape(-1)
+        n = int(getattr(self, "_z_fuse_frames", 1))
+        if n <= 1:
+            return z
+        hist = getattr(self, "_z_fuse_hist", None)
+        if hist is None or hist.maxlen != n:
+            self._z_fuse_hist = deque(maxlen=n)
+            hist = self._z_fuse_hist
+        if len(hist) == 0:
+            for _ in range(n):
+                hist.append(z.copy())
+        else:
+            hist.append(z.copy())
+        return np.mean(np.stack(list(hist), axis=0), axis=0).astype(np.float32)
+
+    def _encode_current(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """Single-frame encode. No temporal average."""
         if self.obs_mode == "lidar_joint":
             return self.wrapper.get_lidar_joint_state()
 
@@ -1522,6 +1605,17 @@ class LatentHumanoidEnv(gym.Env):
                 )
             lat = self._encode_obs_visual(vis_t, prop_t)
             return self._flatten_latent_obs(lat)
+
+    def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """Encode the current observation into the critic/actor state.
+
+        ``obs_mode=wm``: DINO latent from RGB (+ optional proprio).
+        ``visual_feature=patch``: flatten all DINOv2 patch tokens.
+        ``visual_feature=cls``: DINOv2 CLS token only (same frozen encoder).
+        ``obs_mode=lidar_joint``: 12-D legs ‖ full lidar ranges (ignores RGB).
+        When ``z_fuse_frames`` > 1, return the mean of the last N full z.
+        """
+        return self._fuse_z(self._encode_current(obs))
 
     def _encode_obs_visual(self, vis_t: torch.Tensor, prop_t: torch.Tensor):
         """WM ``encode_obs``, optionally swapping DINOv2 patch tokens for CLS."""

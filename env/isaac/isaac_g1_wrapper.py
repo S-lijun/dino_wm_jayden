@@ -23,6 +23,7 @@ from env.isaac.waypoint_utils import (
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     DEFAULT_VIA_REGION_R,
     LAYOUT_BIN_SIDE_DISK,
+    LAYOUT_START_GOAL,
     LAYOUT_START_GOAL_PERP,
     PASS_SIDE_CYCLE,
     PASS_SIDE_TRAIN,
@@ -33,6 +34,7 @@ from env.isaac.waypoint_utils import (
     sample_point_in_half_disk,
     sample_point_in_region,
     sample_perp_points_on_segment,
+    sample_start_goal_path,
     sample_start_goal_perp_path,
     waypoints_to_list,
     quat_to_yaw,
@@ -267,9 +269,11 @@ class IsaacG1Wrapper:
         self.arena_y_min = float(DEFAULT_ARENA_BOUNDS[2])
         self.arena_y_max = float(DEFAULT_ARENA_BOUNDS[3])
         # "regions" = original start/front/left|right.
-        # "start_goal_perp" = start + 2 perp vias + goal.
+        # "start_goal" = start → goal only; bins in the ±perp_offset band.
+        # "start_goal_perp" = start + 2 vias in that same band + goal.
         # "bin_side_disk" = start/goal disks + one bin-side via disk.
         self.waypoint_layout = "regions"
+        # Bin centers are uniform in the ±perp_offset strip around the SG line.
         self.perp_offset = float(DEFAULT_PERP_OFFSET_M)
         self.min_start_goal_dist = float(DEFAULT_MIN_START_GOAL_DIST)
         self.start_goal_region_r = float(DEFAULT_START_GOAL_REGION_R)
@@ -684,7 +688,9 @@ class IsaacG1Wrapper:
           (switch-collect also appends behind-bin ``back``).
         - ``spawn_hemisphere_pass=True`` (formal train only): alternate spawn
           half-disk coupled to matching left/right (no front/middle).
-        - ``waypoint_layout="start_goal_perp"``: start + 2 perp vias + goal.
+        - ``waypoint_layout="start_goal"``: start → goal only.
+        - ``waypoint_layout="start_goal_perp"``: start + 2 vias in the
+          ±perp_offset band + goal.
         - ``waypoint_layout="bin_side_disk"``: start/goal disks + one via disk
           beside a single bin, or 6 free arena waypoints when the bin is absent.
         """
@@ -711,6 +717,18 @@ class IsaacG1Wrapper:
                 for p in sampled["obstacle_xys"]
             ]
             return sampled["waypoints"], list(sampled["names"])
+        if layout == LAYOUT_START_GOAL:
+            wps, names, spawn_yaw = sample_start_goal_path(
+                rng,
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+                min_start_goal_dist=float(self.min_start_goal_dist),
+                margin=float(self.arena_sample_margin),
+            )
+            self._spawn_yaw = float(spawn_yaw)
+            return wps, names
         if layout == LAYOUT_START_GOAL_PERP:
             wps, names, spawn_yaw = sample_start_goal_perp_path(
                 rng,

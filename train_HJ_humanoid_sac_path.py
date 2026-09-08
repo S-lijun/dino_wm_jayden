@@ -196,19 +196,37 @@ parser.add_argument(
     "--waypoint_layout",
     type=str,
     default="start_goal_perp",
-    choices=["regions", "start_goal_perp"],
+    choices=["regions", "start_goal", "start_goal_perp"],
+    help=(
+        "start_goal: straight start→goal, bins in the ±perp_offset band. "
+        "start_goal_perp: start + 2 vias in that same band + goal."
+    ),
 )
 parser.add_argument(
     "--perp_offset",
     type=float,
     default=2.5,
-    help="Perpendicular offset (m) of transition waypoints AND obstacles.",
+    help=(
+        "Half-width (m) of the band around the start–goal line. Obstacle "
+        "centers and start_goal_perp vias are sampled uniformly in "
+        "U[-perp_offset, perp_offset] off the line."
+    ),
 )
 parser.add_argument(
     "--min_start_goal_dist",
     type=float,
     default=4.0,
     help="Reject start/goal samples closer than this (m).",
+)
+parser.add_argument(
+    "--z_fuse_frames",
+    type=int,
+    default=5,
+    help=(
+        "Average the last N full z vectors (visual + proprio) and use that "
+        "as critic/actor/switch input. 1 = original single-frame z. "
+        "Default 5 = past 4 frames + current."
+    ),
 )
 parser.add_argument(
     "--layout_seed",
@@ -292,25 +310,42 @@ parser.add_argument(
     "--nom_act_noise",
     action="store_true",
     help=(
-        "After a_nom is computed (including |v| resample), add independent "
-        "N(0, σ) to vx, vy, yaw, then clip. a_nom only. σ is chosen once "
-        "per episode from --nom_act_noise_stds (else --nom_act_noise_std)."
+        "After a_nom is computed (including |v| resample), add noise to "
+        "(vx, vy, yaw) then clip. vx is independent; vy and yaw share one "
+        "draw so their signs match. a_nom only. Width/σ is chosen once "
+        "per episode from --nom_act_noise_stds (else --nom_act_noise_std). "
+        "Distribution is --nom_act_noise_dist."
+    ),
+)
+parser.add_argument(
+    "--nom_act_noise_dist",
+    type=str,
+    default="uniform",
+    choices=["uniform", "gaussian"],
+    help=(
+        "a_nom (vx,vy,yaw) noise. vx is independent; vy and yaw share one "
+        "draw. uniform: vx += U[-w,w], ε~U[-w,w] → vy+=ε, yaw+=ε. "
+        "gaussian: same with N(0,σ)."
     ),
 )
 parser.add_argument(
     "--nom_act_noise_std",
     type=float,
     default=0.2,
-    help="Fixed Gaussian std if --nom_act_noise_stds is empty.",
+    help=(
+        "Fixed half-width w (uniform: U[-w,w]) or σ (gaussian) if "
+        "--nom_act_noise_stds is empty. Example: 0.2 → vx += U[-0.2,0.2], "
+        "then one ε~U[-0.2,0.2] added to both vy and yaw."
+    ),
 )
 parser.add_argument(
     "--nom_act_noise_stds",
     type=str,
-    default="0.05,0.2,0.4",
+    default="",
     help=(
-        "Comma-separated episode-wise σ for a_nom (vx,vy,yaw). Each episode "
-        "picks one uniformly, then every step uses N(0, σ). a_sf never. "
-        "Empty string: fall back to --nom_act_noise_std."
+        "Optional comma-separated episode-wise w/σ for a_nom (vx,vy,yaw). "
+        "Each episode picks one uniformly, then every step uses that width. "
+        "Empty string: fall back to --nom_act_noise_std. a_sf never."
     ),
 )
 parser.add_argument(
@@ -504,6 +539,21 @@ def args_type(default):
         return x
 
     return lambda x: parse_string(x) if isinstance(x, str) else parse_object(x)
+
+
+def _nom_act_noise_banner(args, *, sep: str = ", ") -> str:
+    if not bool(getattr(args, "nom_act_noise", False)):
+        return ""
+    dist = str(getattr(args, "nom_act_noise_dist", "uniform")).lower()
+    stds = str(getattr(args, "nom_act_noise_stds", "") or "").strip()
+    w = float(args.nom_act_noise_std)
+    if dist == "uniform":
+        if stds:
+            return f"nom_act_U[-w,w] w∈{{{stds}}}/ep vx indep, vy=yaw{sep}"
+        return f"nom_act_U[-{w:g},{w:g}] vx indep, vy=yaw{sep}"
+    if stds:
+        return f"nom_act_σ∈{{{stds}}}/ep vx indep, vy=yaw{sep}"
+    return f"nom_act_N(0,{w:g}) vx indep, vy=yaw{sep}"
 
 
 def get_args_and_merge_config():
@@ -1108,6 +1158,7 @@ def main():
             else " (lidar only)"
         )
         + f", lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
+        + f", z_fuse_frames={int(getattr(args, 'z_fuse_frames', 5))}"
         + ", "
         f"yaw_limit={float(args.yaw_limit):g}, "
         f"freeze_yaw={freeze_yaw}, "
@@ -1118,15 +1169,7 @@ def main():
             if bool(getattr(args, "randomize_nom_speed", False))
             else "nom_|v|=0.5, "
         )
-        + (
-            (
-                f"nom_act_σ∈{{{str(getattr(args, 'nom_act_noise_stds', '')).strip()}}}/ep, "
-                if str(getattr(args, "nom_act_noise_stds", "")).strip()
-                else f"nom_act_N(0,{float(args.nom_act_noise_std):g}), "
-            )
-            if bool(getattr(args, "nom_act_noise", False))
-            else ""
-        )
+        + _nom_act_noise_banner(args, sep=", ")
         + f"obstacles: absent_p={float(args.obstacle_absent_prob):g} "
         f"P(2|present)={float(args.two_obstacle_prob):g} max={int(args.max_n_obstacles)}"
     )
@@ -1244,7 +1287,7 @@ def main():
 
     train_collector.collect = _collect_with_act_nom  # type: ignore[method-assign]
 
-    # Scene: start + 2 perp vias + goal; bins on the same perpendicular.
+    # Scene: start→goal (or start + 2 perp vias); bins on the SG perpendicular.
     def _apply_path_scene_layout() -> None:
         train_envs.set_env_attr("obstacle_absent_prob", float(args.obstacle_absent_prob))
         train_envs.set_env_attr("two_obstacle_prob", float(args.two_obstacle_prob))
@@ -1298,6 +1341,10 @@ def main():
             "nom_act_noise_stds", str(getattr(args, "nom_act_noise_stds", "") or "")
         )
         train_envs.set_env_attr(
+            "nom_act_noise_dist",
+            str(getattr(args, "nom_act_noise_dist", "uniform")),
+        )
+        train_envs.set_env_attr(
             "sidestep_hold_steps", int(getattr(args, "a_good_hold_steps", 0))
         )
         train_envs.set_env_attr(
@@ -1307,16 +1354,26 @@ def main():
         train_envs.set_env_attr(
             "alternate_collect_controllers", bool(args.alternate_collect)
         )
+        train_envs.set_env_attr(
+            "z_fuse_frames", int(getattr(args, "z_fuse_frames", 5))
+        )
 
     arena_desc = (
         f"x[{float(args.arena_x_min):g},{float(args.arena_x_max):g}] "
         f"y[{float(args.arena_y_min):g},{float(args.arena_y_max):g}]"
     )
-    path_desc = (
-        "start → 2 perp vias (±"
-        f"{float(args.perp_offset):g} m) → goal; "
-        f"min |G-S|={float(args.min_start_goal_dist):g} m"
-    )
+    if str(args.waypoint_layout) == "start_goal":
+        path_desc = (
+            "start → goal (straight); bins in a ±"
+            f"{float(args.perp_offset):g} m band around the line; "
+            f"min |G-S|={float(args.min_start_goal_dist):g} m"
+        )
+    else:
+        path_desc = (
+            "start → 2 vias in a ±"
+            f"{float(args.perp_offset):g} m band → goal; "
+            f"min |G-S|={float(args.min_start_goal_dist):g} m"
+        )
 
     _actor_forward = policy.forward
     _expl_fn = policy.exploration_noise
@@ -1332,15 +1389,7 @@ def main():
             if bool(getattr(args, "randomize_nom_speed", False))
             else "nom_|v|=0.5; "
         )
-        + (
-            (
-                f"nom_act_σ∈{{{str(getattr(args, 'nom_act_noise_stds', '')).strip()}}}/ep; "
-                if str(getattr(args, "nom_act_noise_stds", "")).strip()
-                else f"nom_act_N(0,{float(args.nom_act_noise_std):g}); "
-            )
-            if bool(getattr(args, "nom_act_noise", False))
-            else ""
-        )
+        + _nom_act_noise_banner(args, sep="; ")
         + f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
         f"yaw=±{float(args.yaw_limit):g}; "
         f"obstacles: absent_p={float(args.obstacle_absent_prob):g}, "

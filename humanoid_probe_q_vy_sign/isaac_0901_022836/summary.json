@@ -1,0 +1,66 @@
+{
+  "ckpt": "C:\\dino_wm_jayden\\runs\\sac_hj_humanoid_path\\sac-path-cls-concat-wm_ckpt_18-27-17-0831_0105-resume36\\epoch_id_79\\policy.pth",
+  "scene": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      2.0,
+      0.0
+    ],
+    [
+      4.0,
+      -0.25
+    ],
+    [
+      5.5,
+      0.0
+    ]
+  ],
+  "bins": [
+    [
+      4.0,
+      0.0
+    ]
+  ],
+  "note": "z from LatentHumanoidEnv.encode() on live RGB+proprio",
+  "modes": {
+    "waypoint_only": {
+      "mode": "waypoint_only",
+      "end_reason": "stuck",
+      "n_steps": 286,
+      "z_norm_mean": 45.26511952232536,
+      "actor_vy_pos_frac": 0.6888111888111889,
+      "actor_vy_mean": 0.08666737019116957,
+      "delta_sat_mean": 0.014199330985962927,
+      "delta_sat_std": 0.07994063685530821,
+      "frac_Qplus_gt_Qminus": 0.534965034965035,
+      "abs_delta_sat_mean": 0.04764723887185117
+    },
+    "safe_only": {
+      "mode": "safe_only",
+      "end_reason": "out_of_bounds",
+      "n_steps": 83,
+      "z_norm_mean": 45.19220440787219,
+      "actor_vy_pos_frac": 0.9518072289156626,
+      "actor_vy_mean": 0.17670310192169195,
+      "delta_sat_mean": 0.07239927638726062,
+      "delta_sat_std": 0.11844452105672641,
+      "frac_Qplus_gt_Qminus": 0.8192771084337349,
+      "abs_delta_sat_mean": 0.08211847008710885
+    },
+    "switching": {
+      "mode": "switching",
+      "end_reason": "all_waypoints",
+      "n_steps": 227,
+      "z_norm_mean": 45.777058939392354,
+      "actor_vy_pos_frac": 0.973568281938326,
+      "actor_vy_mean": 0.24270241454013908,
+      "delta_sat_mean": 0.11076936207810162,
+      "delta_sat_std": 0.19384990824058,
+      "frac_Qplus_gt_Qminus": 0.8061674008810573,
+      "abs_delta_sat_mean": 0.1335000925192749
+    }
+  }
+}
