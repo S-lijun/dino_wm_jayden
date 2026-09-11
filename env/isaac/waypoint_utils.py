@@ -518,6 +518,8 @@ def sample_perp_points_on_segment(
     n: int,
     *,
     perp_offset: float = DEFAULT_PERP_OFFSET_M,
+    perp_keepout: float = 0.0,
+    side: int | None = None,
     x_min: float = DEFAULT_ARENA_BOUNDS[0],
     x_max: float = DEFAULT_ARENA_BOUNDS[1],
     y_min: float = DEFAULT_ARENA_BOUNDS[2],
@@ -530,10 +532,11 @@ def sample_perp_points_on_segment(
     margin: float = 0.3,
     max_tries: int = 256,
 ) -> list[np.ndarray]:
-    """Sample ``n`` points in the ±perp_offset band around start→goal.
+    """Sample ``n`` points off the start→goal line.
 
-    Each perpendicular offset is ~ U[-perp_offset, perp_offset], so centers
-    fill a rectangle around the segment and may land on the segment itself.
+    ``|offset| ~ U[perp_keepout, perp_offset]``. ``perp_keepout>0`` leaves a
+    corridor on the line (no bins dead ahead). ``side`` is +1 = left of
+    heading (CCW normal), -1 = right; ``None`` draws the sign at random.
     Empty if ``n<=0``.
     """
     n = int(n)
@@ -548,9 +551,39 @@ def sample_perp_points_on_segment(
     tangent = delta / dist
     normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
     off = abs(float(perp_offset))
+    keep = min(abs(float(perp_keepout)), off)
+    side_sign = None if side is None else (1.0 if int(side) >= 0 else -1.0)
 
     def _draw_offsets() -> list[float]:
-        return [float(rng.uniform(-off, off)) for _ in range(n)]
+        mags = [
+            float(keep) if off <= keep else float(rng.uniform(keep, off))
+            for _ in range(n)
+        ]
+        if side_sign is None:
+            return [
+                m * (1.0 if rng.random() < 0.5 else -1.0) for m in mags
+            ]
+        return [side_sign * m for m in mags]
+
+    def _place_at(foot: np.ndarray, signed_off: float) -> np.ndarray | None:
+        pt = foot + signed_off * normal
+        if _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=margin):
+            return pt
+        if side_sign is None:
+            flipped = foot - signed_off * normal
+            if _point_in_rect(flipped, x_min, x_max, y_min, y_max, margin=margin):
+                return flipped
+            if _point_in_rect(flipped, x_min, x_max, y_min, y_max, margin=0.15):
+                return _clamp_to_rect(
+                    flipped, x_min, x_max, y_min, y_max, margin=0.15
+                )
+        sgn = float(np.sign(signed_off)) if abs(signed_off) > 1e-9 else 1.0
+        for frac in (0.85, 0.7, 0.55, 0.4):
+            mag = max(keep, abs(signed_off) * frac)
+            cand = foot + sgn * mag * normal
+            if _point_in_rect(cand, x_min, x_max, y_min, y_max, margin=0.15):
+                return cand
+        return None
 
     # Short segments with a narrow band have no placement meeting the nominal
     # spacing, so relax instead of raising (a crash kills the whole run).
@@ -566,12 +599,8 @@ def sample_perp_points_on_segment(
             ok = True
             for t, signed_off in zip(ts, _draw_offsets()):
                 foot = start + t * delta
-                pt = foot + signed_off * normal
-                if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=margin):
-                    pt = foot - signed_off * normal
-                if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.15):
-                    pt = _clamp_to_rect(pt, x_min, x_max, y_min, y_max, margin=0.15)
-                if not _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=0.05):
+                pt = _place_at(foot, signed_off)
+                if pt is None:
                     ok = False
                     break
                 if float(np.linalg.norm(pt - start)) < end_min:

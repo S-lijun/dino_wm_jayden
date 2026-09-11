@@ -273,8 +273,9 @@ class IsaacG1Wrapper:
         # "start_goal_perp" = start + 2 vias in that same band + goal.
         # "bin_side_disk" = start/goal disks + one bin-side via disk.
         self.waypoint_layout = "regions"
-        # Bin centers are uniform in the ±perp_offset strip around the SG line.
+        # Bin centers: |offset| in [perp_keepout, perp_offset]; side is 2-ep blocks.
         self.perp_offset = float(DEFAULT_PERP_OFFSET_M)
+        self.perp_keepout = 0.0
         self.min_start_goal_dist = float(DEFAULT_MIN_START_GOAL_DIST)
         self.start_goal_region_r = float(DEFAULT_START_GOAL_REGION_R)
         self.via_region_r = float(DEFAULT_VIA_REGION_R)
@@ -282,9 +283,9 @@ class IsaacG1Wrapper:
         self.arena_sample_margin = 0.5
         self._spawn_yaw: float | None = None
         self._layout_obstacle_xys: list[np.ndarray] = []
-        # Env-space velocity clip. Original pipeline: yaw in [-0.5, 0.5].
-        self.action_low = np.array([0.0, -1.0, -0.5], dtype=np.float32)
-        self.action_high = np.array([1.0, 1.0, 0.5], dtype=np.float32)
+        # Env-space velocity clip. Path env overwrites yaw via --yaw_limit.
+        self.action_low = np.array([0.0, -0.5, -1.0], dtype=np.float32)
+        self.action_high = np.array([1.0, 0.5, 1.0], dtype=np.float32)
         # Copy defaults (start disk r=1, front disk r=0.5, left|right r=0.5, middle point).
         if trajectory_regions is not None:
             self.trajectory_regions = trajectory_regions
@@ -622,6 +623,20 @@ class IsaacG1Wrapper:
             return 2
         return 1
 
+    def _path_obstacle_side(self) -> int:
+        """+1 = left of start→goal heading, -1 = right. Two-episode blocks.
+
+        With alternate_collect, episodes 1–2 left, 3–4 right, … so each
+        waypoint / switch pair shares a side.
+        """
+        if bool(getattr(self, "alternate_collect_controllers", False)):
+            ep = int(self._collect_ep_toggle) - 1
+            if ep < 0:
+                ep = 0
+        else:
+            ep = max(0, int(self._n_scene_resets) - 1)
+        return 1 if (int(ep) // 2) % 2 == 0 else -1
+
     def _place_path_obstacles(
         self,
         rng: np.random.Generator,
@@ -631,24 +646,35 @@ class IsaacG1Wrapper:
         n_obstacles: int | None = None,
         positions: list[np.ndarray] | None = None,
     ) -> dict[str, tuple[float, float, float]]:
-        """Place 0/1/2 bins on the start-goal perpendicular. Hide unused assets."""
+        """Place 0/1/2 bins off the start-goal line. Hide unused assets."""
         if positions is not None:
             xys = [np.asarray(p, dtype=np.float64).reshape(2) for p in positions]
             n = len(xys)
         else:
             n = int(self._choose_n_path_obstacles(rng) if n_obstacles is None else n_obstacles)
             n = max(0, min(n, int(self._max_n_obstacles)))
+            side = self._path_obstacle_side()
             xys = sample_perp_points_on_segment(
                 rng,
                 start_xy,
                 goal_xy,
                 n,
                 perp_offset=float(self.perp_offset),
+                perp_keepout=float(getattr(self, "perp_keepout", 0.0)),
+                side=side,
                 x_min=float(self.arena_x_min),
                 x_max=float(self.arena_x_max),
                 y_min=float(self.arena_y_min),
                 y_max=float(self.arena_y_max),
             ) if n > 0 else []
+            if n > 0:
+                print(
+                    f"[IsaacG1Wrapper] path bins side="
+                    f"{'left' if side > 0 else 'right'} "
+                    f"keepout={float(getattr(self, 'perp_keepout', 0.0)):g} "
+                    f"outer={float(self.perp_offset):g} n={n}",
+                    flush=True,
+                )
         self._n_obstacles = len(xys)
         self.obstacle_present = self._n_obstacles > 0
         self._obstacle_xy_list = [p.copy() for p in xys]
@@ -1645,8 +1671,7 @@ class IsaacG1Wrapper:
         if action.shape[0] != 3:
             raise ValueError(f"Expected 3-d velocity action, got shape {action.shape}")
 
-        # HJ / env action: vx in [0, 1]; vy in [-1, 1]; yaw from action_low/high
-        # (path pipeline may widen yaw via --yaw_limit).
+        # HJ / env action: vx [0,1], vy [-0.5,0.5]; yaw from action_low/high.
         low = np.asarray(self.action_low, dtype=np.float32).reshape(-1)
         high = np.asarray(self.action_high, dtype=np.float32).reshape(-1)
         vx = float(np.clip(action[0], float(low[0]), float(high[0])))

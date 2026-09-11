@@ -32,7 +32,7 @@ DEFAULT_WANDB_VIDEO_EVERY = 1
 DEFAULT_WANDB_VIDEO_SIZE = (120, 160)  # (H, W) for uploaded rollouts
 # Env-space velocity box (yaw still comes from --yaw_limit).
 ENV_VX_RANGE = (0.0, 1.0)
-ENV_VY_RANGE = (-1.0, 1.0)
+ENV_VY_RANGE = (-0.5, 0.5)
 
 
 class LatentHumanoidEnv(gym.Env):
@@ -469,6 +469,14 @@ class LatentHumanoidEnv(gym.Env):
         self.wrapper.perp_offset = float(value)
 
     @property
+    def perp_keepout(self) -> float:
+        return float(getattr(self.wrapper, "perp_keepout", 0.0))
+
+    @perp_keepout.setter
+    def perp_keepout(self, value: float) -> None:
+        self.wrapper.perp_keepout = max(0.0, float(value))
+
+    @property
     def start_goal_region_r(self) -> float:
         return float(getattr(self.wrapper, "start_goal_region_r", 1.0))
 
@@ -662,6 +670,8 @@ class LatentHumanoidEnv(gym.Env):
                 self.wrapper.arena_y_max = float(args.arena_y_max)
         if getattr(args, "perp_offset", None) is not None:
             self.wrapper.perp_offset = float(args.perp_offset)
+        if getattr(args, "perp_keepout", None) is not None:
+            self.wrapper.perp_keepout = max(0.0, float(args.perp_keepout))
         if getattr(args, "min_start_goal_dist", None) is not None:
             self.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
         if getattr(args, "start_goal_region_r", None) is not None:

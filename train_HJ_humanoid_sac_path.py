@@ -10,7 +10,7 @@ Layout:
   Hitting the rectangle edge resets; that transition is not stored for updates.
 
   h_s = lidar_min - 1.5 (LiDAR only; contact force is not folded in).
-  Yaw action in [-1, 1].
+  Action box: vx [0,1], vy [-0.5,0.5], yaw [-1,1].
   Blue-bin placement is still the original fixed (3.5, -2) until specified.
 
   Default critic is LateFusionCritic: z and a each through an MLP to the
@@ -207,9 +207,19 @@ parser.add_argument(
     type=float,
     default=2.5,
     help=(
-        "Half-width (m) of the band around the start–goal line. Obstacle "
-        "centers and start_goal_perp vias are sampled uniformly in "
-        "U[-perp_offset, perp_offset] off the line."
+        "Outer half-width (m) of the obstacle band around start–goal. "
+        "Bin |offset| ~ U[--perp_keepout, this]. start_goal_perp vias still "
+        "use U[-this, this]."
+    ),
+)
+parser.add_argument(
+    "--perp_keepout",
+    type=float,
+    default=0.25,
+    help=(
+        "Inner keep-out (m) on both sides of the start–goal line. Bins are "
+        "not placed in ±this corridor (no dead-ahead obstacles). 0 = old "
+        "full band. Default 0.25."
     ),
 )
 parser.add_argument(
@@ -515,7 +525,7 @@ def _log_update_data_bar_filter(self, data, losses):
 OffpolicyTrainer.log_update_data = _log_update_data_bar_filter  # type: ignore[method-assign]
 
 from wm_load import load_model
-from env.isaac.latent_humanoid_env import LatentHumanoidEnv
+from env.isaac.latent_humanoid_env import ENV_VY_RANGE, LatentHumanoidEnv
 from env.isaac.skip_update_buffer import SkipUpdateReplayBuffer
 from env.isaac.ckpt_utils import save_epoch_checkpoint
 from env.isaac.late_fusion_critic import make_q_critic
@@ -1160,6 +1170,7 @@ def main():
         + f", lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
         + f", z_fuse_frames={int(getattr(args, 'z_fuse_frames', 5))}"
         + ", "
+        f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}], "
         f"yaw_limit={float(args.yaw_limit):g}, "
         f"freeze_yaw={freeze_yaw}, "
         f"alternate_collect={bool(args.alternate_collect)} "
@@ -1305,6 +1316,9 @@ def main():
         train_envs.set_env_attr("arena_y_max", float(args.arena_y_max))
         train_envs.set_env_attr("use_arena_bounds", True)
         train_envs.set_env_attr("perp_offset", float(args.perp_offset))
+        train_envs.set_env_attr(
+            "perp_keepout", float(getattr(args, "perp_keepout", 0.25))
+        )
         train_envs.set_env_attr("min_start_goal_dist", float(args.min_start_goal_dist))
         train_envs.set_env_attr(
             "lidar_distance_threshold", float(args.lidar_distance_threshold)
@@ -1364,8 +1378,9 @@ def main():
     )
     if str(args.waypoint_layout) == "start_goal":
         path_desc = (
-            "start → goal (straight); bins in a ±"
-            f"{float(args.perp_offset):g} m band around the line; "
+            "start → goal (straight); bins |offset|~U["
+            f"{float(getattr(args, 'perp_keepout', 0.25)):g},"
+            f"{float(args.perp_offset):g}] m, side L/L/R/R every 2 eps; "
             f"min |G-S|={float(args.min_start_goal_dist):g} m"
         )
     else:
@@ -1391,10 +1406,12 @@ def main():
         )
         + _nom_act_noise_banner(args, sep="; ")
         + f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
+        f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}]; "
         f"yaw=±{float(args.yaw_limit):g}; "
         f"obstacles: absent_p={float(args.obstacle_absent_prob):g}, "
         f"P(2|present)={float(args.two_obstacle_prob):g}, "
-        f"perp ±{float(args.perp_offset):g} m"
+        f"perp U[{float(getattr(args, 'perp_keepout', 0.25)):g},"
+        f"{float(args.perp_offset):g}] L/L/R/R"
         f"{'; resume' if args.resume_policy else ''})..."
     )
 

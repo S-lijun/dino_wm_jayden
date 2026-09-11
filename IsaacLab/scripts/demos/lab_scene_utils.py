@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
-from pxr import Gf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 
 LAB_EXTERNAL_PRIM = "/World/ExternalScene"
 # lab.usda defaultPrim "World" is composed onto ExternalScene (no extra /World segment).
@@ -106,6 +106,91 @@ def _get_stage() -> Usd.Stage:
 def validate_gs_payload(lab_path: str | None = None) -> bool:
     gs_path = gs_payload_path(lab_path)
     return os.path.isfile(gs_path)
+
+
+def _ensure_payloads_loaded(stage: Usd.Stage) -> None:
+    ext = stage.GetPrimAtPath(LAB_EXTERNAL_PRIM)
+    if ext and ext.IsValid():
+        ext.Load()
+    try:
+        stage.Load()
+    except Exception:
+        pass
+
+
+def _nurec_volume_prims(stage: Usd.Stage) -> list[Usd.Prim]:
+    prims: list[Usd.Prim] = []
+    for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+        if not prim.IsValid() or not prim.IsLoaded():
+            continue
+        flag = prim.GetAttribute("omni:nurec:isNuRecVolume")
+        is_flag = bool(flag.IsValid() and flag.Get())
+        if prim.GetTypeName() == "Volume" or is_flag:
+            prims.append(prim)
+    return prims
+
+
+def _session_set_float4(prim: Usd.Prim, name: str, value: Gf.Vec4f) -> Usd.Attribute:
+    attr = prim.GetAttribute(name)
+    if not attr.IsValid():
+        attr = prim.CreateAttribute(name, Sdf.ValueTypeNames.Float4, custom=True)
+    attr.Set(value)
+    return attr
+
+
+def apply_nurec_floor_color(
+    *,
+    deyellow: float = 0.55,
+    verbose: bool = True,
+) -> int:
+    """Session-layer NuRec CCM on the Volume prim. Does not write assets.
+
+    Official knob is OmniNuRecVolumeAPI on the UsdVol Volume, not the field
+    child. Mixes blue into R/G so yellow goes grey instead of muddy brown.
+    """
+    stage = _get_stage()
+    _ensure_payloads_loaded(stage)
+    volumes = _nurec_volume_prims(stage)
+    if not volumes:
+        if verbose:
+            print("[WARN] No NuRec Volume prim found; floor color override skipped.")
+        return 0
+
+    k = float(np.clip(deyellow, 0.0, 1.0))
+    # R' = (1-k)R + k B, G' = (1-k)G + k B, B' = B. No blue boost.
+    ccm_r = Gf.Vec4f(1.0 - k, 0.0, k, 0.0)
+    ccm_g = Gf.Vec4f(0.0, 1.0 - k, k, 0.0)
+    ccm_b = Gf.Vec4f(0.0, 0.0, 1.0, 0.0)
+
+    session = stage.GetSessionLayer()
+
+    def _apply(prim: Usd.Prim) -> None:
+        try:
+            prim.ApplyAPI("OmniNuRecVolumeAPI")
+        except Exception as exc:
+            if verbose:
+                print(f"[WARN] ApplyAPI OmniNuRecVolumeAPI on {prim.GetPath()}: {exc}")
+        for name, value in (
+            ("omni:nurec:ccmR", ccm_r),
+            ("omni:nurec:ccmG", ccm_g),
+            ("omni:nurec:ccmB", ccm_b),
+        ):
+            attr = _session_set_float4(prim, name, value)
+            got = attr.Get()
+            if verbose:
+                print(f"[INFO] set {prim.GetPath()}.{name} -> {got}")
+
+    if session is not None:
+        with Usd.EditContext(stage, session):
+            for prim in volumes:
+                _apply(prim)
+    else:
+        for prim in volumes:
+            _apply(prim)
+
+    if verbose:
+        print(f"[INFO] NuRec floor CCM on {len(volumes)} Volume(s), deyellow={k:g}")
+    return len(volumes)
 
 
 def load_lab_scene_usd(

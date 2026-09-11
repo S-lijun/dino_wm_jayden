@@ -242,6 +242,12 @@ parser.add_argument("--arena_y_min", type=float, default=-4.0)
 parser.add_argument("--arena_y_max", type=float, default=2.0)
 parser.add_argument("--waypoint_layout", type=str, default="start_goal")
 parser.add_argument("--perp_offset", type=float, default=1.0)
+parser.add_argument(
+    "--perp_keepout",
+    type=float,
+    default=0.25,
+    help="Inner keep-out (m) on both sides of start–goal. Must match training.",
+)
 parser.add_argument("--min_start_goal_dist", type=float, default=5.0)
 parser.add_argument("--path_obstacle_layout", action="store_true", default=True)
 parser.add_argument("--max_n_obstacles", type=int, default=2)
@@ -671,6 +677,7 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
     env.wrapper.arena_y_min = float(args.arena_y_min)
     env.wrapper.arena_y_max = float(args.arena_y_max)
     env.wrapper.perp_offset = float(args.perp_offset)
+    env.wrapper.perp_keepout = float(getattr(args, "perp_keepout", 0.0))
     env.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
     env.wrapper.lidar_distance_threshold = float(args.lidar_distance_threshold)
     env.wrapper.lidar_h_half_fov_deg = float(args.lidar_h_half_fov_deg)

@@ -151,6 +151,77 @@ def merge_depth_maps_multi(
     return merged
 
 
+def grade_rgb(
+    rgb: np.ndarray,
+    *,
+    exposure_ev: float = 0.0,
+    gamma: float = 1.0,
+    highlight: float = 0.0,
+    saturation: float = 1.0,
+    wb_temp: float = 0.0,
+    contrast: float = 0.0,
+) -> np.ndarray:
+    """Camera-side grade. Default is identity except optional white balance.
+
+    ``wb_temp``: negative = pull yellow toward grey (does not boost blue).
+    ``exposure_ev`` is stops (negative darkens). ``highlight`` Reinhard
+    shoulder (0 disables).
+    """
+    img = np.asarray(rgb, dtype=np.float32)
+    if img.size == 0:
+        return rgb
+    if img.max() > 1.5:
+        img = img / 255.0
+    img = np.clip(img, 0.0, None)
+
+    temp = float(wb_temp)
+    if temp < -1e-6:
+        # Only subtract yellow where R/G exceed B. Never raise blue,
+        # so already-cool tiles do not go white-cyan.
+        amount = float(np.clip(-temp, 0.0, 1.5))
+        r = img[..., 0]
+        g = img[..., 1]
+        b = img[..., 2]
+        yellow = 0.5 * (r + g)
+        excess = np.clip(yellow - b, 0.0, None)
+        denom = np.maximum(yellow, 1e-6)
+        img = np.stack(
+            (
+                r - amount * excess * (r / denom),
+                g - amount * excess * (g / denom),
+                b,
+            ),
+            axis=-1,
+        )
+    elif temp > 1e-6:
+        r_gain = 1.0 + 0.55 * temp
+        b_gain = 1.0 - 0.65 * temp
+        img = img * np.array([r_gain, 1.0, b_gain], dtype=np.float32)
+
+    img = img * (2.0 ** float(exposure_ev))
+    h = float(highlight)
+    if h > 1e-6:
+        img = img / (1.0 + img * h)
+
+    c = float(contrast)
+    if abs(c) > 1e-6:
+        y = 0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+        y2 = np.clip(y, 0.0, 1.0)
+        y2 = 0.5 + (y2 - 0.5) * (1.0 + 1.8 * c) / (1.0 + 1.8 * c * 2.0 * np.abs(y2 - 0.5))
+        img = img * (y2 / np.maximum(y, 1e-4))[..., None]
+
+    g = float(gamma)
+    if abs(g - 1.0) > 1e-6:
+        img = np.power(np.clip(img, 0.0, None), 1.0 / g)
+    sat = float(saturation)
+    if abs(sat - 1.0) > 1e-6:
+        luma = (
+            0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+        )[..., None]
+        img = luma + (img - luma) * sat
+    return (np.clip(img, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
 def resize_rgb(rgb: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     from PIL import Image
 
