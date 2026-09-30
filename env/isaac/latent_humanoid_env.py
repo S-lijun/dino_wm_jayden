@@ -876,6 +876,9 @@ class LatentHumanoidEnv(gym.Env):
 
         ``uniform``: vx += U[-w,w], ε~U[-w,w] then vy+=ε, yaw+=ε.
         ``gaussian``: vx += N(0,σ), ε~N(0,σ) then vy+=ε, yaw+=ε.
+
+        Shared ε can still flip only the smaller of (vy, yaw). If they
+        disagree after the add, flip the smaller-abs one to match the larger.
         """
         if not bool(getattr(self, "_nom_act_noise", False)):
             return cmd
@@ -898,8 +901,23 @@ class LatentHumanoidEnv(gym.Env):
             else:
                 vx_n = float(rng.normal(0.0, width))
                 lat_n = float(rng.normal(0.0, width))
-        noise = np.array([vx_n, lat_n, lat_n], dtype=np.float32)
-        return np.asarray(cmd, dtype=np.float32).reshape(3) + noise
+        out = np.asarray(cmd, dtype=np.float32).reshape(3) + np.array(
+            [vx_n, lat_n, lat_n], dtype=np.float32
+        )
+        return self._align_nom_vy_yaw_signs(out)
+
+    @staticmethod
+    def _align_nom_vy_yaw_signs(cmd: np.ndarray) -> np.ndarray:
+        """If sign(vy)!=sign(yaw), flip the smaller-abs axis. Zeros stay."""
+        out = np.asarray(cmd, dtype=np.float32).reshape(3).copy()
+        vy, yaw = float(out[1]), float(out[2])
+        if vy * yaw >= 0.0:
+            return out
+        if abs(yaw) >= abs(vy):
+            out[1] = float(np.copysign(abs(vy), yaw))
+        else:
+            out[2] = float(np.copysign(abs(yaw), vy))
+        return out
 
     def compute_waypoint_nav_action(self) -> np.ndarray:
         """Env-space (vx, vy, yaw_rate) from WaypointNavController toward current waypoint.

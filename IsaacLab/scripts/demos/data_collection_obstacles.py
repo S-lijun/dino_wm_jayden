@@ -237,6 +237,81 @@ def add_bin_fill_light(xy, z: float = 1.9, intensity: float = 4000.0) -> None:
     )
 
 
+def apply_blue_bin_visual(
+    prim_path: str = "/World/envs/env_0/blue_bin_0",
+    *,
+    texture_path: str | None = None,
+) -> str:
+    """Bind OmniPBR + the local albedo PNG onto the spawned mesh bin.
+
+    MeshConverter writes ``textures/blue_bin_texture0.png`` next to the USD but
+    does not author a UsdUVTexture graph, so the live prim renders black even
+    with a fill light. This overrides that after the env has spawned.
+    """
+    import omni.kit.commands
+    import omni.usd
+    from pxr import Sdf, Usd
+
+    from isaaclab.sim.utils import bind_visual_material, safe_set_attribute_on_usd_prim
+
+    if texture_path is None:
+        texture_path = blue_bin_texture_path()
+    texture_path = os.path.abspath(texture_path)
+    if not os.path.isfile(texture_path):
+        raise FileNotFoundError(f"Blue bin texture not found: {texture_path}")
+
+    stage = omni.usd.get_context().get_stage()
+    root = stage.GetPrimAtPath(prim_path)
+    if not root.IsValid():
+        raise RuntimeError(f"No blue bin prim at {prim_path}")
+
+    mtl_prim = "/World/Looks/blue_bin_albedo"
+    if stage.GetPrimAtPath(mtl_prim):
+        stage.RemovePrim(mtl_prim)
+
+    omni.kit.commands.execute(
+        "CreateMdlMaterialPrim",
+        mtl_url="OmniPBR.mdl",
+        mtl_name="OmniPBR",
+        mtl_path=mtl_prim,
+        select_new_prim=False,
+    )
+    shader = stage.GetPrimAtPath(f"{mtl_prim}/Shader")
+    if not shader.IsValid():
+        raise RuntimeError("OmniPBR Shader missing for blue bin")
+
+    tex_attr = shader.GetAttribute("inputs:diffuse_texture")
+    if not tex_attr.IsValid():
+        tex_attr = shader.CreateAttribute("inputs:diffuse_texture", Sdf.ValueTypeNames.Asset)
+    tex_attr.Set(Sdf.AssetPath(texture_path.replace("\\", "/")))
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:diffuse_color_constant", (0.12, 0.38, 0.78), camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:reflection_roughness_constant", 0.72, camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:metallic_constant", 0.0, camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:albedo_brightness", 1.35, camel_case=False
+    )
+
+    bound = [prim_path]
+    bind_visual_material(prim_path, mtl_prim, stronger_than_descendants=True)
+    for prim in Usd.PrimRange(root):
+        if prim.GetTypeName() != "Mesh":
+            continue
+        path = str(prim.GetPath())
+        bind_visual_material(path, mtl_prim, stronger_than_descendants=True)
+        bound.append(path)
+
+    print(
+        f"[INFO] Blue bin albedo bound ({os.path.basename(texture_path)}) -> {bound}"
+    )
+    return mtl_prim
+
+
 def add_blue_bin(env_cfg, pos, index: int) -> None:
     import isaaclab.sim as sim_utils
     from isaaclab.assets import RigidObjectCfg

@@ -22,6 +22,9 @@ Usage (from IsaacLab/):
     # Shorter clip
     .\\isaaclab.bat -p scripts/demos/wander_scene_video.py --duration_s 20
 
+    # 2D carpet floor only (no lab.usda / 3DGS)
+    .\\isaaclab.bat -p scripts/demos/wander_scene_video.py --floor_only --no_headless --duration_s 20
+
     # No GS lab: Isaac default grid + default skyLight (compare lighting)
     .\\isaaclab.bat -p scripts/demos/wander_scene_video.py --no_lab_scene --duration_s 20
 
@@ -117,6 +120,11 @@ parser.add_argument(
     help="Do not load lab.usda / 3DGS. Keep Isaac default ground grid.",
 )
 parser.add_argument(
+    "--floor_only",
+    action="store_true",
+    help="Do not load lab.usda / 3DGS. Use scene_new/lab_floor.jpg on /World/ground.",
+)
+parser.add_argument(
     "--no_isaac_light",
     action="store_true",
     help="Disable Isaac skyLight and the local bin fill light.",
@@ -199,8 +207,10 @@ from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg imp
 )
 
 from data_collection_obstacles import add_bin_fill_light, add_blue_bin
+from isaaclab.sim.utils import bind_visual_material
 from lab_scene_utils import (
     apply_nurec_floor_color,
+    apply_photo_ground,
     default_raycast_mesh_paths,
     load_lab_scene_usd,
     rotate_sensor_ccw_to_landscape,
@@ -215,6 +225,68 @@ from visual_obs_utils import (
 
 TASK = "Isaac-Velocity-Flat-G1-v0"
 RL_LIBRARY = "rsl_rl"
+
+
+_RUBBER_MTL_PRIM = "/World/Looks/rubber_floor"
+_MAT_GREY = (0.50, 0.50, 0.52)
+
+
+def apply_rubber_ground(*, ground_path: str = "/World/ground", verbose: bool = True) -> str:
+    """Matte grey floor (OmniPBR, Kit built-in). No Nucleus vMaterials."""
+    import omni.kit.commands
+    import omni.usd
+    from pxr import Gf, UsdGeom
+
+    from isaaclab.sim.utils import safe_set_attribute_on_usd_prim
+
+    stage = omni.usd.get_context().get_stage()
+    if not stage.GetPrimAtPath(ground_path).IsValid():
+        raise RuntimeError(f"No ground prim at {ground_path}")
+    if stage.GetPrimAtPath(_RUBBER_MTL_PRIM):
+        stage.RemovePrim(_RUBBER_MTL_PRIM)
+
+    used = ""
+    try:
+        omni.kit.commands.execute(
+            "CreateMdlMaterialPrim",
+            mtl_url="OmniPBR.mdl",
+            mtl_name="OmniPBR",
+            mtl_path=_RUBBER_MTL_PRIM,
+            select_new_prim=False,
+        )
+        shader = stage.GetPrimAtPath(f"{_RUBBER_MTL_PRIM}/Shader")
+        if not shader.IsValid():
+            raise RuntimeError("OmniPBR Shader missing")
+        safe_set_attribute_on_usd_prim(
+            shader, "inputs:diffuse_color", Gf.Vec3f(*_MAT_GREY), camel_case=False
+        )
+        safe_set_attribute_on_usd_prim(
+            shader, "inputs:reflection_roughness_constant", 0.88, camel_case=False
+        )
+        safe_set_attribute_on_usd_prim(
+            shader, "inputs:metallic_constant", 0.0, camel_case=False
+        )
+        used = "OmniPBR matte grey"
+    except Exception as exc:
+        if verbose:
+            print(f"[WARN] OmniPBR floor failed ({exc}); PreviewSurface grey.")
+        if stage.GetPrimAtPath(_RUBBER_MTL_PRIM):
+            stage.RemovePrim(_RUBBER_MTL_PRIM)
+        cfg = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=_MAT_GREY,
+            roughness=0.88,
+            metallic=0.0,
+        )
+        cfg.func(_RUBBER_MTL_PRIM, cfg)
+        used = "PreviewSurface matte grey"
+
+    bind_visual_material(ground_path, _RUBBER_MTL_PRIM, stronger_than_descendants=True)
+    grid_look = stage.GetPrimAtPath(f"{ground_path}/Looks/theGrid")
+    if grid_look.IsValid():
+        UsdGeom.Imageable(grid_look).MakeInvisible()
+    if verbose:
+        print(f"[INFO] Ground material: {used} -> {ground_path}")
+    return used
 
 
 def quat_to_yaw(quat: np.ndarray) -> float:
@@ -364,9 +436,13 @@ def main() -> None:
     video_path = os.path.join(out_dir, "wander.mp4")
     print(f"[INFO] Output: {out_dir}")
     print(f"[INFO] visual_mode={_visual_mode}")
-    load_lab = not bool(args_cli.no_lab_scene)
+    load_floor = bool(args_cli.floor_only)
+    load_lab = (not bool(args_cli.no_lab_scene)) and (not load_floor)
     use_isaac_light = not bool(args_cli.no_isaac_light)
-    print(f"[INFO] lab_scene={'off (Isaac default grid)' if not load_lab else 'on (GS lab.usda)'}")
+    if load_floor:
+        print("[INFO] lab_scene=off (2D photo floor, no 3DGS)")
+    else:
+        print(f"[INFO] lab_scene={'off (Isaac default grid)' if not load_lab else 'on (GS lab.usda)'}")
     print(f"[INFO] isaac_light={'on' if use_isaac_light else 'off'}")
     print(f"[INFO] wb_temp={args_cli.wb_temp:g} (negative = yellow→grey, no blue boost)")
     print(f"[INFO] contrast={args_cli.contrast:g}")
@@ -447,8 +523,10 @@ def main() -> None:
     if load_lab and stage.GetPrimAtPath("/World/ground"):
         stage.RemovePrim("/World/ground")
         print("[INFO] Removed default /World/ground so it does not z-fight the lab floor.")
+    elif load_floor:
+        apply_photo_ground(ground_path="/World/ground")
     elif not load_lab:
-        print("[INFO] Isaac default grid kept at /World/ground.")
+        apply_rubber_ground(ground_path="/World/ground")
     if load_lab and not args_cli.no_nurec_ccm and float(args_cli.nurec_deyellow) > 1e-6:
         apply_nurec_floor_color(deyellow=float(args_cli.nurec_deyellow), verbose=True)
     elif load_lab:
@@ -461,7 +539,8 @@ def main() -> None:
         print("[INFO] Isaac daylight off.")
     else:
         print("[INFO] Isaac daylight /World/skyLight left on (mesh bin needs it).")
-        if load_lab:
+        # PBR bin is black without a local light; sky HDR only washes the floor.
+        if load_lab or load_floor:
             add_bin_fill_light((float(args_cli.bin_x), float(args_cli.bin_y)))
     leftover_lights = [
         str(prim.GetPath())
@@ -487,6 +566,15 @@ def main() -> None:
     if hasattr(robot, "write_root_velocity_to_sim"):
         robot.write_root_velocity_to_sim(torch.zeros(1, 6, device=device))
 
+    bin_asset = scene["blue_bin_0"]
+    bin_pose = torch.tensor(
+        [[float(bin_xy[0]), float(bin_xy[1]), 0.5, 0.5, 0.5, 0.5, 0.5]],
+        device=device,
+    )
+    bin_asset.write_root_pose_to_sim(bin_pose)
+    if hasattr(bin_asset, "write_root_velocity_to_sim"):
+        bin_asset.write_root_velocity_to_sim(torch.zeros(1, 6, device=device))
+
     commands = torch.zeros(1, 3, device=device)
     zero_actions = torch.zeros(1, num_joints, device=device)
     warmup = 30 if _visual_mode == "rtx_rgb" else 3
@@ -495,15 +583,19 @@ def main() -> None:
         env.unwrapped.command_manager._terms["base_velocity"].command[:] = commands
         obs, _, _, _ = env.step(zero_actions)
 
+    bin_asset.write_root_pose_to_sim(bin_pose)
+    if hasattr(bin_asset, "write_root_velocity_to_sim"):
+        bin_asset.write_root_velocity_to_sim(torch.zeros(1, 6, device=device))
+    bin_xyz = bin_asset.data.root_pos_w[0].detach().cpu().numpy()
+    print(
+        f"[INFO] blue_bin_0 at ({bin_xyz[0]:.2f},{bin_xyz[1]:.2f},{bin_xyz[2]:.2f})"
+    )
+
     nav = ShortestYawWander(max_speed=float(args_cli.max_speed))
-    target = _sample_wander_xy(
-        rng,
-        bin_xy,
-        float(args_cli.bin_keepout_m),
-        float(args_cli.wander_x_min),
-        float(args_cli.wander_x_max),
-        float(args_cli.wander_y_min),
-        float(args_cli.wander_y_max),
+    # First leg: walk toward the bin so it is in the head camera (same as 09/07 preview).
+    target = np.array(
+        [float(bin_xy[0]) - 1.1, float(bin_xy[1])],
+        dtype=np.float64,
     )
     print(f"[INFO] First wander target: {target}")
 

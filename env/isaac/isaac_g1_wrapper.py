@@ -195,6 +195,7 @@ class IsaacG1Wrapper:
             visual_mode = getattr(args_cli, "visual_mode", "depth_rgb")
         self.visual_mode = visual_mode
         self.collect_visual = self.visual_mode != "off"
+        self._use_rtx_camera = self.visual_mode in ("rtx_rgb", "rtx_depth")
         self.img_res = img_res
         self.visual_output_size = landscape_output_size(img_res)
         if blue_bin_xy is None:
@@ -343,6 +344,7 @@ class IsaacG1Wrapper:
         from visual_obs_utils import (
             build_depth_camera_cfgs,
             build_rtx_camera_cfg,
+            depth_to_gray_rgb,
             depth_to_rgb,
             lidar_ranges_to_rgb,
             merge_depth_maps_multi,
@@ -352,11 +354,14 @@ class IsaacG1Wrapper:
             default_raycast_mesh_paths,
             load_lab_scene_usd,
             rotate_sensor_ccw_to_landscape,
+            set_lab_depth_proxies_visible,
         )
         self._rotate_sensor_ccw_to_landscape = rotate_sensor_ccw_to_landscape
         self._resize_rgb = resize_rgb
         self._merge_depth_maps_multi = merge_depth_maps_multi
         self._depth_to_rgb = depth_to_rgb
+        self._depth_to_gray_rgb = depth_to_gray_rgb
+        self._set_lab_depth_proxies_visible = set_lab_depth_proxies_visible
         self._lidar_ranges_to_rgb = lidar_ranges_to_rgb
         import isaaclab.sim as sim_utils
         import omni.usd
@@ -370,9 +375,9 @@ class IsaacG1Wrapper:
         self._depth_cam_names: list[str] = []
 
         # depth_rgb: lab meshes needed for RayCasterCamera.
-        # rtx_rgb: load lab BEFORE env (matches test_gs_rtx_smoke); loading after
+        # rtx_rgb / rtx_depth: load lab BEFORE env (matches test_gs_rtx_smoke); loading after
         # often leaves CameraCfg annotator with invalid overscan on first RGB read.
-        if self.visual_mode in ("depth_rgb", "rtx_rgb"):
+        if self.visual_mode in ("depth_rgb", "rtx_rgb", "rtx_depth"):
             load_lab_scene_usd(demos_dir=self.demos_dir)
         if self.visual_mode == "depth_rgb":
             self._lidar_mesh_paths = default_raycast_mesh_paths(
@@ -432,14 +437,22 @@ class IsaacG1Wrapper:
         self.lidar_fps = 7.0
         self.lidar_period_s = 1.0 / self.lidar_fps
 
-        if self.visual_mode == "rtx_rgb":
+        if self._use_rtx_camera:
             # update_period=0 → refresh every sim step (avoids empty first annotator frame).
-            env_cfg.scene.camera = build_rtx_camera_cfg(
+            cam_cfg = build_rtx_camera_cfg(
                 img_res=img_res,
                 update_period_s=0.0,
                 sim_utils=sim_utils,
                 camera_cfg_cls=CameraCfg,
             )
+            if self.visual_mode == "rtx_depth":
+                cam_cfg.data_types = ["rgb", "distance_to_image_plane"]
+                cam_cfg.depth_clipping_behavior = "max"
+                print(
+                    "[IsaacG1Wrapper] rtx_depth: CameraCfg "
+                    "data_types=['rgb', 'distance_to_image_plane']"
+                )
+            env_cfg.scene.camera = cam_cfg
         elif self.visual_mode == "depth_rgb":
             for name, dc_cfg in build_depth_camera_cfgs(
                 self._lidar_mesh_paths,
@@ -492,7 +505,7 @@ class IsaacG1Wrapper:
         # loops → Windows "Isaac Sim (Not Responding)". Downgrade render mode.
         sim = self.env.unwrapped.sim
         if sim.has_gui():
-            if self.visual_mode == "rtx_rgb":
+            if self._use_rtx_camera:
                 sim.set_render_mode(sim.RenderMode.PARTIAL_RENDERING)
                 print(
                     "[WARN] GUI open: viewport set to PARTIAL_RENDERING. "
@@ -506,7 +519,7 @@ class IsaacG1Wrapper:
                 )
 
         # Non-depth modes that did not pre-load lab (e.g. lidar_rgb).
-        if self.visual_mode not in ("depth_rgb", "rtx_rgb"):
+        if self.visual_mode not in ("depth_rgb", "rtx_rgb", "rtx_depth"):
             load_lab_scene_usd(demos_dir=self.demos_dir)
         else:
             # G1FlatEnvCfg spawns /World/ground after any pre-env lab load.
@@ -516,6 +529,12 @@ class IsaacG1Wrapper:
             if stage.GetPrimAtPath(ground_path):
                 stage.RemovePrim(ground_path)
                 print("[INFO] Removed default /World/ground under GS lab floor.")
+            if self.visual_mode == "rtx_depth":
+                found = self._set_lab_depth_proxies_visible(stage, True)
+                print(
+                    "[IsaacG1Wrapper] rtx_depth: unhid lab collision proxies "
+                    f"for distance_to_image_plane: {found or 'none found'}"
+                )
 
         runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
         runner.load(checkpoint)
@@ -525,7 +544,7 @@ class IsaacG1Wrapper:
         self.num_joints = int(robot.data.joint_pos.shape[1])
         self.proprio_dim = self.num_joints
 
-        if self.visual_mode == "rtx_rgb":
+        if self._use_rtx_camera:
             self.camera = self.env.unwrapped.scene["camera"]
 
         self._ignored_collision_links = {"left_ankle_roll_link", "right_ankle_roll_link"}
@@ -1108,7 +1127,7 @@ class IsaacG1Wrapper:
         # NoneType crash in omni.replicator (_resize_data_for_overscan).
         zero_actions = torch.zeros(1, self.num_joints, device=self.device)
         warmup_steps = 3
-        if self.visual_mode == "rtx_rgb":
+        if self._use_rtx_camera:
             cam_period = float(
                 getattr(self.camera.cfg, "update_period", 1.0 / 15.0) or (1.0 / 15.0)
             )
@@ -1512,6 +1531,58 @@ class IsaacG1Wrapper:
             "Try without --headless, or use --visual_mode depth_rgb."
         ) from last_exc
 
+    def _read_rtx_depth_hwc(self) -> np.ndarray:
+        """Read RTX distance_to_image_plane as 3-channel grayscale uint8."""
+        last_exc: Exception | None = None
+        zero_actions = torch.zeros(1, self.num_joints, device=self.device)
+        for attempt in range(15):
+            try:
+                depth_tensor = self.camera.data.output["distance_to_image_plane"][0]
+                depth_np = depth_tensor.detach().cpu().numpy()
+                gray = self._depth_to_gray_rgb(depth_np, max_depth=10.0)
+                return self._rotate_sensor_ccw_to_landscape(gray)
+            except (TypeError, KeyError) as exc:
+                last_exc = exc
+                self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = (
+                    self.commands
+                )
+                obs, _, _, _ = self.env.step(zero_actions)
+                self._last_policy_obs = obs
+                if attempt == 0 or attempt == 14:
+                    print(
+                        f"[WARN] rtx_depth read failed (attempt {attempt + 1}/15): {exc}"
+                    )
+        raise RuntimeError(
+            "rtx_depth camera never produced distance_to_image_plane. "
+            "Try without --headless."
+        ) from last_exc
+
+    def _refresh_rtx_camera(self, n_renders: int = 2) -> None:
+        sim = self.env.unwrapped.sim
+        for _ in range(n_renders):
+            sim.render()
+        if hasattr(self.camera, "_is_outdated"):
+            self.camera._is_outdated[:] = True
+        self.camera.update(0.0, force_recompute=True)
+
+    def get_rgb_depth_side_hwc(self) -> np.ndarray:
+        """GS RGB | grayscale depth. Restores depth proxies for the next policy obs."""
+        if self.visual_mode != "rtx_depth":
+            raise RuntimeError(
+                f"get_rgb_depth_side_hwc needs visual_mode=rtx_depth, got {self.visual_mode!r}"
+            )
+        depth_vis = self._read_rtx_depth_hwc()
+        stage = self._omni_usd.get_context().get_stage()
+        self._set_lab_depth_proxies_visible(stage, False)
+        try:
+            self._refresh_rtx_camera()
+            rgb = self._read_rtx_rgb_hwc()
+        finally:
+            self._set_lab_depth_proxies_visible(stage, True)
+        if rgb.shape[0] != depth_vis.shape[0]:
+            raise ValueError(f"RGB/depth height mismatch: {rgb.shape} vs {depth_vis.shape}")
+        return np.concatenate([rgb, depth_vis], axis=1)
+
     def get_raw_obs(self) -> dict[str, np.ndarray]:
         if not self.collect_visual:
             raise RuntimeError(
@@ -1525,6 +1596,14 @@ class IsaacG1Wrapper:
             visual = self._read_rtx_rgb_hwc()
             if log_rtx:
                 print("[IsaacG1Wrapper] first RTX RGB ok", flush=True)
+                self._logged_first_rtx = True
+        elif self.visual_mode == "rtx_depth":
+            log_rtx = not self._logged_first_rtx
+            if log_rtx:
+                print("[IsaacG1Wrapper] reading first RTX depth...", flush=True)
+            visual = self._read_rtx_depth_hwc()
+            if log_rtx:
+                print("[IsaacG1Wrapper] first RTX depth ok", flush=True)
                 self._logged_first_rtx = True
         elif self.visual_mode == "depth_rgb":
             scene = self.env.unwrapped.scene

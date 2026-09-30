@@ -10,7 +10,17 @@ from pxr import Gf, Sdf, Usd, UsdGeom
 LAB_EXTERNAL_PRIM = "/World/ExternalScene"
 # lab.usda defaultPrim "World" is composed onto ExternalScene (no extra /World segment).
 LAB_SCENE_RAYCAST_ROOT = LAB_EXTERNAL_PRIM
+# Collision proxies: hidden for GS RGB, must be visible for RTX camera depth.
+LAB_DEPTH_PROXY_PATHS = (
+    f"{LAB_EXTERNAL_PRIM}/GroundPlane",
+    f"{LAB_EXTERNAL_PRIM}/Plane",
+    f"{LAB_EXTERNAL_PRIM}/plane2",
+    f"{LAB_EXTERNAL_PRIM}/plane3",
+    f"{LAB_EXTERNAL_PRIM}/plane4",
+)
 LAB_SCENE_REL = "../../scene_new/lab.usda"
+FLOOR_ONLY_REL = "../../scene_new/floor_only.usda"
+FLOOR_TEXTURE_NAME = "lab_floor.jpg"
 GS_PAYLOAD_NAME = "3dgs_lab.usdz"
 
 SENSOR_IMG_RES = (640, 480)
@@ -22,6 +32,25 @@ def lab_usda_path(*, demos_dir: str | None = None) -> str:
     if demos_dir is None:
         demos_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.abspath(os.path.join(demos_dir, LAB_SCENE_REL))
+
+
+def floor_only_usda_path(*, demos_dir: str | None = None) -> str:
+    if demos_dir is None:
+        demos_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(demos_dir, FLOOR_ONLY_REL))
+
+
+def floor_texture_path(*, demos_dir: str | None = None) -> str:
+    usda = floor_only_usda_path(demos_dir=demos_dir)
+    local = os.path.join(os.path.dirname(usda), FLOOR_TEXTURE_NAME)
+    if os.path.isfile(local):
+        return local
+    fallback = os.path.abspath(os.path.join("C:\\gs_apt", "1000006893.jpg"))
+    if os.path.isfile(fallback):
+        return fallback
+    raise FileNotFoundError(
+        f"Floor texture not found next to {usda} or at {fallback}"
+    )
 
 
 def gs_payload_path(lab_path: str | None = None) -> str:
@@ -241,6 +270,87 @@ def load_lab_scene_usd(
         print(f"[INFO] ExternalScene valid: {stage.GetPrimAtPath(LAB_EXTERNAL_PRIM).IsValid()}")
 
     return scene_path
+
+
+def apply_photo_ground(
+    *,
+    ground_path: str = "/World/ground",
+    texture_path: str | None = None,
+    texture_scale: tuple[float, float] = (19.9, 20.8),
+    demos_dir: str | None = None,
+    verbose: bool = True,
+) -> str:
+    """Bind the saved lab carpet photo onto Isaac's default ground plane."""
+    import omni.kit.commands
+    import omni.usd
+    from pxr import Sdf, UsdGeom
+
+    from isaaclab.sim.utils import bind_visual_material, safe_set_attribute_on_usd_prim
+
+    if texture_path is None:
+        texture_path = floor_texture_path(demos_dir=demos_dir)
+    texture_path = os.path.abspath(texture_path)
+    if not os.path.isfile(texture_path):
+        raise FileNotFoundError(f"Floor texture not found: {texture_path}")
+
+    mtl_prim = "/World/Looks/photo_floor"
+    stage = omni.usd.get_context().get_stage()
+    if not stage.GetPrimAtPath(ground_path).IsValid():
+        raise RuntimeError(f"No ground prim at {ground_path}")
+    if stage.GetPrimAtPath(mtl_prim):
+        stage.RemovePrim(mtl_prim)
+
+    omni.kit.commands.execute(
+        "CreateMdlMaterialPrim",
+        mtl_url="OmniPBR.mdl",
+        mtl_name="OmniPBR",
+        mtl_path=mtl_prim,
+        select_new_prim=False,
+    )
+    shader = stage.GetPrimAtPath(f"{mtl_prim}/Shader")
+    if not shader.IsValid():
+        raise RuntimeError("OmniPBR Shader missing")
+
+    tex_attr = shader.GetAttribute("inputs:diffuse_texture")
+    if not tex_attr.IsValid():
+        tex_attr = shader.CreateAttribute("inputs:diffuse_texture", Sdf.ValueTypeNames.Asset)
+    tex_attr.Set(Sdf.AssetPath(texture_path.replace("\\", "/")))
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:diffuse_color_constant", (1.0, 1.0, 1.0), camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:reflection_roughness_constant", 0.9, camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:metallic_constant", 0.0, camel_case=False
+    )
+    safe_set_attribute_on_usd_prim(
+        shader, "inputs:texture_scale", tuple(float(v) for v in texture_scale), camel_case=False
+    )
+
+    bind_visual_material(ground_path, mtl_prim, stronger_than_descendants=True)
+    grid_look = stage.GetPrimAtPath(f"{ground_path}/Looks/theGrid")
+    if grid_look.IsValid():
+        UsdGeom.Imageable(grid_look).MakeInvisible()
+    if verbose:
+        print(f"[INFO] Photo ground: {texture_path} -> {ground_path} scale={texture_scale}")
+    return texture_path
+
+
+def set_lab_depth_proxies_visible(stage: Usd.Stage, visible: bool) -> list[str]:
+    """Show/hide lab.usda collision meshes so RTX ``distance_to_image_plane`` hits the floor."""
+    found: list[str] = []
+    for path in LAB_DEPTH_PROXY_PATHS:
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            continue
+        img = UsdGeom.Imageable(prim)
+        if visible:
+            img.MakeVisible()
+        else:
+            img.MakeInvisible()
+        found.append(path)
+    return found
 
 
 def rotate_sensor_ccw_to_landscape(img: np.ndarray) -> np.ndarray:

@@ -9,7 +9,8 @@ Modes
 - ``off``       : no images
 - ``depth_rgb`` : pinhole depth ray-cast, merged per obstacle mesh → pseudo-RGB
 - ``lidar_rgb`` : Velodyne-style range image from merged LiDAR → pseudo-RGB
-- ``rtx_rgb``   : true RTX ``TiledCamera`` (needs ``--enable_cameras``; often broken on cluster)
+- ``rtx_rgb``   : true RTX camera RGB (needs ``--enable_cameras``)
+- ``rtx_depth`` : RTX ``distance_to_image_plane`` grayscale (needs ``--enable_cameras``)
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ from typing import Any
 
 import numpy as np
 
-VISUAL_MODES = ("off", "depth_rgb", "lidar_rgb", "rtx_rgb")
+VISUAL_MODES = ("off", "depth_rgb", "lidar_rgb", "rtx_rgb", "rtx_depth")
+RTX_CAMERA_MODES = ("rtx_rgb", "rtx_depth")
 DEFAULT_VISUAL_MODE = "depth_rgb"  # cluster-safe; DataCollection_test defaults to rtx_rgb
 IMG_RES_LANDSCAPE = (480, 640)  # (height, width) = 640×480 landscape
 LIDAR_CHANNELS = 45
@@ -35,14 +37,14 @@ def resolve_visual_mode(args_cli) -> str:
     if mode not in VISUAL_MODES:
         raise ValueError(f"visual_mode must be one of {VISUAL_MODES}, got {mode!r}")
 
-    if getattr(args_cli, "enable_cameras", False) and mode != "rtx_rgb":
+    if getattr(args_cli, "enable_cameras", False) and mode not in RTX_CAMERA_MODES:
         warnings.warn(
-            "--enable_cameras is set but visual_mode is not rtx_rgb. "
+            "--enable_cameras is set but visual_mode is not an RTX camera mode. "
             f"Using {mode!r} without RTX (ignoring --enable_cameras).",
             stacklevel=2,
         )
 
-    if mode == "rtx_rgb":
+    if mode in RTX_CAMERA_MODES:
         args_cli.enable_cameras = True
     else:
         args_cli.enable_cameras = False
@@ -51,8 +53,8 @@ def resolve_visual_mode(args_cli) -> str:
 
 
 def configure_app_for_visual(args_cli, visual_mode: str, *, verbose: bool = True) -> None:
-    """Call before AppLauncher. Only rtx_rgb touches enable_cameras / kit_args."""
-    if visual_mode != "rtx_rgb":
+    """Call before AppLauncher. Only RTX camera modes touch enable_cameras / kit_args."""
+    if visual_mode not in RTX_CAMERA_MODES:
         args_cli.enable_cameras = False
         if verbose:
             print(
@@ -104,6 +106,15 @@ def depth_to_rgb(depth: np.ndarray, max_depth: float = 10.0) -> np.ndarray:
     b = np.clip(1.5 * (1.0 - inv) - 0.5, 0.0, 1.0)
     rgb = np.stack([r, g, b], axis=-1)
     return (rgb * 255.0).astype(np.uint8)
+
+
+def depth_to_gray_rgb(depth: np.ndarray, max_depth: float = 10.0) -> np.ndarray:
+    """Meters → 8-bit grayscale RGB (near=black, far/clip=white). DINO takes 3-ch."""
+    d = _squeeze_depth(depth)
+    d = np.nan_to_num(d, nan=max_depth, posinf=max_depth, neginf=0.0)
+    d = np.clip(d, 0.0, max_depth)
+    gray = np.round(d / max_depth * 255.0).astype(np.uint8)
+    return np.repeat(gray[..., None], 3, axis=-1)
 
 
 def lidar_ranges_to_rgb(

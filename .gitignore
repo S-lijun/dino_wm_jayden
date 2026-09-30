@@ -8,6 +8,11 @@ __pycache__/
 cargoal_test/
 humanoid_test_sac/
 humanoid_test_sac_path/
+humanoid_test_sac_path_depth/
+humanoid_test_sac_path_trainlike/
+humanoid_test_sac_path_trainmatch/
+humanoid_probe_q_vy_sign/
+
 *.pyo
 runs/
 # Ignore virtual environments
