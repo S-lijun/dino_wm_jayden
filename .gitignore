@@ -12,7 +12,7 @@ humanoid_test_sac_path_depth/
 humanoid_test_sac_path_trainlike/
 humanoid_test_sac_path_trainmatch/
 humanoid_probe_q_vy_sign/
-
+DataCollection/
 *.pyo
 runs/
 # Ignore virtual environments
@@ -41,3 +41,4 @@ checkpoints/
 # Large local data / checkpoints
 wm_ckpt_18-27-17/
 Trajectories/
+Sim2Real/

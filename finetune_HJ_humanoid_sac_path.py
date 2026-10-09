@@ -50,7 +50,6 @@ from PyHJ.policy import avoid_SACPolicy_annealing
 from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import ActorProb
 
-from env.isaac.ckpt_utils import save_epoch_checkpoint
 from env.isaac.late_fusion_critic import make_q_critic
 from wm_load import load_model
 
@@ -151,7 +150,12 @@ def get_args():
         help="Override gradient steps/epoch. Default matches sim trainer: "
         "step-per-epoch * update-per-step (2000*0.125=250).",
     )
-    parser.add_argument("--keep_ckpts", type=int, default=5)
+    parser.add_argument(
+        "--keep_ckpts",
+        type=int,
+        default=1,
+        help="Unused. FT always overwrites a single policy.pth.",
+    )
     parser.add_argument("--encode_batch_size", type=int, default=16)
     parser.add_argument(
         "--wm_joint_names",
@@ -210,6 +214,34 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     print(f"[INFO] Resumed policy from {ckpt_path}")
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    return str(value)
+
+
+def write_run_meta(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def save_latest_policy(policy, log_root: Path) -> Path:
+    out = Path(log_root) / "policy.pth"
+    torch.save(policy.state_dict(), out)
+    return out
+
+
 def _as_name_list(value: Any) -> list[str] | None:
     if value is None:
         return None
@@ -258,15 +290,24 @@ def remap_proprio(
     values = np.asarray(values, dtype=np.float32)
     if values.ndim == 1:
         values = values.reshape(1, -1)
-    if values.shape[-1] == dst_dim and dst_names is None:
+    src_dim = int(values.shape[-1])
+    if src_dim == dst_dim and dst_names is None:
         return values
-    if values.shape[-1] == dst_dim and (
+    if src_dim == dst_dim and (
         src_names is None or dst_names is None or list(src_names) == list(dst_names)
     ):
         return values
     if src_names is None or dst_names is None:
+        if src_dim < dst_dim:
+            print(f"[INFO] zero-pad proprio {src_dim} -> {dst_dim}")
+            out = np.zeros((values.shape[0], dst_dim), dtype=np.float32)
+            out[:, :src_dim] = values
+            return out
+        if src_dim > dst_dim:
+            print(f"[INFO] truncate proprio {src_dim} -> {dst_dim}")
+            return values[:, :dst_dim].copy()
         raise ValueError(
-            f"proprio dim {values.shape[-1]} != WM dim {dst_dim}. "
+            f"proprio dim {src_dim} != WM dim {dst_dim}. "
             "Save joint_names in each episode and pass --wm_joint_names."
         )
     if len(dst_names) != dst_dim:
@@ -810,6 +851,60 @@ def main():
     log_root = Path("runs/sac_hj_humanoid_path_ft") / run_name
     tb_dir = log_root / "logs"
     tb_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = log_root / "meta.json"
+    policy_path = log_root / "policy.pth"
+    run_meta: dict[str, Any] = {
+        "run_name": run_name,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "policy_path": str(policy_path.resolve()),
+        "latest_epoch": 0,
+        "config": {k: _json_safe(v) for k, v in sorted(vars(args).items())},
+        "policy": {
+            "visual_feature": str(args.visual_feature),
+            "critic_fusion": str(args.critic_fusion),
+            "with_proprio": bool(args.with_proprio),
+            "z_fuse_frames": int(args.z_fuse_frames),
+            "z_dim": int(z_dim),
+            "yaw_limit": float(args.yaw_limit),
+            "freeze_yaw": bool(args.freeze_yaw),
+            "lidar_distance_threshold": float(args.lidar_distance_threshold),
+            "train_actor": bool(args.train_actor),
+            "actor_reg_coef": float(args.actor_reg_coef),
+            "actor_reg_when_unsafe": bool(args.actor_reg_when_unsafe),
+            "auto_alpha": bool(use_auto_alpha),
+            "alpha": float(args.alpha),
+            "gamma": float(args.gamma_pyhj),
+        },
+        "data": {
+            "data_dir": str(data_dir.resolve()),
+            "n_episodes": int(len(obs_list)),
+            "n_transitions": int(n_trans),
+            "n_skip_short": int(n_skip),
+            "hs_unsafe_frac": float(unsafe_frac),
+            "hs_mean": float(rew.mean()),
+        },
+        "wm": {
+            "dino_ckpt_dir": str(ckpt_dir.resolve()),
+            "dino_encoder": str(args.dino_encoder),
+            "snapshot": str(snapshot.resolve()),
+        },
+        "resume": {
+            "resume_policy": str(Path(args.resume_policy).resolve()),
+            "resume_epoch": int(resume_epoch),
+        },
+        "trainer": {
+            "total_epochs": int(args.total_epochs),
+            "updates_per_epoch": int(updates_per_epoch),
+            "batch_size": int(args.batch_size_pyhj),
+            "step_per_collect": int(args.step_per_collect),
+            "step_per_epoch": int(args.step_per_epoch),
+            "update_per_step": float(args.update_per_step),
+            "device": str(args.device),
+            "seed": int(args.seed),
+        },
+        "last_metrics": {},
+    }
+    write_run_meta(meta_path, run_meta)
     writer = SummaryWriter(log_dir=str(tb_dir))
     use_wandb = not bool(args.no_wandb)
     if use_wandb:
@@ -850,12 +945,17 @@ def main():
         writer.add_scalar("loss/actor", mean_loss.get("loss/actor", 0.0), epoch)
         if wandb is not None:
             wandb.log(payload, step=global_update)
-        save_epoch_checkpoint(policy, log_root, epoch, keep=int(args.keep_ckpts))
+        save_latest_policy(policy, log_root)
+        run_meta["latest_epoch"] = int(epoch)
+        run_meta["updated"] = datetime.now().isoformat(timespec="seconds")
+        run_meta["last_metrics"] = {k: float(v) for k, v in mean_loss.items()}
+        write_run_meta(meta_path, run_meta)
 
     writer.close()
     if wandb is not None:
         wandb.finish()
-    print(f"[INFO] done. checkpoints in {log_root}")
+    print(f"[INFO] done. latest policy: {policy_path}")
+    print(f"[INFO] meta: {meta_path}")
 
 
 if __name__ == "__main__":
