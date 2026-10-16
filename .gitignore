@@ -40,5 +40,7 @@ checkpoints/
 *.pkl
 # Large local data / checkpoints
 wm_ckpt_18-27-17/
+# Nested clone. Do not stage as a gitlink.
+third_party/Utonia/
 Trajectories/
 Sim2Real/

@@ -78,6 +78,7 @@ class LatentHumanoidEnv(gym.Env):
         device: str,
         args_cli,
         with_proprio: bool = False,
+        proprio_encoder=None,
         latent_h: bool = False,
         max_episode_steps: int = DEFAULT_MAX_EPISODE_SIM_STEPS,
         visual_fps: float = DEFAULT_VISUAL_FPS,
@@ -96,12 +97,30 @@ class LatentHumanoidEnv(gym.Env):
                 f"Unknown visual_feature={self.visual_feature!r}; use 'patch' or 'cls'"
             )
         self.wm = wm
+        self.proprio_encoder = proprio_encoder
+        self.lidar_encoder = None
         if self.obs_mode == "wm":
             if wm is None:
                 raise ValueError("obs_mode='wm' requires a world-model encoder.")
             self.wm.eval()
         elif self.obs_mode == "lidar_joint":
             self.wm = None
+        elif self.obs_mode == "lidar_utonia":
+            from env.isaac.utonia_encoder import UtoniaLidarEncoder
+
+            ckpt = getattr(args, "utonia_ckpt", None)
+            if not ckpt:
+                raise ValueError("obs_mode='lidar_utonia' requires args.utonia_ckpt")
+            self.lidar_encoder = UtoniaLidarEncoder(str(ckpt), device)
+            self.wm = None
+            if self.with_proprio:
+                if self.proprio_encoder is None:
+                    raise ValueError(
+                        "obs_mode='lidar_utonia' with proprio requires proprio_encoder"
+                    )
+                self.proprio_encoder.eval()
+                for p in self.proprio_encoder.parameters():
+                    p.requires_grad = False
         else:
             raise ValueError(f"Unknown obs_mode={self.obs_mode!r}")
         self.max_episode_sim_steps = int(
@@ -163,6 +182,9 @@ class LatentHumanoidEnv(gym.Env):
             max_speed=float(getattr(self.wrapper, "max_speed", 0.5)),
             stop_thresh=float(self.wrapper.waypoint_stop_thresh),
         )
+        if bool(getattr(self, "_freeze_vy", False)):
+            self.waypoint_nav.freeze_vy = True
+            self._safe_side_nav.freeze_vy = True
         self.safe_side_waypoints = tuple(
             np.asarray(p, dtype=np.float64).reshape(2).copy()
             for p in SAFE_SIDE_WAYPOINTS
@@ -192,7 +214,7 @@ class LatentHumanoidEnv(gym.Env):
         # Constructor warm-up reset is not a training episode; do not record.
         self._record_this_episode = False
         self._episode_frames = []
-        obs = self.wrapper.get_raw_obs()
+        obs = self._read_step_obs()
         z = self.encode(obs)
         self.observation_space = Box(
             low=-np.inf, high=np.inf, shape=z.shape, dtype=np.float32
@@ -225,6 +247,7 @@ class LatentHumanoidEnv(gym.Env):
             f"nom_|v|={'U[' + str(self._nom_speed_min) + ',' + str(self._nom_speed_max) + ']/ep' if self._randomize_nom_speed else f'{self._episode_nom_speed:g}'}, "
             f"nom_act={self._nom_act_noise_log()}, "
             f"lidar_cone=±{float(getattr(self.wrapper, 'lidar_h_half_fov_deg', 90.0)):g}°, "
+            f"freeze_vy={bool(getattr(self, '_freeze_vy', False))}, "
             f"yaw=[{self.action_space.low[2]:g},{self.action_space.high[2]:g}] "
             f"(OOB → truncate only, no h_s penalty), "
             f"wm_num_hist={self._wm_num_hist()}, "
@@ -633,6 +656,7 @@ class LatentHumanoidEnv(gym.Env):
             )
         self._nom_act_noise_dist = dist
         self._episode_nom_act_noise_std = float(self._nom_act_noise_std)
+        self._freeze_vy = bool(getattr(args, "freeze_vy", False))
         thr = getattr(args, "lidar_distance_threshold", None)
         if thr is not None:
             self.wrapper.lidar_distance_threshold = float(thr)
@@ -901,6 +925,12 @@ class LatentHumanoidEnv(gym.Env):
             else:
                 vx_n = float(rng.normal(0.0, width))
                 lat_n = float(rng.normal(0.0, width))
+        if bool(getattr(self, "_freeze_vy", False)):
+            out = np.asarray(cmd, dtype=np.float32).reshape(3).copy()
+            out[0] = float(out[0]) + vx_n
+            out[1] = 0.0
+            out[2] = float(out[2]) + lat_n
+            return out
         out = np.asarray(cmd, dtype=np.float32).reshape(3) + np.array(
             [vx_n, lat_n, lat_n], dtype=np.float32
         )
@@ -934,7 +964,7 @@ class LatentHumanoidEnv(gym.Env):
             base_pos, base_quat, self.wrapper.waypoint
         )
         cmd = self._perturb_nom_action(cmd)
-        return self._clip_nav_cmd(cmd)
+        return self._zero_vy_if_frozen(self._clip_nav_cmd(cmd))
 
     def note_collect_use_sf(self, use_sf: bool) -> None:
         """Update held sidestep G from HJ<0 (not from who executed in the env)."""
@@ -959,7 +989,7 @@ class LatentHumanoidEnv(gym.Env):
             if target is None:
                 return np.zeros(3, dtype=np.float32)
             cmd = self._safe_side_nav.compute_command(base_pos, base_quat, target)
-            return self._clip_nav_cmd(cmd)
+            return self._zero_vy_if_frozen(self._clip_nav_cmd(cmd))
         xy = np.asarray(base_pos[:2], dtype=np.float64)
         pts = [
             np.asarray(p, dtype=np.float64).reshape(2)
@@ -968,7 +998,13 @@ class LatentHumanoidEnv(gym.Env):
         dists = [float(np.linalg.norm(xy - p)) for p in pts]
         target = pts[int(np.argmin(np.asarray(dists)))]
         cmd = self._safe_side_nav.compute_command(base_pos, base_quat, target)
-        return self._clip_nav_cmd(cmd)
+        return self._zero_vy_if_frozen(self._clip_nav_cmd(cmd))
+
+    def _zero_vy_if_frozen(self, cmd: np.ndarray) -> np.ndarray:
+        out = np.asarray(cmd, dtype=np.float32).reshape(3).copy()
+        if bool(getattr(self, "_freeze_vy", False)):
+            out[1] = 0.0
+        return out
 
     def _clip_nav_cmd(self, cmd) -> np.ndarray:
         low = np.asarray(self.action_space.low, dtype=np.float32)
@@ -1161,7 +1197,8 @@ class LatentHumanoidEnv(gym.Env):
         # Record every N finished-episode boundaries (N=self.wandb_video_every).
         # e.g. N=5 → episodes starting at finished=0,5,10,...
         every = int(self.wandb_video_every)
-        self._record_this_episode = every > 0 and (
+        has_image = bool(getattr(self.wrapper, "collect_visual", False))
+        self._record_this_episode = has_image and every > 0 and (
             int(self._finished_episodes) % every == 0
         )
 
@@ -1327,7 +1364,7 @@ class LatentHumanoidEnv(gym.Env):
         nom_speed = self._resample_nom_speed()
         act_std = self._resample_episode_nom_act_noise_std()
         self._start_episode_recording()
-        obs = self.wrapper.get_raw_obs()
+        obs = self._read_step_obs()
         self._reset_z_fuse_hist()
         z = self.encode(obs)
         self._reset_wm_history(obs)
@@ -1366,8 +1403,13 @@ class LatentHumanoidEnv(gym.Env):
         """Hold ``action`` across sim substeps until the next 15 fps visual sample."""
         import time as _time
 
+        action = np.array(action, dtype=np.float32, copy=True)
+        if bool(getattr(self, "_freeze_vy", False)) and action.shape[-1] >= 2:
+            action[..., 1] = 0.0
+
         # Continuous margin: smaller = more dangerous → aggregate with min.
         h_s = float("inf")
+        step_min_failset = float("inf")
         stuck = False
         end_reason = None
         step_info: dict[str, Any] = {}
@@ -1397,6 +1439,9 @@ class LatentHumanoidEnv(gym.Env):
                 )
 
             h_s = min(h_s, float(self.wrapper.calculate_cost()))
+            d_fail = float(self.wrapper.min_obstacle_xy_dist_live())
+            if np.isfinite(d_fail):
+                step_min_failset = min(step_min_failset, d_fail)
             if float(self.wrapper._last_lidar_stats.get("contact_collision", 0.0)) > 0.5:
                 contact_any = 1.0
             stuck = stuck or bool(step_info.get("stuck", False))
@@ -1419,6 +1464,9 @@ class LatentHumanoidEnv(gym.Env):
                 self._next_visual_time_s += self.visual_period_s
                 break
 
+        self._step_min_failset_m = (
+            float(step_min_failset) if step_min_failset < float("inf") else float("nan")
+        )
         self._episode_visual_step += 1
         if dbg:
             print(
@@ -1426,7 +1474,7 @@ class LatentHumanoidEnv(gym.Env):
                 f"({_time.time() - t_enter:.1f}s); reading RTX+encode...",
                 flush=True,
             )
-        obs = self.wrapper.get_raw_obs()
+        obs = self._read_step_obs()
         self._push_wm_history(obs, action)
         z_next = self.encode(obs)
         # Q(z, a_executed) — same cost as the old actor-based overlay.
@@ -1481,6 +1529,14 @@ class LatentHumanoidEnv(gym.Env):
         if self.wm is None:
             return 1
         return max(1, int(getattr(self.wm, "num_hist", 1)))
+
+    def _read_step_obs(self) -> dict[str, Any]:
+        """Lidar training reads joints only. Images stay on the vision line."""
+        if self.obs_mode == "lidar_utonia" and not bool(
+            getattr(self.wrapper, "collect_visual", False)
+        ):
+            return {"visual": None, "proprio": self.wrapper.get_proprio()}
+        return self.wrapper.get_raw_obs()
 
     def _split_raw_obs(self, obs: dict[str, Any] | tuple | list):
         if isinstance(obs, dict):
@@ -1616,6 +1672,8 @@ class LatentHumanoidEnv(gym.Env):
         """Single-frame encode. No temporal average."""
         if self.obs_mode == "lidar_joint":
             return self.wrapper.get_lidar_joint_state()
+        if self.obs_mode == "lidar_utonia":
+            return self._encode_lidar_utonia(obs)
 
         visual, proprio = self._split_raw_obs(obs)
 
@@ -1641,9 +1699,41 @@ class LatentHumanoidEnv(gym.Env):
         ``visual_feature=patch``: flatten all DINOv2 patch tokens.
         ``visual_feature=cls``: DINOv2 CLS token only (same frozen encoder).
         ``obs_mode=lidar_joint``: 12-D legs ‖ full lidar ranges (ignores RGB).
+        ``obs_mode=lidar_utonia``: frozen Utonia on sensor-frame hits, optional
+        frozen proprio encoder. No z_{t+1} predictor.
         When ``z_fuse_frames`` > 1, return the mean of the last N full z.
         """
         return self._fuse_z(self._encode_current(obs))
+
+    def _encode_lidar_utonia(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """z = pool(Utonia(xyz)) ‖ proprio_encoder(joints). Action is not in z."""
+        if self.lidar_encoder is None:
+            raise RuntimeError("lidar encoder is not loaded")
+        _, proprio = self._split_raw_obs(obs)
+        pts = self.wrapper.get_lidar_points_sensor()
+        with torch.no_grad():
+            z_lidar = self.lidar_encoder.encode(pts)
+            if self.with_proprio:
+                if isinstance(proprio, torch.Tensor):
+                    prop_np = proprio.detach().float().reshape(-1).cpu().numpy()
+                else:
+                    prop_np = np.asarray(proprio, dtype=np.float32).reshape(-1)
+                expected = int(getattr(self.proprio_encoder, "in_chans", prop_np.shape[0]))
+                if int(prop_np.shape[0]) != expected:
+                    raise ValueError(
+                        f"proprio dim {int(prop_np.shape[0])} != "
+                        f"proprio encoder in_chans {expected}"
+                    )
+                prop_t = (
+                    torch.from_numpy(np.ascontiguousarray(prop_np))
+                    .view(1, 1, expected)
+                    .to(self.device)
+                )
+                z_prop = self.proprio_encoder(prop_t).reshape(-1)
+                z = torch.cat([z_lidar, z_prop], dim=0)
+            else:
+                z = z_lidar
+        return z.detach().cpu().numpy().astype(np.float32)
 
     def _encode_obs_visual(self, vis_t: torch.Tensor, prop_t: torch.Tensor):
         """WM ``encode_obs``, optionally swapping DINOv2 patch tokens for CLS."""

@@ -110,6 +110,15 @@ def get_args():
     parser.add_argument("--yaw_limit", type=float, default=1.0)
     parser.add_argument("--freeze_yaw", action="store_true")
     parser.add_argument(
+        "--freeze_vy",
+        action="store_true",
+        help=(
+            "Match a sim run trained with --freeze_vy. Stored real actions, "
+            "the SF actor, and target-Q actions all keep vy=0. vy is dropped "
+            "from the SAC log-prob (target entropy -2). Default off."
+        ),
+    )
+    parser.add_argument(
         "--lidar_distance_threshold",
         type=float,
         default=1.0,
@@ -499,6 +508,30 @@ def _zero_yaw_tensor(act: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _zero_vy_tensor(act: torch.Tensor) -> torch.Tensor:
+    """Force vy (dim 1) to 0 without an inplace write on the actor graph."""
+    if act.shape[-1] < 2:
+        return act
+    mask = torch.ones_like(act)
+    mask[..., 1] = 0.0
+    return act * mask
+
+
+def _log_prob_without_vy(out) -> torch.Tensor:
+    """Squashed-Gaussian log π(vx, yaw | z). vy is held at 0 and dropped."""
+    act = out.act
+    mu, sigma = out.logits
+    eps = 1e-6
+    clipped = act.clamp(-1.0 + eps, 1.0 - eps)
+    raw = 0.5 * (torch.log1p(clipped) - torch.log1p(-clipped))
+    var = sigma.pow(2).clamp(min=eps)
+    log_p = -0.5 * (
+        (raw - mu).pow(2) / var + torch.log(var) + float(np.log(2.0 * np.pi))
+    )
+    corr = torch.log((1.0 - clipped.pow(2)) + eps)
+    return (log_p - corr)[..., [0, 2]].sum(dim=-1, keepdim=True)
+
+
 def _frozen_pi_sim_act(pi_sim_policy, obs, device: torch.device) -> torch.Tensor:
     """Deterministic π_sim(z) in policy space (eval + tanh mean)."""
     was = pi_sim_policy.training
@@ -707,7 +740,9 @@ def main():
     ).to(args.device)
     actor1_optim = torch.optim.AdamW(actor1.parameters(), lr=args.actor_lr)
     if use_auto_alpha:
-        target_entropy = float(-np.prod(action_shape))
+        # freeze_vy: entropy is over (vx, yaw) only.
+        n_ent = 2.0 if bool(args.freeze_vy) else float(np.prod(action_shape))
+        target_entropy = -n_ent
         log_alpha = torch.zeros(1, requires_grad=True, device=args.device)
         alpha_optim = torch.optim.Adam([log_alpha], lr=float(args.alpha_lr))
         alpha_arg = (target_entropy, log_alpha, alpha_optim)
@@ -734,11 +769,38 @@ def main():
     policy.warmup = not bool(args.train_actor)
     load_policy_checkpoint(policy, args.resume_policy, args.device)
 
+    freeze_vy = bool(args.freeze_vy)
+    _orig_policy_forward = policy.forward
+
+    def _sac_forward(batch, state=None, input="obs", **kwargs):
+        """SAC forward. --freeze_vy zeros vy and drops it from log π."""
+        out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
+        if freeze_vy:
+            act = out.act
+            if torch.is_tensor(act):
+                out.act = _zero_vy_tensor(act)
+                if getattr(out, "logits", None) is not None:
+                    out.log_prob = _log_prob_without_vy(out)
+            else:
+                act_np = np.array(act, dtype=np.float32, copy=True)
+                if act_np.shape[-1] >= 2:
+                    act_np[..., 1] = 0.0
+                out.act = act_np
+        return out
+
+    policy.forward = _sac_forward  # type: ignore[method-assign]
+
     act_env = np.clip(act_env, action_low, action_high)
+    if freeze_vy and act_env.shape[-1] >= 2:
+        act_env = np.array(act_env, dtype=np.float32, copy=True)
+        act_env[:, 1] = 0.0
     act_pol = np.asarray(policy.map_action_inverse(act_env), dtype=np.float32)
     if bool(args.freeze_yaw):
         act_pol = act_pol.copy()
         act_pol[:, 2] = 0.0
+    if freeze_vy and act_pol.shape[-1] >= 2:
+        act_pol = np.array(act_pol, dtype=np.float32, copy=True)
+        act_pol[:, 1] = 0.0
 
     buffer_size = max(int(args.buffer_size), n_trans)
     buffer = VectorReplayBuffer(buffer_size, 1)
@@ -775,6 +837,8 @@ def main():
                 act = torch.as_tensor(act, device=args.device, dtype=torch.float32)
             if freeze_yaw:
                 act = _zero_yaw_tensor(act)
+            if freeze_vy:
+                act = _zero_vy_tensor(act)
             q = torch.min(
                 policy.critic1(batch.obs, act).flatten(),
                 policy.critic2(batch.obs, act).flatten(),
@@ -784,6 +848,8 @@ def main():
                 act_sim = _frozen_pi_sim_act(pi_sim_policy, batch.obs, torch.device(args.device))
                 if freeze_yaw:
                     act_sim = _zero_yaw_tensor(act_sim)
+                if freeze_vy:
+                    act_sim = _zero_vy_tensor(act_sim)
                 sq = (act - act_sim).pow(2).mean(dim=-1)
                 if bool(args.actor_reg_when_unsafe):
                     rew_t = torch.as_tensor(batch.rew, device=act.device, dtype=act.dtype).reshape(-1)
@@ -839,6 +905,7 @@ def main():
         f"[INFO] offline FT: mode={mode} gamma={args.gamma_pyhj} "
         f"h_s=dist-{float(args.lidar_distance_threshold):g} "
         f"z_fuse={int(args.z_fuse_frames)} proprio={bool(args.with_proprio)} "
+        f"freeze_vy={freeze_vy} "
         f"epochs={int(args.total_epochs)} "
         f"(sim match: {int(args.step_per_collect)} collect / "
         f"{int(args.step_per_epoch)} steps/epoch / "
@@ -867,6 +934,7 @@ def main():
             "z_dim": int(z_dim),
             "yaw_limit": float(args.yaw_limit),
             "freeze_yaw": bool(args.freeze_yaw),
+            "freeze_vy": bool(args.freeze_vy),
             "lidar_distance_threshold": float(args.lidar_distance_threshold),
             "train_actor": bool(args.train_actor),
             "actor_reg_coef": float(args.actor_reg_coef),

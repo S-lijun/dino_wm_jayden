@@ -862,10 +862,19 @@ class WaypointNavController:
         dead_zone_start = 180.0 - self.dead_zone_deg
 
         if -self.threshold_deg <= theta_deg <= self.threshold_deg:
-            yaw_rate_to_use = self.k_yaw * theta_v
-            vx_cmd = vx_local
-            vy_cmd = vy_local
-            yaw_smooth = 0.1
+            if getattr(self, "freeze_vy", False):
+                # No strafe: yaw tracks the bearing immediately, then drive forward.
+                yaw_rate_to_use = float(
+                    np.clip(self.k_yaw * theta_v, -self.max_yaw_rate, self.max_yaw_rate)
+                )
+                vx_cmd = float(max(vx_local, 0.0))
+                vy_cmd = 0.0
+                yaw_smooth = 1.0
+            else:
+                yaw_rate_to_use = self.k_yaw * theta_v
+                vx_cmd = vx_local
+                vy_cmd = vy_local
+                yaw_smooth = 0.1
         else:
             vx_cmd = 0.1
             vy_cmd = 0.0
@@ -883,6 +892,8 @@ class WaypointNavController:
         alpha = self.vel_smooth_alpha
         vx_cmd = (1.0 - alpha) * self.prev_vx + alpha * vx_cmd
         vy_cmd = (1.0 - alpha) * self.prev_vy + alpha * vy_cmd
+        if getattr(self, "freeze_vy", False):
+            vy_cmd = 0.0
         self.prev_vx = float(vx_cmd)
         self.prev_vy = float(vy_cmd)
 

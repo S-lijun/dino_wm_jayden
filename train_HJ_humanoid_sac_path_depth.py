@@ -626,6 +626,36 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     print(f"[INFO] Resumed policy from {ckpt_path}")
 
 
+def _wandb_init_mode() -> str:
+    """Skip wandb-core when Windows application control blocks that binary."""
+    import subprocess
+
+    from wandb.util import get_core_path
+
+    try:
+        core = get_core_path()
+    except Exception:
+        return "online"
+    try:
+        subprocess.run(
+            [core, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 4551:
+            print(
+                "[WARN] Windows blocked wandb-core (WinError 4551). "
+                "Training continues without wandb. Curves go to TensorBoard.",
+                flush=True,
+            )
+            return "disabled"
+        raise
+    return "online"
+
+
 def main():
     args = get_args_and_merge_config()
 
@@ -699,10 +729,12 @@ def main():
     run_name = f"{run_tag}-{args.dino_encoder}-{timestamp}"
     if args.resume_policy:
         run_name = f"{run_name}-resume{resume_epoch_for_name}"
+    wandb_mode = _wandb_init_mode()
     wandb.init(
         project="sac-hj-latent-humanoid",
         name=run_name,
         config=vars(args),
+        mode=wandb_mode,
     )
     wandb.define_metric("trainer/env_step")
     wandb.define_metric("trainer/update")
@@ -714,6 +746,8 @@ def main():
     wandb.define_metric("switch/*", step_metric="trainer/env_step")
     tb_dir = f"runs/sac_hj_humanoid_path/{run_name}/logs"
     writer = SummaryWriter(log_dir=tb_dir)
+    if wandb_mode == "disabled" and wandb.run is not None:
+        wandb.run._label = lambda *args, **kwargs: None  # type: ignore[method-assign]
     wb_logger = WandbLogger(update_interval=1, train_interval=10**9, test_interval=10**9)
     wb_logger.load(writer)
     logger = wb_logger

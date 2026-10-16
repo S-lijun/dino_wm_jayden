@@ -124,6 +124,29 @@ def merge_ray_hits_multi(
     return diff_w, ranges, ranges_xy
 
 
+def quat_wxyz_to_matrix(quat_wxyz: np.ndarray) -> np.ndarray:
+    """Column-vector rotation matrix for a quaternion (w, x, y, z)."""
+    w, x, y, z = (float(v) for v in np.asarray(quat_wxyz, dtype=np.float64).reshape(4))
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def rotate_vectors_by_quat_inv(quat_wxyz: np.ndarray, vectors: np.ndarray) -> np.ndarray:
+    """Rotate world vectors into the frame of a unit quaternion (w, x, y, z)."""
+    quat = np.asarray(quat_wxyz, dtype=np.float64).reshape(4)
+    vec = np.asarray(vectors, dtype=np.float64)
+    w = float(quat[0])
+    xyz = -quat[1:]
+    t = np.cross(xyz, vec) * 2.0
+    return vec + w * t + np.cross(xyz, t)
+
+
 def compute_lidar_min_range_labels(
     origin_np: np.ndarray,
     hits_list: list[np.ndarray],
@@ -465,6 +488,8 @@ class IsaacG1Wrapper:
                 self._depth_cam_names.append(name)
 
         lidar_half = float(np.clip(self.lidar_h_half_fov_deg, 0.0, 180.0))
+        # Vision / h_s sensor. This cone is the distance vision can measure.
+        # Do not retarget it for the point-cloud encoder.
         lidar_common = dict(
             prim_path="{ENV_REGEX_NS}/Robot/head_link",
             update_period=self.lidar_period_s,
@@ -490,6 +515,52 @@ class IsaacG1Wrapper:
                 env_cfg.scene,
                 sensor_name,
                 RayCasterCfg(mesh_prim_paths=[mesh_path], **lidar_common),
+            )
+
+        # Utonia point cloud. Separate casters so the cone above stays put.
+        self._pc_lidar_sensor_names: list[str] = []
+        self._obstacle_pc_lidar_names: dict[str, str] = {}
+        self.lidar_min_range_m = 0.1
+        self.pc_lidar_max_distance = 40.0
+        pc_pattern = str(getattr(args_cli, "lidar_pattern", "")).lower()
+        if pc_pattern == "mid360":
+            pc_common = dict(
+                prim_path="{ENV_REGEX_NS}/Robot/head_link",
+                update_period=self.lidar_period_s,
+                offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+                ray_alignment="base",
+                max_distance=float(self.pc_lidar_max_distance),
+                pattern_cfg=patterns.LidarPatternCfg(
+                    channels=85,
+                    # Mid-360 sensor frame is -7..+52. G1 mounts it upside
+                    # down, so the same 59° span is -52..+7 on the robot.
+                    vertical_fov_range=(-52.0, 7.0),
+                    horizontal_fov_range=(-180.0, 180.0),
+                    horizontal_res=2.0,
+                ),
+                debug_vis=False,
+            )
+            for i, mesh_path in enumerate(self._lidar_mesh_paths):
+                sensor_name = f"lidar_pc_{i}"
+                self._pc_lidar_sensor_names.append(sensor_name)
+                setattr(
+                    env_cfg.scene,
+                    sensor_name,
+                    RayCasterCfg(mesh_prim_paths=[mesh_path], **pc_common),
+                )
+                path_s = str(mesh_path).rstrip("/")
+                for obs_name in self._obstacle_names:
+                    if path_s.endswith("/" + obs_name) or path_s.endswith(obs_name):
+                        self._obstacle_pc_lidar_names[obs_name] = sensor_name
+            print(
+                "[IsaacG1Wrapper] point-cloud LiDAR 360°: 85 channels, "
+                "elevation -52..+7 deg (inverted Mid-360), azimuth 360 deg "
+                "at 2 deg, max_distance=40 m. h_s uses this scan. "
+                "The 45-channel cone is not used."
+            )
+        elif pc_pattern not in ("", "cone"):
+            raise ValueError(
+                f"lidar_pattern must be 'mid360' or unset, got {pc_pattern!r}"
             )
 
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
@@ -1198,17 +1269,53 @@ class IsaacG1Wrapper:
         transform_matrix = np.array(omni.usd.get_world_transform_matrix(mesh_prim)).T
         points = np.matmul(points, transform_matrix[:3, :3].T)
         points += transform_matrix[:3, 3]
+        # Fabric does not write the teleported bin back into USD, so the
+        # matrix above is still the spawn pose. Ray casts must follow PhysX.
+        points = self._mesh_points_at_physx_pose(mesh_prim_path, points)
         indices = np.asarray(mesh_prim.GetFaceVertexIndicesAttr().Get())
         lidar.meshes[mesh_prim_path] = convert_to_warp_mesh(
             points, indices, device=self.device
         )
+
+    def _mesh_points_at_physx_pose(
+        self, mesh_prim_path: str, points_usd_world: np.ndarray
+    ) -> np.ndarray:
+        """Move USD-baked mesh vertices onto the rigid bin's live pose."""
+        path_s = str(mesh_prim_path).rstrip("/")
+        obs_name = None
+        for name in self._obstacle_names:
+            if path_s.endswith("/" + name) or path_s.endswith(name):
+                obs_name = name
+                break
+        if obs_name is None:
+            return points_usd_world
+        try:
+            obj = self.env.unwrapped.scene[obs_name]
+        except KeyError:
+            return points_usd_world
+        import isaaclab.sim as sim_utils
+
+        root_prim = sim_utils.find_first_matching_prim(obj.cfg.prim_path)
+        if root_prim is None or not root_prim.IsValid():
+            return points_usd_world
+        import omni.usd
+
+        root_T = np.array(omni.usd.get_world_transform_matrix(root_prim)).T
+        rotation = root_T[:3, :3]
+        translation = root_T[:3, 3]
+        points_local = (points_usd_world - translation) @ rotation
+        pos = obj.data.root_pos_w[0].detach().cpu().numpy().astype(np.float64)
+        quat = obj.data.root_quat_w[0].detach().cpu().numpy().astype(np.float64)
+        return points_local @ quat_wxyz_to_matrix(quat).T + pos
 
     def _refresh_lidar_warp_meshes(self) -> None:
         scene = self.env.unwrapped.scene
         n = 0
         # InteractiveScene has no __contains__; `name not in scene` probes
         # scene[0] and crashes with KeyError('0').
-        for name in list(getattr(self, "_lidar_sensor_names", []) or []):
+        names = list(getattr(self, "_lidar_sensor_names", []) or [])
+        names.extend(getattr(self, "_pc_lidar_sensor_names", []) or [])
+        for name in names:
             try:
                 lidar = scene[str(name)]
             except KeyError:
@@ -1277,6 +1384,24 @@ class IsaacG1Wrapper:
             if d < best:
                 best = d
         return best if np.isfinite(best) else float("nan")
+
+    def min_obstacle_xy_dist_live(self) -> float:
+        """360° distance from the robot to each active bin's current center."""
+        if not bool(getattr(self, "obstacle_present", True)):
+            return float("nan")
+        names = list(getattr(self, "_active_obstacles", []) or [])
+        if not names:
+            return self.min_obstacle_xy_dist()
+        robot_xy = self.get_robot_xy_local()
+        origin = self.env.unwrapped.scene.env_origins[0].detach().cpu().numpy()
+        scene = self.env.unwrapped.scene
+        best = float("inf")
+        for name in names:
+            pos = scene[name].data.root_pos_w[0].detach().cpu().numpy()
+            dx = float(pos[0] - origin[0]) - float(robot_xy[0])
+            dy = float(pos[1] - origin[1]) - float(robot_xy[1])
+            best = min(best, float(np.hypot(dx, dy)))
+        return best if best < float("inf") else float("nan")
 
     def lidar_azimuth_count(self) -> int:
         half = float(np.clip(getattr(self, "lidar_h_half_fov_deg", 90.0), 0.0, 180.0))
@@ -1360,6 +1485,49 @@ class IsaacG1Wrapper:
         filled = np.where(valid, np.minimum(ranges, clip), clip)
         return np.asarray(filled, dtype=np.float32).reshape(-1)
 
+    def get_lidar_points_sensor(self) -> np.ndarray:
+        """Valid hits in the head LiDAR frame, shape (N, 3).
+
+        One caster per obstacle, closest hit per ray, then drop misses and
+        returns closer than ``lidar_min_range_m``. Color and normals are not
+        measured. An empty scan returns shape (0, 3).
+        """
+        empty = np.zeros((0, 3), dtype=np.float32)
+        sensor_names = list(getattr(self, "_pc_lidar_sensor_names", []) or [])
+        if not sensor_names:
+            raise RuntimeError(
+                "point-cloud LiDAR is not in the scene. "
+                "Pass --lidar_pattern mid360 on the lidar training script."
+            )
+        if not bool(getattr(self, "obstacle_present", True)):
+            return empty
+        scene = self.env.unwrapped.scene
+        if bool(getattr(self, "filter_lidar_to_active_obstacles", False)):
+            mapped = [
+                self._obstacle_pc_lidar_names[name]
+                for name in self._active_obstacles
+                if name in getattr(self, "_obstacle_pc_lidar_names", {})
+            ]
+            if not mapped:
+                return empty
+            sensor_names = mapped
+        lidars = [scene[name] for name in sensor_names]
+        hits_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
+        origin = lidars[0].data.pos_w[0].detach().cpu().numpy()
+        quat = lidars[0].data.quat_w[0].detach().cpu().numpy()
+        max_d = float(getattr(lidars[0].cfg, "max_distance", self.pc_lidar_max_distance))
+        min_d = float(getattr(self, "lidar_min_range_m", 0.1))
+        diff_w, ranges, _ranges_xy = merge_ray_hits_multi(origin, hits_list, max_d)
+        valid = (
+            np.isfinite(ranges)
+            & (ranges >= min_d)
+            & (ranges < max_d * 0.999)
+        )
+        if not np.any(valid):
+            return empty
+        pts = rotate_vectors_by_quat_inv(quat, diff_w[valid])
+        return np.asarray(pts, dtype=np.float32)
+
     def get_lidar_joint_state(self) -> np.ndarray:
         """Onboard observation: 12 joints ‖ full lidar ranges (normalized)."""
         joints = self.get_lower_body_joint_pos()
@@ -1369,6 +1537,9 @@ class IsaacG1Wrapper:
         return np.concatenate([joints, scan_n], axis=0).astype(np.float32)
 
     def get_lidar_data(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+        # Lidar training: h_s from the 360° scan. Vision keeps the cone below.
+        if getattr(self, "_pc_lidar_sensor_names", None):
+            return self._get_pc_lidar_range()
         # Despawned obstacle: ignore mesh hits entirely so l is not polluted.
         if not bool(getattr(self, "obstacle_present", True)):
             stats = {
@@ -1434,6 +1605,59 @@ class IsaacG1Wrapper:
         }
         return diff_w, ranges, ranges_xy, stats
 
+    def _get_pc_lidar_range(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+        """Min range over the full Mid-360 scan. No forward-cone gate."""
+        if not bool(getattr(self, "obstacle_present", True)):
+            stats = {
+                "lidar_min_distance": float("nan"),
+                "lidar_min_distance_xy": float("nan"),
+            }
+            empty = np.zeros((0, 3), dtype=np.float64)
+            empty_r = np.zeros((0,), dtype=np.float64)
+            return empty, empty_r, empty_r, stats
+
+        scene = self.env.unwrapped.scene
+        sensor_names = list(self._pc_lidar_sensor_names)
+        if bool(getattr(self, "filter_lidar_to_active_obstacles", False)):
+            mapped = [
+                self._obstacle_pc_lidar_names[name]
+                for name in self._active_obstacles
+                if name in getattr(self, "_obstacle_pc_lidar_names", {})
+            ]
+            if not mapped:
+                stats = {
+                    "lidar_min_distance": float("nan"),
+                    "lidar_min_distance_xy": float("nan"),
+                }
+                empty = np.zeros((0, 3), dtype=np.float64)
+                empty_r = np.zeros((0,), dtype=np.float64)
+                return empty, empty_r, empty_r, stats
+            sensor_names = mapped
+        lidars = [scene[name] for name in sensor_names]
+        hits_list = [lidar.data.ray_hits_w[0].detach().cpu().numpy() for lidar in lidars]
+        origin = lidars[0].data.pos_w[0].detach().cpu().numpy()
+        max_d = float(getattr(lidars[0].cfg, "max_distance", self.pc_lidar_max_distance))
+        diff_w, ranges, ranges_xy = merge_ray_hits_multi(origin, hits_list, max_d)
+        valid_ray = (
+            np.isfinite(diff_w).all(axis=1)
+            & (ranges > 1e-4)
+            & (ranges < max_d * 0.999)
+        )
+        positive_ranges = ranges[valid_ray]
+        positive_ranges_xy = ranges_xy[valid_ray]
+        lidar_min_m = (
+            float(np.min(positive_ranges)) if positive_ranges.size > 0 else float("nan")
+        )
+        lidar_min_xy_m = (
+            float(np.min(positive_ranges_xy)) if positive_ranges_xy.size > 0 else float("nan")
+        )
+        stats = {
+            "lidar_min_distance": lidar_min_m,
+            "lidar_min_distance_xy": lidar_min_xy_m,
+            "lidar_geom_xy": float("nan"),
+        }
+        return diff_w, ranges, ranges_xy, stats
+
     def _update_lidar_stats(self) -> None:
         _, _, _, stats = self.get_lidar_data()
         self._last_lidar_stats.update(stats)
@@ -1454,8 +1678,10 @@ class IsaacG1Wrapper:
 
         ``h_s`` is the continuous PyHJ avoid cost (<0 unsafe, >0 safe).
 
-        - ``hs_mode=lidar`` (vision path): ``lidar_min - threshold``. No valid
-          hit in the forward cone → ``h_s = 2.0``.
+        - ``hs_mode=lidar`` on the vision path: ``lidar_min - threshold`` inside
+          the 45-channel forward cone. No hit → ``h_s = 2.0``.
+        - ``hs_mode=lidar`` when the Mid-360 casters exist: same formula on the
+          full 360° scan. No hit → ``h_s = 2.0``.
         - ``hs_mode=geom``: ``min_i ||xy_robot - xy_bin_i|| - threshold``.
           No active obstacle → ``h_s = 2.0``. Not gated by the lidar cone.
 
@@ -1582,6 +1808,17 @@ class IsaacG1Wrapper:
         if rgb.shape[0] != depth_vis.shape[0]:
             raise ValueError(f"RGB/depth height mismatch: {rgb.shape} vs {depth_vis.shape}")
         return np.concatenate([rgb, depth_vis], axis=1)
+
+    def get_proprio(self) -> np.ndarray:
+        """Joint angles, the same vector the vision line feeds its proprio encoder."""
+        robot = self.env.unwrapped.scene["robot"]
+        return (
+            robot.data.joint_pos[0, : self.num_joints]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
 
     def get_raw_obs(self) -> dict[str, np.ndarray]:
         if not self.collect_visual:

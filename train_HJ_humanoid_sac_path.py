@@ -416,6 +416,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--freeze_vy",
+    action="store_true",
+    help=(
+        "Force vy=0 on both the waypoint nominal controller and the safety-filter "
+        "actor. vy is dropped from the SAC log-prob (target entropy -2) so that "
+        "head is not trained. vx and yaw stay free. Default off."
+    ),
+)
+parser.add_argument(
     "--force_right_pass",
     action="store_true",
     help=(
@@ -815,6 +824,10 @@ def main():
     action_reg_coef = float(args.action_reg_coef)
     boundary_reg_coef = float(args.boundary_reg_coef)
     freeze_yaw = bool(getattr(args, "freeze_yaw", False))
+    freeze_vy = bool(getattr(args, "freeze_vy", False))
+    if freeze_vy and use_auto_alpha:
+        # log π is over (vx, yaw) only; do not spend entropy budget on vy.
+        policy._target_entropy = -2.0
     switch_collect = bool(getattr(args, "switch_collect", False))
     switch_threshold = float(getattr(args, "switch_threshold", 0.0))
     if switch_collect and boundary_reg_coef != 0.0:
@@ -837,6 +850,33 @@ def main():
         if out.ndim >= 1 and out.shape[-1] >= 3:
             out[..., 2] = 0.0
         return out
+
+    def _zero_vy_act(act):
+        """Force vy (dim 1) to 0 in policy-space actions (tensor or ndarray)."""
+        if isinstance(act, torch.Tensor):
+            if act.shape[-1] < 2:
+                return act
+            mask = torch.ones_like(act)
+            mask[..., 1] = 0.0
+            return act * mask
+        out = np.array(act, dtype=np.float32, copy=True)
+        if out.ndim >= 1 and out.shape[-1] >= 2:
+            out[..., 1] = 0.0
+        return out
+
+    def _log_prob_without_vy(out) -> torch.Tensor:
+        """Squashed-Gaussian log π(vx, yaw | z). vy is held at 0 and dropped."""
+        act = out.act
+        mu, sigma = out.logits
+        eps = 1e-6
+        clipped = act.clamp(-1.0 + eps, 1.0 - eps)
+        raw = 0.5 * (torch.log1p(clipped) - torch.log1p(-clipped))
+        var = sigma.pow(2).clamp(min=eps)
+        log_p = -0.5 * (
+            (raw - mu).pow(2) / var + torch.log(var) + float(np.log(2.0 * np.pi))
+        )
+        corr = torch.log((1.0 - clipped.pow(2)) + eps)
+        return (log_p - corr)[..., [0, 2]].sum(dim=-1, keepdim=True)
 
     def _waypoint_acts_policy(*, zero_yaw: bool = False) -> np.ndarray:
         fns = train_envs.get_env_attr("compute_waypoint_nav_action")
@@ -876,6 +916,8 @@ def main():
         # Train/BC: optional yaw=0 so we never imitate buffer yaw.
         if freeze_yaw:
             act_nom_t = _zero_yaw_act(act_nom_t)
+        if freeze_vy:
+            act_nom_t = _zero_vy_act(act_nom_t)
         return act_nom_t
 
     def _batch_act_good_tensor(batch, act_ref: torch.Tensor) -> torch.Tensor | None:
@@ -891,6 +933,8 @@ def main():
             act_good_t = act_good_t.unsqueeze(0)
         if freeze_yaw:
             act_good_t = _zero_yaw_act(act_good_t)
+        if freeze_vy:
+            act_good_t = _zero_vy_act(act_good_t)
         return act_good_t
 
     def _batch_use_sf_weight(batch, act_ref: torch.Tensor) -> torch.Tensor:
@@ -1019,6 +1063,10 @@ def main():
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
         if freeze_yaw:
             out.act = _zero_yaw_act(out.act)
+        if freeze_vy:
+            out.act = _zero_vy_act(out.act)
+            if isinstance(out.act, torch.Tensor) and getattr(out, "logits", None) is not None:
+                out.log_prob = _log_prob_without_vy(out)
         if getattr(policy, "_attach_act_nom", False):
             act_nom = _waypoint_acts_policy(zero_yaw=freeze_yaw)
             n = int(np.asarray(act_nom).reshape(-1, 3).shape[0])
@@ -1085,7 +1133,7 @@ def main():
         if not policy.warmup:
             # Learn always uses the SF actor (not the switched env action).
             obs_result = policy(batch)
-            act = obs_result.act  # yaw already 0 if --freeze_yaw
+            act = obs_result.act  # yaw/vy already 0 if those freezes are on
             q = torch.min(
                 policy.critic1(batch.obs, act).flatten(),
                 policy.critic2(batch.obs, act).flatten(),
@@ -1172,7 +1220,7 @@ def main():
         + ", "
         f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}], "
         f"yaw_limit={float(args.yaw_limit):g}, "
-        f"freeze_yaw={freeze_yaw}, "
+        f"freeze_yaw={freeze_yaw}, freeze_vy={freeze_vy}, "
         f"alternate_collect={bool(args.alternate_collect)} "
         f"(waypoint ↔ switch), "
         + (
@@ -1249,6 +1297,8 @@ def main():
         try:
             if freeze_yaw:
                 act = _zero_yaw_act(act)
+            if freeze_vy:
+                act = _zero_vy_act(act)
             if isinstance(act, torch.Tensor):
                 act_np = act.detach().cpu().numpy()
             else:
@@ -1406,8 +1456,12 @@ def main():
         )
         + _nom_act_noise_banner(args, sep="; ")
         + f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°; "
-        f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}]; "
-        f"yaw=±{float(args.yaw_limit):g}; "
+        + (
+            "vy=0 (frozen on a_nom and a_sf); "
+            if freeze_vy
+            else f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}]; "
+        )
+        + f"yaw=±{float(args.yaw_limit):g}; "
         f"obstacles: absent_p={float(args.obstacle_absent_prob):g}, "
         f"P(2|present)={float(args.two_obstacle_prob):g}, "
         f"perp U[{float(getattr(args, 'perp_keepout', 0.25)):g},"
@@ -1486,7 +1540,7 @@ def main():
         )
     print(
         "[INFO] Buffer done; restoring SAC actor "
-        f"(learn always SF; freeze_yaw={freeze_yaw}; {path_desc}; "
+        f"(learn always SF; freeze_yaw={freeze_yaw}; freeze_vy={freeze_vy}; {path_desc}; "
         f"arena {arena_desc}, OOB reset skip_update="
         f"{bool(args.skip_arena_oob_from_buffer)}). "
         f"Obstacles: absent_p={float(args.obstacle_absent_prob):g}, "

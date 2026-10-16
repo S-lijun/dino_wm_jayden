@@ -201,6 +201,11 @@ parser.add_argument("--include_contact_in_hs", action="store_true", default=True
 parser.add_argument("--no_include_contact_in_hs", action="store_true")
 parser.add_argument("--contact_hs", type=float, default=-2.5)
 parser.add_argument("--yaw_limit", type=float, default=1.0)
+parser.add_argument(
+    "--freeze_vy",
+    action="store_true",
+    help="Match a train run with --freeze_vy: nominal and SF actions keep vy=0.",
+)
 parser.add_argument("--y_bound", type=float, default=0.0)
 parser.add_argument("--use_arena_bounds", action="store_true", default=True)
 parser.add_argument("--arena_x_min", type=float, default=-1.0)
@@ -452,6 +457,9 @@ def v_value(policy, z: np.ndarray, device: str) -> float:
         a_t = act_pol
     else:
         a_t = torch.as_tensor(act_pol, dtype=torch.float32, device=device)
+    if bool(getattr(policy, "freeze_vy", False)):
+        a_t = a_t.clone()
+        a_t[..., 1] = 0.0
     if a_t.ndim == 1:
         a_t = a_t.unsqueeze(0)
     q = torch.min(policy.critic1(z_t, a_t), policy.critic2(z_t, a_t))
@@ -473,6 +481,9 @@ def actor_policy_and_env(policy, z: np.ndarray, device: str) -> tuple[np.ndarray
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
     act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
+    if bool(getattr(policy, "freeze_vy", False)) and act_pol.shape[-1] >= 2:
+        act_pol = act_pol.copy()
+        act_pol[1] = 0.0
     act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
     policy.train(was_training)
     return act_pol, act_env
@@ -1283,6 +1294,7 @@ def main():
     )
     configure_path_eval(env, args)
     policy = build_policy(env, args, args.device)
+    policy.freeze_vy = bool(getattr(args, "freeze_vy", False))
     load_policy_checkpoint(
         policy, args.policy_path, args.device, critic_fusion=args.critic_fusion
     )

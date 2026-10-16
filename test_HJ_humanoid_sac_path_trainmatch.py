@@ -21,6 +21,7 @@ Fixed start / goal / bins (repeat --scene)::
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from datetime import datetime
@@ -92,7 +93,8 @@ parser.add_argument(
     "--visual_mode",
     type=str,
     default="rtx_rgb",
-    choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb"],
+    choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb", "rtx_depth"],
+    help="rtx_depth: policy sees depth; saved video is RGB|depth.",
 )
 parser.add_argument(
     "--policy_path",
@@ -107,8 +109,12 @@ parser.add_argument(
     "--mode",
     type=str,
     default="compare",
-    choices=["compare", "switching", "waypoint_only", "safe_only"],
-    help="compare (default) = waypoint / SF / switching on the same scene.",
+    choices=["compare", "switch_nominal", "switching", "waypoint_only", "safe_only"],
+    help=(
+        "switch_nominal: nominal and switching on the same scene, then print metrics. "
+        "compare: waypoint / SF / switching. "
+        "switching | waypoint_only | safe_only: that controller only."
+    ),
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
@@ -221,6 +227,13 @@ parser.add_argument(
     help="h_s = lidar_d_min - this. Dashed obstacle circle uses the same radius.",
 )
 parser.add_argument("--lidar_h_half_fov_deg", type=float, default=60.0)
+parser.add_argument(
+    "--success_fail_radius",
+    type=float,
+    default=0.5,
+    help="Success fails if the 360° distance to a bin center drops below this, "
+    "even if the goal is reached.",
+)
 parser.add_argument("--include_contact_in_hs", action="store_true", default=True)
 parser.add_argument("--no_include_contact_in_hs", action="store_true")
 parser.add_argument("--contact_hs", type=float, default=-2.5)
@@ -232,6 +245,15 @@ parser.add_argument(
     help=(
         "Force yaw (dim 2) to 0 on the SF action only; a_nom keeps its yaw. "
         "Q(a_sf) is probed on the same zeroed action. Default: off."
+    ),
+)
+parser.add_argument(
+    "--freeze_vy",
+    action="store_true",
+    default=False,
+    help=(
+        "Match a --freeze_vy train run: vy=0 on a_nom and a_sf. "
+        "Q is probed on that same action. Default: off."
     ),
 )
 parser.add_argument("--y_bound", type=float, default=0.0)
@@ -432,7 +454,10 @@ def _visual_to_uint8_hwc(visual) -> np.ndarray:
 
 
 def _video_frame(env: LatentHumanoidEnv, hj_val: float | None, l_val: float | None) -> np.ndarray:
-    hwc = _visual_to_uint8_hwc(env.wrapper.get_raw_obs()["visual"])
+    if getattr(env.wrapper, "visual_mode", "") == "rtx_depth":
+        hwc = _visual_to_uint8_hwc(env.wrapper.get_rgb_depth_side_hwc())
+    else:
+        hwc = _visual_to_uint8_hwc(env.wrapper.get_raw_obs()["visual"])
     return env._overlay_metrics_hwc(hwc, hj_val, l_val)
 
 
@@ -549,6 +574,7 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str, critic_fu
 
 
 FREEZE_YAW = False
+FREEZE_VY = False
 
 
 def _zero_yaw_act(act: np.ndarray) -> np.ndarray:
@@ -561,6 +587,16 @@ def _zero_yaw_act(act: np.ndarray) -> np.ndarray:
         return out
     out = out.copy()
     out[..., 2] = 0.0
+    return out
+
+
+def _zero_vy_act(act: np.ndarray) -> np.ndarray:
+    """Force vy (dim 1) to 0 when --freeze_vy is on. No-op otherwise."""
+    out = np.asarray(act, dtype=np.float32)
+    if not FREEZE_VY or out.ndim < 1 or out.shape[-1] < 2:
+        return out
+    out = out.copy()
+    out[..., 1] = 0.0
     return out
 
 
@@ -590,6 +626,9 @@ def v_value(policy, z: np.ndarray, device: str) -> float:
         a_t = act_pol
     else:
         a_t = torch.as_tensor(act_pol, dtype=torch.float32, device=device)
+    if FREEZE_VY:
+        a_t = a_t.clone()
+        a_t[..., 1] = 0.0
     if a_t.ndim == 1:
         a_t = a_t.unsqueeze(0)
     q = torch.min(policy.critic1(z_t, a_t), policy.critic2(z_t, a_t))
@@ -610,9 +649,11 @@ def actor_policy_and_env(policy, z: np.ndarray, device: str) -> tuple[np.ndarray
     act_pol = policy(Batch(obs=z_t, info=Batch())).act
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
-    act_pol = _zero_yaw_act(np.asarray(act_pol, dtype=np.float32).reshape(-1))
-    act_env = _zero_yaw_act(
-        np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
+    act_pol = _zero_vy_act(
+        _zero_yaw_act(np.asarray(act_pol, dtype=np.float32).reshape(-1))
+    )
+    act_env = _zero_vy_act(
+        _zero_yaw_act(np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3))
     )
     policy.train(was_training)
     return act_pol, act_env
@@ -661,8 +702,12 @@ def _no_bin_run_ids(num_runs: int, every: int, rng: np.random.Generator) -> set[
 
 
 def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
-    global FREEZE_YAW
+    global FREEZE_YAW, FREEZE_VY
     FREEZE_YAW = bool(getattr(args, "freeze_yaw", False))
+    FREEZE_VY = bool(getattr(args, "freeze_vy", False))
+    env._freeze_vy = FREEZE_VY
+    env.waypoint_nav.freeze_vy = FREEZE_VY
+    env._safe_side_nav.freeze_vy = FREEZE_VY
     env.wrapper.waypoint_layout = str(getattr(args, "waypoint_layout", "start_goal"))
     env.wrapper.path_obstacle_layout = True
     env.wrapper.filter_lidar_to_active_obstacles = True
@@ -726,7 +771,8 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
         f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}° "
         f"contact_hs={float(args.contact_hs):g} "
         f"nom {nom_v} act={nom_a} a_sf=eval mean "
-        f"z_fuse={env.z_fuse_frames} freeze_yaw={FREEZE_YAW}"
+        f"z_fuse={env.z_fuse_frames} freeze_yaw={FREEZE_YAW} "
+        f"freeze_vy={FREEZE_VY}"
     )
 
 
@@ -1433,6 +1479,122 @@ def _save_compare_traj(
     print(f"[INFO] Saved compare traj: {out_path}")
 
 
+def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
+    """Per-session rates, then the mean of those session values."""
+    labels = {
+        "waypoint_only": "nominal",
+        "switching": "switching",
+        "safe_only": "sf_only",
+    }
+    lines = [
+        "METRICS",
+        "  success_rate: reached goal without 360° bin-center distance < success_fail_radius",
+        "  collision_rate: contact steps / session steps (h_s <= contact_hs), then mean over sessions",
+        "  avg_velocity_mps: mean XY speed inside a session, then mean over all sessions",
+        "  sf_step_ratio: SF steps / session steps, then mean over sessions",
+        "  min_clearance_m: closest bin-center distance in a session, then averaged",
+        "",
+    ]
+
+    def _fmt(x: float, nd: int = 3) -> str:
+        return "n/a" if not np.isfinite(x) else f"{x:.{nd}f}"
+
+    def _mean_finite(xs: list[float]) -> tuple[float, int]:
+        vals = [float(x) for x in xs if np.isfinite(x)]
+        if not vals:
+            return float("nan"), 0
+        return float(np.mean(vals)), len(vals)
+
+    for mode in modes:
+        rs = [r for r in results if r["mode"] == mode]
+        n = len(rs)
+        name = labels.get(mode, mode)
+        if n == 0:
+            lines.append(f"[{name}] no sessions")
+            lines.append("")
+            continue
+        n_ok = sum(1 for r in rs if r["success"])
+        success_rate = n_ok / n
+        collision_rate, n_col = _mean_finite([r["collision_rate"] for r in rs])
+        velocity, n_vel = _mean_finite([r["mean_speed_mps"] for r in rs])
+        sf_ratio, n_sf = _mean_finite([r["sf_step_ratio"] for r in rs])
+        clearance, n_clr = _mean_finite([r["min_clearance_m"] for r in rs])
+
+        lines.extend(
+            [
+                f"[{name}] n={n}",
+                f"  success_rate={success_rate:.3f} ({n_ok}/{n})",
+                f"  collision_rate={_fmt(collision_rate)} (n={n_col})",
+                f"  avg_velocity_mps={_fmt(velocity)} (n={n_vel})",
+                f"  sf_step_ratio={_fmt(sf_ratio)} (n={n_sf})",
+                f"  min_clearance_m={_fmt(clearance)} (n_with_obstacle={n_clr})",
+            ]
+        )
+        for r in rs:
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            lines.append(
+                f"  {tag}: success={int(bool(r['success']))} "
+                f"collision_rate={_fmt(float(r['collision_rate']))} "
+                f"({r['n_contact_steps']}/{r['n_steps']}) "
+                f"speed={_fmt(float(r['mean_speed_mps']))} "
+                f"sf_step_ratio={_fmt(float(r['sf_step_ratio']))} "
+                f"({r['n_sf_steps']}/{r['n_steps']}) "
+                f"min_clearance={_fmt(float(r['min_clearance_m']))} "
+                f"min_failset={_fmt(float(r['min_failset_m']))}"
+            )
+        lines.append("")
+    return lines
+
+
+def _write_session_metrics(path: Path, results: list[dict]) -> None:
+    """One row per session. Aggregates stay in the summary text."""
+    fields = [
+        "mode",
+        "tag",
+        "run_id",
+        "success",
+        "end_reason",
+        "n_steps",
+        "n_contact_steps",
+        "collision_rate",
+        "mean_speed_mps",
+        "n_sf_steps",
+        "n_nom_steps",
+        "sf_step_ratio",
+        "min_clearance_m",
+        "min_failset_m",
+    ]
+
+    def _cell(x) -> str:
+        if isinstance(x, float) and not np.isfinite(x):
+            return ""
+        return str(x)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in results:
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            writer.writerow(
+                {
+                    "mode": r["mode"],
+                    "tag": tag,
+                    "run_id": int(r["run_id"]),
+                    "success": int(bool(r["success"])),
+                    "end_reason": r["end_reason"],
+                    "n_steps": int(r["n_steps"]),
+                    "n_contact_steps": int(r["n_contact_steps"]),
+                    "collision_rate": _cell(float(r["collision_rate"])),
+                    "mean_speed_mps": _cell(float(r["mean_speed_mps"])),
+                    "n_sf_steps": int(r["n_sf_steps"]),
+                    "n_nom_steps": int(r["n_nom_steps"]),
+                    "sf_step_ratio": _cell(float(r["sf_step_ratio"])),
+                    "min_clearance_m": _cell(float(r["min_clearance_m"])),
+                    "min_failset_m": _cell(float(r["min_failset_m"])),
+                }
+            )
+
+
 def simulate_one(
     env: LatentHumanoidEnv,
     policy,
@@ -1448,6 +1610,7 @@ def simulate_one(
     seed: int | None = None,
     look_ahead: bool = False,
     file_tag: str | None = None,
+    success_fail_radius: float = 0.5,
 ) -> dict:
     z, info = env.reset(seed=seed, options={"fixed_layout": fixed_layout})
     layout = fixed_layout
@@ -1466,6 +1629,13 @@ def simulate_one(
     last_controller = None
     end_reason = None
     use_sf_hist: list[bool] = []
+    contact_hist: list[bool] = []
+    clearance_hist: list[float] = []
+    failset_hist: list[float] = []
+    d0 = float(env.wrapper.min_obstacle_xy_dist_live())
+    if np.isfinite(d0):
+        failset_hist.append(d0)
+    contact_hs = float(getattr(env.wrapper, "contact_hs", -2.5))
     probe_rng = np.random.default_rng(0)
     q_nom_hist: list[float] = []
     q_sf_hist: list[float] = []
@@ -1533,6 +1703,14 @@ def simulate_one(
         h_s_last = float(h_s)
         if h_s < 0:
             constraint_violations += 1
+        # Contact folds h_s down to contact_hs (-2.5). Lidar alone stays above that.
+        contact_hist.append(h_s_last <= contact_hs + 1e-3)
+        d_fail = float(getattr(env, "_step_min_failset_m", float("nan")))
+        if np.isfinite(d_fail):
+            failset_hist.append(d_fail)
+        d_obs = float(env.wrapper.min_obstacle_xy_dist())
+        if np.isfinite(d_obs):
+            clearance_hist.append(d_obs)
 
         if save_video:
             hj_exec = env._hj_value(
@@ -1565,9 +1743,33 @@ def simulate_one(
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] video save failed: {exc}")
 
-    success = end_reason == "all_waypoints"
     def _mean(xs: list[float]) -> float | None:
         return float(np.mean(xs)) if xs else None
+
+    dt = float(getattr(env, "visual_period_s", 1.0 / 15.0))
+    speeds: list[float] = []
+    traj_np = np.asarray(traj, dtype=np.float64)
+    if dt > 0.0 and traj_np.shape[0] >= 2:
+        step_xy = np.linalg.norm(np.diff(traj_np, axis=0), axis=1)
+        speeds = (step_xy / dt).astype(np.float64).tolist()
+    mean_speed = float(np.mean(speeds)) if speeds else float("nan")
+    # Per session: closest approach to a bin center. No bin → NaN (left out of the mean).
+    min_clearance = float(np.min(clearance_hist)) if clearance_hist else float("nan")
+    n_steps = int(len(contact_hist))
+    n_contact_steps = int(sum(contact_hist))
+    n_sf_steps = int(sum(use_sf_hist))
+    n_nom_steps = n_steps - n_sf_steps
+    collision_rate = (
+        float(n_contact_steps) / float(n_steps) if n_steps else float("nan")
+    )
+    min_failset = float(np.min(failset_hist)) if failset_hist else float("nan")
+    entered_fail_margin = bool(
+        np.isfinite(min_failset) and min_failset < float(success_fail_radius)
+    )
+    success = end_reason == "all_waypoints" and not entered_fail_margin
+    sf_step_ratio = (
+        float(n_sf_steps) / float(n_steps) if n_steps else float("nan")
+    )
 
     result = {
         "mode": mode,
@@ -1583,8 +1785,17 @@ def simulate_one(
         "final_h_s": h_s_last,
         "stuck": float(info.get("stuck", 0.0)),
         "video": video_path,
-        "traj": np.asarray(traj, dtype=np.float64),
+        "traj": traj_np,
         "use_sf": np.asarray(use_sf_hist, dtype=bool),
+        "n_steps": n_steps,
+        "n_contact_steps": n_contact_steps,
+        "collision_rate": collision_rate,
+        "n_sf_steps": n_sf_steps,
+        "n_nom_steps": n_nom_steps,
+        "sf_step_ratio": sf_step_ratio,
+        "mean_speed_mps": mean_speed,
+        "min_clearance_m": min_clearance,
+        "min_failset_m": min_failset,
         "layout": layout,
         "q_probe_mean_nom": _mean(q_nom_hist),
         "q_probe_mean_sf": _mean(q_sf_hist),
@@ -1594,6 +1805,9 @@ def simulate_one(
     print(
         f"[RUN {run_id}] mode={mode} end={end_reason} success={success} "
         f"steps={result['visual_steps']} interventions={hj_interventions} "
+        f"collision_rate={collision_rate:.3f} "
+        f"sf_step_ratio="
+        f"{'n/a' if not np.isfinite(sf_step_ratio) else f'{sf_step_ratio:.3f}'} "
         f"violations={constraint_violations} minQ={result['min_q_nom']}"
     )
     if q_nom_hist:
@@ -1634,20 +1848,28 @@ def main():
         torch.cuda.manual_seed_all(int(getattr(args, "seed", 0)))
 
     stamp = datetime.now().strftime("%m%d_%H%M%S")
-    out_dir = (
-        Path(args.out_dir)
-        if args.out_dir
-        else Path("humanoid_test_sac_path_trainmatch") / stamp
+    default_root = (
+        Path("humanoid_test_sac_path_depth")
+        if str(getattr(args, "visual_mode", "")) == "rtx_depth"
+        else Path("humanoid_test_sac_path_trainmatch")
     )
+    out_dir = Path(args.out_dir) if args.out_dir else default_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
-    modes = list(COMPARE_MODES) if args.mode == "compare" else [args.mode]
+    if args.mode == "compare":
+        modes = list(COMPARE_MODES)
+    elif args.mode == "switch_nominal":
+        modes = ["waypoint_only", "switching"]
+    else:
+        modes = [args.mode]
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] modes={modes} policy={args.policy_path}")
     print(
-        f"[INFO] visual_feature={args.visual_feature} "
+        f"[INFO] visual_mode={args.visual_mode} "
+        f"visual_feature={args.visual_feature} "
         f"critic_fusion={args.critic_fusion} "
         f"z_fuse_frames={int(getattr(args, 'z_fuse_frames', 5))} "
-        f"freeze_yaw={bool(getattr(args, 'freeze_yaw', False))}"
+        f"freeze_yaw={bool(getattr(args, 'freeze_yaw', False))} "
+        f"freeze_vy={bool(getattr(args, 'freeze_vy', False))}"
     )
     print(
         "[INFO] look_ahead="
@@ -1784,6 +2006,7 @@ def main():
                 seed=trial_seed,
                 look_ahead=look_ahead,
                 file_tag=file_tag,
+                success_fail_radius=float(args.success_fail_radius),
             )
             results.append(r)
             mode_trajs[mode] = r["traj"]
@@ -1888,14 +2111,20 @@ def main():
             )
         lines.append("")
 
+    lines.extend(_metrics_block(results, modes))
     text = "\n".join(lines)
     summary_path = out_dir / (
         "summary_compare.txt" if args.mode == "compare" else f"summary_{args.mode}.txt"
     )
     summary_path.write_text(text, encoding="utf-8")
+    metrics_path = out_dir / (
+        "metrics_compare.csv" if args.mode == "compare" else f"metrics_{args.mode}.csv"
+    )
+    _write_session_metrics(metrics_path, results)
     print("\n" + "=" * 60)
     print(text)
     print(f"[INFO] Wrote {summary_path}")
+    print(f"[INFO] Wrote {metrics_path}")
 
     env.close()
     simulation_app.close()
