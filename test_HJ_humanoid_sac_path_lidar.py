@@ -1,17 +1,30 @@
-"""Test SAC lidar+joints HJ safety filter on Isaac G1 (path layout).
+"""Eval that matches the lidar start_goal train command.
 
-Matches ``train_HJ_humanoid_sac_lidar.py``: no DINO WM; state is 12-D
-legs plus full lidar ranges; ``h_s`` is geometric XY distance to the bin.
+State is frozen Utonia on the Mid-360 scan plus the WM proprio encoder.
+RTX RGB is the rollout video only. Scene sampling, controllers, and metrics
+match train_HJ_humanoid_sac_path_lidar.py: start→goal, bins off the path,
+|v|~U[0.05,0.95]/ep, Gaussian a_nom noise σ∈{0.1,0.2} with vy=yaw sharing
+one draw, z_fuse_frames=5, h_s = min range − 1 m.
 
 Usage::
 
-  python test_HJ_humanoid_sac_lidar.py --headless --visual_mode rtx_rgb \\
-    --policy_path runs/sac_hj_humanoid_lidar/.../epoch_id_N/policy.pth
+    python test_HJ_humanoid_sac_path_lidar.py --headless --visual_mode rtx_rgb \\
+      --obs_mode lidar_utonia --lidar_pattern mid360 \\
+      --dino_ckpt_dir C:\\dino_wm_jayden --dino_encoder wm_ckpt_18-27-17 \\
+      --with_proprio --critic_fusion concat \\
+      --policy_path runs/sac_hj_humanoid_path/.../epoch_id_N/policy.pth
+
+Fixed start / goal / bins (repeat --scene)::
+
+    --scene 0,0 5.5,0 4,0 \\
+    --scene 0,0 5.5,0 4,0.5 3.5,-0.4 \\
+    --scene 0,0 5.5,0 none
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import sys
 from datetime import datetime
@@ -43,42 +56,68 @@ EASY_BIN_XY = (4.5, -2.0)
 EASY_GOAL_REGION = {"center": (5.5, -2.0), "r": 1.0}
 EASY_WP3_MAX_DIST = 1.0
 
-parser = argparse.ArgumentParser("Test SAC HJ lidar+joints filter on path-layout Humanoid")
+parser = argparse.ArgumentParser(
+    "Train-matched eval for the Mid-360 Utonia SAC HJ path filter"
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
+parser.add_argument("--dino_ckpt_dir", type=str, default=REPO_ROOT)
+parser.add_argument("--dino_encoder", type=str, default="wm_ckpt_18-27-17")
 parser.add_argument(
     "--obs_mode",
     type=str,
-    default="lidar_joint",
-    choices=["lidar_joint"],
+    default="lidar_utonia",
+    choices=["lidar_utonia"],
+    help="State is Utonia(lidar hits) plus the WM proprio encoder.",
 )
 parser.add_argument(
-    "--hs_mode",
+    "--lidar_pattern",
     type=str,
-    default="geom",
-    choices=["geom", "lidar"],
+    default="mid360",
+    choices=["mid360"],
+    help="360° scan, elevation -52..+7 deg. Same rays for z_lidar and h_s.",
 )
 parser.add_argument(
-    "--critic-net",
-    type=int,
-    nargs="*",
-    default=[256],
+    "--utonia_ckpt",
+    type=str,
+    default=None,
+    help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
 )
 parser.add_argument(
-    "--control-net",
-    type=int,
-    nargs="*",
-    default=[256],
+    "--visual_feature",
+    type=str,
+    default="cls",
+    choices=["patch", "cls"],
+    help="Unused on the lidar line. Kept so old CLI flags still parse.",
 )
-parser.add_argument("--dino_ckpt_dir", type=str, default="/workspace")
-parser.add_argument("--dino_encoder", type=str, default="wm_ckpt_18-27-17")
+parser.add_argument(
+    "--critic_fusion",
+    type=str,
+    default="concat",
+    choices=["late", "concat"],
+    help="Must match training (this script defaults to concat).",
+)
+parser.add_argument(
+    "--z_fuse_frames",
+    type=int,
+    default=5,
+    help=(
+        "Average the last N full z vectors (z_lidar + proprio). "
+        "Must match training. Default 5."
+    ),
+)
 parser.add_argument("--config", type=str, default="train_HJ_configs.yaml")
-parser.add_argument("--with_proprio", action="store_true")
+parser.add_argument(
+    "--with_proprio",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
 parser.add_argument(
     "--visual_mode",
     type=str,
     default="rtx_rgb",
-    choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb"],
+    choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb", "rtx_depth"],
+    help="Ignored: rollout video is always RTX RGB. The actor state is z_lidar.",
 )
 parser.add_argument(
     "--policy_path",
@@ -93,8 +132,12 @@ parser.add_argument(
     "--mode",
     type=str,
     default="compare",
-    choices=["compare", "switching", "waypoint_only", "safe_only"],
-    help="compare (default) = waypoint / SF / switching on the same scene.",
+    choices=["compare", "switch_nominal", "switching", "waypoint_only", "safe_only"],
+    help=(
+        "switch_nominal: nominal and switching on the same scene, then print metrics. "
+        "compare: waypoint / SF / switching. "
+        "switching | waypoint_only | safe_only: that controller only."
+    ),
 )
 parser.add_argument("--num_runs", type=int, default=5)
 parser.add_argument(
@@ -146,19 +189,31 @@ parser.add_argument(
 )
 parser.add_argument(
     "--bin_xy",
-    type=str,
+    action="append",
     default=None,
     metavar="X,Y",
     help=(
-        "Custom blue-bin XY as 'x,y'. Omit or 'none' for no bin. "
-        "Only valid with custom waypoints."
+        "Blue-bin XY as 'x,y'. Repeat for a second bin, or 'x1,y1;x2,y2'. "
+        "'none' = no bin. Only valid with custom waypoints. "
+        "Omit: no bin. Ignored if --scene is set."
+    ),
+)
+parser.add_argument(
+    "--scene",
+    action="append",
+    default=None,
+    metavar="XY",
+    help=(
+        "One eval scene: start goal [bin [bin2] | none]. Repeat the flag. "
+        "Example: --scene 0,-3 0,1 -0.5,0. Negative coords are fine. "
+        "'none' or omit bins = no obstacle. Do not use ';' (PowerShell)."
     ),
 )
 parser.add_argument(
     "--spawn_yaw",
     type=float,
     default=None,
-    help="Spawn yaw in radians. Default: heading from start toward via1.",
+    help="Spawn yaw in radians. Default: heading from start toward goal.",
 )
 parser.add_argument(
     "--safety_threshold",
@@ -185,29 +240,149 @@ parser.add_argument(
 parser.add_argument(
     "--danger_radius",
     type=float,
-    default=1.5,
-    help="Failure-set / LiDAR margin radius (m). Third via is inside this disk.",
+    default=1.0,
+    help="Plot / failure-set disk (m). Default 1 to match h_s = d_min-1.",
 )
-parser.add_argument("--lidar_distance_threshold", type=float, default=1.5)
+parser.add_argument(
+    "--lidar_distance_threshold",
+    type=float,
+    default=1.0,
+    help="h_s = lidar_d_min - this. Dashed obstacle circle uses the same radius.",
+)
 parser.add_argument("--lidar_h_half_fov_deg", type=float, default=60.0)
+parser.add_argument(
+    "--success_fail_radius",
+    type=float,
+    default=0.5,
+    help="Success fails if the 360° distance to a bin center drops below this, "
+    "even if the goal is reached.",
+)
 parser.add_argument("--include_contact_in_hs", action="store_true", default=True)
 parser.add_argument("--no_include_contact_in_hs", action="store_true")
-parser.add_argument("--contact_hs", type=float, default=-1.5)
+parser.add_argument("--contact_hs", type=float, default=-2.5)
 parser.add_argument("--yaw_limit", type=float, default=1.0)
+parser.add_argument(
+    "--freeze_yaw",
+    action="store_true",
+    default=False,
+    help=(
+        "Force yaw (dim 2) to 0 on the SF action only; a_nom keeps its yaw. "
+        "Q(a_sf) is probed on the same zeroed action. Default: off."
+    ),
+)
+parser.add_argument(
+    "--freeze_vy",
+    action="store_true",
+    default=False,
+    help=(
+        "Match a --freeze_vy train run: vy=0 on a_nom and a_sf. "
+        "Q is probed on that same action. Default: off."
+    ),
+)
 parser.add_argument("--y_bound", type=float, default=0.0)
 parser.add_argument("--use_arena_bounds", action="store_true", default=True)
 parser.add_argument("--arena_x_min", type=float, default=-1.0)
 parser.add_argument("--arena_x_max", type=float, default=6.0)
 parser.add_argument("--arena_y_min", type=float, default=-4.0)
 parser.add_argument("--arena_y_max", type=float, default=2.0)
-parser.add_argument("--waypoint_layout", type=str, default="start_goal_perp")
-parser.add_argument("--perp_offset", type=float, default=2.5)
-parser.add_argument("--min_start_goal_dist", type=float, default=4.0)
+parser.add_argument("--waypoint_layout", type=str, default="start_goal")
+parser.add_argument("--perp_offset", type=float, default=1.5)
+parser.add_argument(
+    "--perp_keepout",
+    type=float,
+    default=0.25,
+    help="Inner keep-out (m) on both sides of start–goal. Must match training.",
+)
+parser.add_argument("--min_start_goal_dist", type=float, default=5.0)
 parser.add_argument("--path_obstacle_layout", action="store_true", default=True)
-parser.add_argument("--max_n_obstacles", type=int, default=1)
+parser.add_argument("--max_n_obstacles", type=int, default=2)
+parser.add_argument("--obstacle_absent_prob", type=float, default=0.1)
+parser.add_argument("--two_obstacle_prob", type=float, default=0.5)
 parser.add_argument("--skip_arena_oob_from_buffer", action="store_true", default=True)
+parser.add_argument(
+    "--randomize_nom_speed",
+    action="store_true",
+    default=True,
+    help="Train default on: Uniform[min,max] once per episode.",
+)
+parser.add_argument("--no_randomize_nom_speed", action="store_true")
+parser.add_argument("--nom_speed_min", type=float, default=0.05)
+parser.add_argument("--nom_speed_max", type=float, default=0.95)
+parser.add_argument("--nom_speed_mean", type=float, default=0.5)
+parser.add_argument("--nom_speed_std", type=float, default=0.3)
+parser.add_argument(
+    "--nom_act_noise",
+    action="store_true",
+    default=True,
+    help="Train default on: Gaussian a_nom noise, vy and yaw share one draw.",
+)
+parser.add_argument("--no_nom_act_noise", action="store_true")
+parser.add_argument(
+    "--nom_act_noise_dist",
+    type=str,
+    default="gaussian",
+    choices=["uniform", "gaussian"],
+)
+parser.add_argument("--nom_act_noise_std", type=float, default=0.2)
+parser.add_argument(
+    "--nom_act_noise_stds",
+    type=str,
+    default="0.1,0.2",
+    help="Episode-wise σ list. Each episode picks one. Empty: use --nom_act_noise_std.",
+)
+parser.add_argument("--a_good_hold_steps", type=int, default=0)
 
-args_cli, remaining = parser.parse_known_args()
+
+def _looks_like_xy_token(tok: str) -> bool:
+    s = str(tok).strip()
+    if not s:
+        return False
+    if s.lower() in ("none", "null"):
+        return True
+    parts = s.split(",")
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0])
+        float(parts[1])
+    except ValueError:
+        return False
+    return True
+
+
+def _collapse_scene_argv(argv: list[str]) -> list[str]:
+    """Glue --scene tokens, including leading-minus XY like -0.5,0.
+
+    argparse treats -0.5,0 as an unknown flag. Collapse each --scene's
+    following x,y tokens into one string first.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--scene":
+            out.append("--scene")
+            i += 1
+            chunks: list[str] = []
+            while i < len(argv) and _looks_like_xy_token(argv[i]):
+                chunks.append(argv[i])
+                i += 1
+            if not chunks:
+                raise SystemExit("--scene needs start goal [bin...]")
+            out.append("/".join(chunks))
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
+args_cli, remaining = parser.parse_known_args(_collapse_scene_argv(sys.argv[1:]))
+if getattr(args_cli, "visual_mode", None) != "rtx_rgb":
+    print(
+        "[INFO] test_HJ_humanoid_sac_path_lidar.py forces visual_mode=rtx_rgb "
+        f"(CLI had {getattr(args_cli, 'visual_mode', None)!r}). "
+        "The image is the rollout video; the state is z_lidar."
+    )
+args_cli.visual_mode = "rtx_rgb"
 
 sys.path.insert(0, os.path.join(ISAACLAB_ROOT, "scripts/demos"))
 from visual_obs_utils import configure_app_for_visual, resolve_visual_mode
@@ -226,18 +401,18 @@ import torch
 import yaml
 
 from PyHJ.policy import avoid_SACPolicy_annealing
+from PyHJ.utils.net.common import Net
 from PyHJ.utils.net.continuous import ActorProb
 
 from env.isaac.latent_humanoid_env import LatentHumanoidEnv
 from env.isaac.waypoint_utils import (
     _point_in_rect,
+    sample_perp_points_on_segment,
     sample_point_in_region,
+    sample_start_goal_path,
     sample_start_goal_perp_path,
 )
-from env.isaac.lidar_joint_nets import (
-    make_dual_stream_actor_net,
-    make_dual_stream_critic,
-)
+from env.isaac.late_fusion_critic import make_q_critic
 from env.isaac.switch_traj_plot import _plot_colored_traj
 
 
@@ -279,6 +454,10 @@ def get_args_and_merge_config():
             setattr(args, name, val)
     if bool(getattr(args, "no_include_contact_in_hs", False)):
         args.include_contact_in_hs = False
+    if bool(getattr(args, "no_randomize_nom_speed", False)):
+        args.randomize_nom_speed = False
+    if bool(getattr(args, "no_nom_act_noise", False)):
+        args.nom_act_noise = False
     return args
 
 
@@ -303,7 +482,10 @@ def _visual_to_uint8_hwc(visual) -> np.ndarray:
 
 
 def _video_frame(env: LatentHumanoidEnv, hj_val: float | None, l_val: float | None) -> np.ndarray:
-    hwc = _visual_to_uint8_hwc(env.wrapper.get_raw_obs()["visual"])
+    if getattr(env.wrapper, "visual_mode", "") == "rtx_depth":
+        hwc = _visual_to_uint8_hwc(env.wrapper.get_rgb_depth_side_hwc())
+    else:
+        hwc = _visual_to_uint8_hwc(env.wrapper.get_raw_obs()["visual"])
     return env._overlay_metrics_hwc(hwc, hj_val, l_val)
 
 
@@ -317,7 +499,8 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
     )
 
     def _make_critic():
-        critic = make_dual_stream_critic(
+        critic = make_q_critic(
+            getattr(args, "critic_fusion", "late"),
             state_shape,
             action_shape,
             hidden_sizes=args.critic_net,
@@ -329,7 +512,7 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
 
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
-    actor_net = make_dual_stream_actor_net(
+    actor_net = Net(
         state_shape,
         hidden_sizes=args.control_net,
         activation=getattr(torch.nn, args.actor_activation),
@@ -385,17 +568,26 @@ def resolve_policy_path(ckpt_path: str | Path) -> Path:
     )
 
 
-def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
+def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str, critic_fusion: str = "late") -> None:
     ckpt_path = resolve_policy_path(ckpt_path)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     missing, unexpected = policy.load_state_dict(state, strict=False)
-    critic_missing = [k for k in missing if "critic" in k and "z_mlp" in k]
-    old_concat = any("preprocess" in k for k in unexpected)
-    if critic_missing or old_concat:
+    fusion = str(critic_fusion).lower()
+    late_missing = [k for k in missing if "critic" in k and "z_mlp" in k]
+    concat_as_late = any("preprocess" in k for k in unexpected)
+    late_as_concat = any("z_mlp" in k for k in unexpected) or any(
+        "preprocess" in k and "critic" in k for k in missing
+    )
+    if fusion == "late" and (late_missing or concat_as_late):
         raise RuntimeError(
-            "This checkpoint is the old early-concat critic (cat(z, a) at the "
-            "first Linear). LateFusionCritic cannot load it — retrain with "
-            "train_HJ_humanoid_sac_path.py. "
+            "This checkpoint is concat critic (cat(z, a)), not LateFusionCritic. "
+            "Pass --critic_fusion concat (matching the lidar training run). "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
+    if fusion == "concat" and late_as_concat:
+        raise RuntimeError(
+            "This checkpoint is LateFusionCritic, not concat. "
+            "Drop --critic_fusion concat (default late + patch). "
             f"missing={len(missing)} unexpected={len(unexpected)}"
         )
     if missing:
@@ -407,6 +599,33 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
     policy.critic1.eval()
     policy.critic2.eval()
     print(f"[INFO] Loaded SAC policy from {ckpt_path}")
+
+
+FREEZE_YAW = False
+FREEZE_VY = False
+
+
+def _zero_yaw_act(act: np.ndarray) -> np.ndarray:
+    """Force yaw (dim 2) to 0 when --freeze_yaw is on. No-op otherwise.
+
+    Policy- and env-space yaw share a symmetric range, so 0 maps to 0 in both.
+    """
+    out = np.asarray(act, dtype=np.float32)
+    if not FREEZE_YAW or out.ndim < 1 or out.shape[-1] < 3:
+        return out
+    out = out.copy()
+    out[..., 2] = 0.0
+    return out
+
+
+def _zero_vy_act(act: np.ndarray) -> np.ndarray:
+    """Force vy (dim 1) to 0 when --freeze_vy is on. No-op otherwise."""
+    out = np.asarray(act, dtype=np.float32)
+    if not FREEZE_VY or out.ndim < 1 or out.shape[-1] < 2:
+        return out
+    out = out.copy()
+    out[..., 1] = 0.0
+    return out
 
 
 @torch.no_grad()
@@ -435,6 +654,9 @@ def v_value(policy, z: np.ndarray, device: str) -> float:
         a_t = act_pol
     else:
         a_t = torch.as_tensor(act_pol, dtype=torch.float32, device=device)
+    if FREEZE_VY:
+        a_t = a_t.clone()
+        a_t[..., 1] = 0.0
     if a_t.ndim == 1:
         a_t = a_t.unsqueeze(0)
     q = torch.min(policy.critic1(z_t, a_t), policy.critic2(z_t, a_t))
@@ -455,8 +677,12 @@ def actor_policy_and_env(policy, z: np.ndarray, device: str) -> tuple[np.ndarray
     act_pol = policy(Batch(obs=z_t, info=Batch())).act
     if isinstance(act_pol, torch.Tensor):
         act_pol = act_pol.detach().cpu().numpy()
-    act_pol = np.asarray(act_pol, dtype=np.float32).reshape(-1)
-    act_env = np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3)
+    act_pol = _zero_vy_act(
+        _zero_yaw_act(np.asarray(act_pol, dtype=np.float32).reshape(-1))
+    )
+    act_env = _zero_vy_act(
+        _zero_yaw_act(np.asarray(policy.map_action(act_pol), dtype=np.float32).reshape(3))
+    )
     policy.train(was_training)
     return act_pol, act_env
 
@@ -504,13 +730,19 @@ def _no_bin_run_ids(num_runs: int, every: int, rng: np.random.Generator) -> set[
 
 
 def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
-    env.wrapper.waypoint_layout = "start_goal_perp"
+    global FREEZE_YAW, FREEZE_VY
+    FREEZE_YAW = bool(getattr(args, "freeze_yaw", False))
+    FREEZE_VY = bool(getattr(args, "freeze_vy", False))
+    env._freeze_vy = FREEZE_VY
+    env.waypoint_nav.freeze_vy = FREEZE_VY
+    env._safe_side_nav.freeze_vy = FREEZE_VY
+    env.wrapper.waypoint_layout = str(getattr(args, "waypoint_layout", "start_goal"))
     env.wrapper.path_obstacle_layout = True
     env.wrapper.filter_lidar_to_active_obstacles = True
     env.wrapper.include_middle_pass = False
     env.wrapper.alternate_left_right = False
-    env.wrapper.obstacle_absent_prob = 0.0
-    env.wrapper.two_obstacle_prob = 0.0
+    env.wrapper.obstacle_absent_prob = float(args.obstacle_absent_prob)
+    env.wrapper.two_obstacle_prob = float(args.two_obstacle_prob)
     env.wrapper.y_bound = 0.0
     env.wrapper.use_arena_bounds = True
     env.wrapper.arena_x_min = float(args.arena_x_min)
@@ -518,6 +750,7 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
     env.wrapper.arena_y_min = float(args.arena_y_min)
     env.wrapper.arena_y_max = float(args.arena_y_max)
     env.wrapper.perp_offset = float(args.perp_offset)
+    env.wrapper.perp_keepout = float(getattr(args, "perp_keepout", 0.0))
     env.wrapper.min_start_goal_dist = float(args.min_start_goal_dist)
     env.wrapper.lidar_distance_threshold = float(args.lidar_distance_threshold)
     env.wrapper.lidar_h_half_fov_deg = float(args.lidar_h_half_fov_deg)
@@ -525,20 +758,49 @@ def configure_path_eval(env: LatentHumanoidEnv, args) -> None:
     env.wrapper.contact_hs = float(args.contact_hs)
     env.wrapper.waypoint_stop_thresh = float(args.goal_radius)
     env.waypoint_nav.stop_thresh = float(args.goal_radius)
+    env.randomize_nom_speed = bool(args.randomize_nom_speed) and not bool(
+        getattr(args, "no_randomize_nom_speed", False)
+    )
+    env.nom_speed_min = float(args.nom_speed_min)
+    env.nom_speed_max = float(args.nom_speed_max)
+    env.nom_speed_mean = float(args.nom_speed_mean)
+    env.nom_speed_std = float(args.nom_speed_std)
+    env.nom_act_noise = bool(args.nom_act_noise) and not bool(
+        getattr(args, "no_nom_act_noise", False)
+    )
+    env.nom_act_noise_std = float(args.nom_act_noise_std)
+    env.nom_act_noise_stds = str(getattr(args, "nom_act_noise_stds", "") or "")
+    env.nom_act_noise_dist = str(getattr(args, "nom_act_noise_dist", "gaussian"))
+    env.z_fuse_frames = int(getattr(args, "z_fuse_frames", 5))
+    if not env.randomize_nom_speed:
+        env._episode_nom_speed = 0.5
+        env.waypoint_nav.max_speed = 0.5
+    if not env.nom_act_noise:
+        env._episode_nom_act_noise_std = 0.0
     custom = _custom_waypoints_complete(args)
     if custom:
         layout_tag = "custom"
     elif bool(getattr(args, "easy", False)):
         layout_tag = "easy-line"
     else:
-        layout_tag = "start+trans1+trans2+goal"
+        layout_tag = str(getattr(args, "waypoint_layout", "start_goal"))
+    nom_v = (
+        f"|v|~U[{float(args.nom_speed_min):g},{float(args.nom_speed_max):g}]/ep"
+        if env.randomize_nom_speed
+        else "|v|=0.5"
+    )
+    nom_a = env._nom_act_noise_log()
     print(
-        f"[INFO] path eval: layout={layout_tag} "
+        f"[INFO] train-match eval: layout={layout_tag} "
         f"arena=x[{args.arena_x_min:g},{args.arena_x_max:g}] "
         f"y[{args.arena_y_min:g},{args.arena_y_max:g}] "
-        f"danger_r={float(args.danger_radius):g} "
+        f"danger_r={float(args.lidar_distance_threshold):g} "
         f"goal_r={float(args.goal_radius):g} "
-        f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
+        f"lidar_cone=±{float(args.lidar_h_half_fov_deg):g}° "
+        f"contact_hs={float(args.contact_hs):g} "
+        f"nom {nom_v} act={nom_a} a_sf=eval mean "
+        f"z_fuse={env.z_fuse_frames} freeze_yaw={FREEZE_YAW} "
+        f"freeze_vy={FREEZE_VY}"
     )
 
 
@@ -647,6 +909,39 @@ def _sample_in_danger_disk(
     return last
 
 
+def _parse_bin_list(val) -> list[np.ndarray]:
+    """Parse 0/1/2 bin XYs from CLI.
+
+    Accepts None, 'none', 'x,y', 'x1,y1;x2,y2', or a list of those strings
+    (from ``--bin_xy`` action=append).
+    """
+    if val is None:
+        return []
+    chunks: list[str] = []
+    if isinstance(val, (list, tuple)):
+        for item in val:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                chunks.extend(part.strip() for part in s.split(";") if part.strip())
+    else:
+        s = str(val).strip()
+        if s:
+            chunks.extend(part.strip() for part in s.split(";") if part.strip())
+    out: list[np.ndarray] = []
+    for chunk in chunks:
+        if chunk.lower() in ("", "none", "null"):
+            continue
+        xy = _parse_xy(chunk)
+        if xy is None:
+            continue
+        out.append(xy)
+    if len(out) > 2:
+        raise ValueError(f"at most 2 bins (training max), got {len(out)}")
+    return out
+
+
 def _parse_xy(val) -> np.ndarray | None:
     if val is None:
         return None
@@ -671,6 +966,157 @@ def _xy2(val) -> np.ndarray:
     return xy
 
 
+def _scene_flag_list(args) -> list[list[str]]:
+    raw = getattr(args, "scene", None)
+    if not raw:
+        return []
+    out: list[list[str]] = []
+    for item in raw:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            tokens = [str(t).strip() for t in item if str(t).strip()]
+        else:
+            tokens = [str(item).strip()] if str(item).strip() else []
+        if tokens:
+            out.append(tokens)
+    return out
+
+
+def _parse_scene_tokens(
+    tokens: list[str], *, max_n_obstacles: int = 2
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+    """start goal [bin [bin2] | none]."""
+    parts = [str(t).strip() for t in tokens if str(t).strip()]
+    if len(parts) == 1:
+        parts = [
+            p.strip()
+            for p in parts[0].replace("|", " ").replace("/", " ").replace(";", " ").split()
+            if p.strip()
+        ]
+    if len(parts) < 2:
+        raise ValueError(
+            "--scene needs start goal [bin...], got " + repr(" ".join(parts))
+        )
+    start = _xy2(parts[0])
+    goal = _xy2(parts[1])
+    bins = _parse_bin_list(parts[2:] if len(parts) > 2 else None)
+    if len(bins) > int(max_n_obstacles):
+        raise ValueError(
+            f"--scene has {len(bins)} bins but --max_n_obstacles={max_n_obstacles}"
+        )
+    return start, goal, bins
+
+
+def build_layout_from_start_goal(
+    start,
+    goal,
+    bins: list[np.ndarray] | None = None,
+    *,
+    spawn_yaw: float | None = None,
+    log: bool = True,
+) -> dict:
+    """Freeze start → goal and 0/1/2 bins (train start_goal layout)."""
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    wps = np.stack([start, goal], axis=0)
+    names = ["start", "goal"]
+    heading = goal - start
+    if float(np.linalg.norm(heading)) < 1e-6:
+        heading = np.array([1.0, 0.0], dtype=np.float64)
+    yaw = (
+        float(spawn_yaw)
+        if spawn_yaw is not None
+        else float(np.arctan2(heading[1], heading[0]))
+    )
+    bins = list(bins or [])
+    obstacle_xys = [(float(b[0]), float(b[1])) for b in bins]
+    if log:
+        bin_txt = obstacle_xys if obstacle_xys else "none"
+        print(
+            f"[INFO] start_goal scene: start={start.tolist()} "
+            f"goal={goal.tolist()} bins={bin_txt} spawn_yaw={yaw:.3f}"
+        )
+    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
+    return {
+        "waypoints": wps,
+        "waypoint_region_names": names,
+        "spawn_yaw": yaw,
+        "obstacle_xys": obstacle_xys,
+        "n_obstacles": int(len(obstacle_xys)),
+        "obstacle_present": bool(obstacle_xys),
+        "blue_bin_xy": blue,
+        "robot_xy": np.asarray(start, dtype=np.float64).copy(),
+    }
+
+
+def build_layout_from_waypoints(
+    start,
+    trans1,
+    trans2,
+    goal,
+    bins: list[np.ndarray] | None = None,
+    *,
+    spawn_yaw: float | None = None,
+    log: bool = True,
+) -> dict:
+    """Freeze start, via1, via2, goal, and 0/1/2 bins."""
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    trans1 = np.asarray(trans1, dtype=np.float64).reshape(2)
+    trans2 = np.asarray(trans2, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    wps = np.stack([start, trans1, trans2, goal], axis=0)
+    names = ["start", "trans1", "trans2", "goal"]
+    heading = trans1 - start
+    if float(np.linalg.norm(heading)) < 1e-6:
+        heading = np.array([1.0, 0.0], dtype=np.float64)
+    yaw = (
+        float(spawn_yaw)
+        if spawn_yaw is not None
+        else float(np.arctan2(heading[1], heading[0]))
+    )
+    bins = list(bins or [])
+    obstacle_xys = [(float(b[0]), float(b[1])) for b in bins]
+    if log:
+        if obstacle_xys:
+            dists = [
+                float(np.linalg.norm(np.asarray(xy) - trans2)) for xy in obstacle_xys
+            ]
+            print(
+                f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
+                f"via2={trans2.tolist()} goal={goal.tolist()} "
+                f"bins={obstacle_xys} via2–bin={dists} "
+                f"spawn_yaw={yaw:.3f}"
+            )
+        else:
+            print(
+                f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
+                f"via2={trans2.tolist()} goal={goal.tolist()} bin=none "
+                f"spawn_yaw={yaw:.3f}"
+            )
+    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
+    return {
+        "waypoints": wps,
+        "waypoint_region_names": names,
+        "spawn_yaw": yaw,
+        "obstacle_xys": obstacle_xys,
+        "n_obstacles": int(len(obstacle_xys)),
+        "obstacle_present": bool(obstacle_xys),
+        "blue_bin_xy": blue,
+        "robot_xy": np.asarray(start, dtype=np.float64).copy(),
+    }
+
+
+def _copy_layout(layout: dict) -> dict:
+    return {
+        **layout,
+        "waypoints": np.asarray(layout["waypoints"], dtype=np.float64).copy(),
+        "robot_xy": np.asarray(layout["robot_xy"], dtype=np.float64).copy(),
+        "obstacle_xys": list(layout["obstacle_xys"]),
+        "waypoint_region_names": list(layout["waypoint_region_names"]),
+    }
+
+
 def _custom_waypoint_flags(args) -> dict[str, bool]:
     return {
         "start_xy": _parse_xy(getattr(args, "start_xy", None)) is not None,
@@ -689,9 +1135,19 @@ def _validate_custom_layout_args(args) -> None:
     flags = _custom_waypoint_flags(args)
     any_wp = any(flags.values())
     all_wp = all(flags.values())
-    bin_set = _parse_xy(getattr(args, "bin_xy", None)) is not None
+    scenes = _scene_flag_list(args)
+    bins = _parse_bin_list(getattr(args, "bin_xy", None))
+    bin_set = bool(bins) or (
+        getattr(args, "bin_xy", None) is not None
+        and str(args.bin_xy).strip() != ""
+    )
     spawn_set = getattr(args, "spawn_yaw", None) is not None
     easy = bool(getattr(args, "easy", False))
+    if scenes and (easy or any_wp or bin_set):
+        raise ValueError(
+            "--scene is mutually exclusive with --easy / --start_xy / "
+            "--via1_xy / --via2_xy / --goal_xy / --bin_xy"
+        )
     if easy and (any_wp or bin_set or spawn_set):
         raise ValueError(
             "--easy is mutually exclusive with --start_xy/--via1_xy/--via2_xy/"
@@ -703,57 +1159,55 @@ def _validate_custom_layout_args(args) -> None:
             "custom layout requires all four waypoints; missing "
             + ", ".join(f"--{k}" for k in missing)
         )
-    if (bin_set or spawn_set) and not all_wp:
+    if (bin_set or spawn_set) and not all_wp and not scenes:
         raise ValueError(
             "--bin_xy / --spawn_yaw require a full custom layout "
-            "(--start_xy --via1_xy --via2_xy --goal_xy)"
+            "(--start_xy --via1_xy --via2_xy --goal_xy) or --scene"
+        )
+    if scenes:
+        max_n = int(getattr(args, "max_n_obstacles", 2))
+        for tokens in scenes:
+            _parse_scene_tokens(tokens, max_n_obstacles=max_n)
+        return
+    if len(bins) > int(getattr(args, "max_n_obstacles", 2)):
+        raise ValueError(
+            f"got {len(bins)} bins but --max_n_obstacles="
+            f"{int(getattr(args, 'max_n_obstacles', 2))}"
         )
 
 
 def build_custom_path_eval_layout(args) -> dict:
-    """Freeze start, via1, via2, goal, and optional bin from CLI XY flags."""
-    start = _xy2(args.start_xy)
-    trans1 = _xy2(args.via1_xy)
-    trans2 = _xy2(args.via2_xy)
-    goal = _xy2(args.goal_xy)
-    wps = np.stack([start, trans1, trans2, goal], axis=0)
-    names = ["start", "trans1", "trans2", "goal"]
-    heading = trans1 - start
-    if float(np.linalg.norm(heading)) < 1e-6:
-        heading = np.array([1.0, 0.0], dtype=np.float64)
-    spawn_yaw = (
-        float(args.spawn_yaw)
-        if getattr(args, "spawn_yaw", None) is not None
-        else float(np.arctan2(heading[1], heading[0]))
+    """Freeze start, via1, via2, goal, and 0/1/2 bins from CLI XY flags."""
+    bins = _parse_bin_list(getattr(args, "bin_xy", None))
+    return build_layout_from_waypoints(
+        _xy2(args.start_xy),
+        _xy2(args.via1_xy),
+        _xy2(args.via2_xy),
+        _xy2(args.goal_xy),
+        bins,
+        spawn_yaw=getattr(args, "spawn_yaw", None),
+        log=True,
     )
-    obstacle_xys: list[tuple[float, float]] = []
-    if _parse_xy(getattr(args, "bin_xy", None)) is not None:
-        bin_xy = _xy2(args.bin_xy)
-        obstacle_xys.append((float(bin_xy[0]), float(bin_xy[1])))
-        dist = float(np.linalg.norm(bin_xy - trans2))
-        print(
-            f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
-            f"via2={trans2.tolist()} goal={goal.tolist()} "
-            f"bin={bin_xy.tolist()} via2–bin={dist:.2f}m "
-            f"spawn_yaw={spawn_yaw:.3f}"
+
+
+def build_scene_eval_layouts(args) -> list[dict]:
+    """One frozen layout per --scene (queued in CLI order)."""
+    yaw = getattr(args, "spawn_yaw", None)
+    max_n = int(getattr(args, "max_n_obstacles", 2))
+    layouts: list[dict] = []
+    for i, tokens in enumerate(_scene_flag_list(args)):
+        start, goal, bins = _parse_scene_tokens(tokens, max_n_obstacles=max_n)
+        print(f"[INFO] scene {i:02d}")
+        layouts.append(
+            build_layout_from_start_goal(
+                start,
+                goal,
+                bins,
+                spawn_yaw=yaw,
+                log=True,
+            )
         )
-    else:
-        print(
-            f"[INFO] custom layout: start={start.tolist()} via1={trans1.tolist()} "
-            f"via2={trans2.tolist()} goal={goal.tolist()} bin=none "
-            f"spawn_yaw={spawn_yaw:.3f}"
-        )
-    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
-    return {
-        "waypoints": wps,
-        "waypoint_region_names": names,
-        "spawn_yaw": spawn_yaw,
-        "obstacle_xys": obstacle_xys,
-        "n_obstacles": int(len(obstacle_xys)),
-        "obstacle_present": bool(obstacle_xys),
-        "blue_bin_xy": blue,
-        "robot_xy": np.asarray(start, dtype=np.float64).copy(),
-    }
+    return layouts
 
 
 def sample_easy_path_eval_layout(rng: np.random.Generator, args) -> dict:
@@ -810,50 +1264,70 @@ def sample_path_eval_layout(
     rng: np.random.Generator,
     args,
     *,
-    with_bin: bool,
+    with_bin: bool | None = None,
+    n_bins: int | None = None,
 ) -> dict:
-    """start + 2 perp vias + goal; optional one bin covering trans2."""
-    wps, names, spawn_yaw = sample_start_goal_perp_path(
-        rng,
-        x_min=float(args.arena_x_min),
-        x_max=float(args.arena_x_max),
-        y_min=float(args.arena_y_min),
-        y_max=float(args.arena_y_max),
-        perp_offset=float(args.perp_offset),
-        min_start_goal_dist=float(args.min_start_goal_dist),
-        margin=0.5,
-    )
-    if wps.shape[0] <= THIRD_WAYPOINT_IDX:
-        raise RuntimeError(f"expected 4 waypoints, got {wps.shape}")
-    obstacle_xys: list[np.ndarray] = []
-    if with_bin:
-        bin_xy = _place_bin_covering_waypoint(
+    """Same sampler as train collect: start→goal (or perp vias) + band bins."""
+    layout = str(getattr(args, "waypoint_layout", "start_goal"))
+    if layout == "start_goal_perp":
+        wps, names, spawn_yaw = sample_start_goal_perp_path(
             rng,
-            wps[THIRD_WAYPOINT_IDX],
-            danger_radius=float(args.danger_radius),
             x_min=float(args.arena_x_min),
             x_max=float(args.arena_x_max),
             y_min=float(args.arena_y_min),
             y_max=float(args.arena_y_max),
-            start=wps[0],
-            goal=wps[-1],
+            perp_offset=float(args.perp_offset),
+            min_start_goal_dist=float(args.min_start_goal_dist),
+            margin=0.5,
         )
-        obstacle_xys.append(bin_xy)
-        dist = float(np.linalg.norm(bin_xy - wps[THIRD_WAYPOINT_IDX]))
+    else:
+        wps, names, spawn_yaw = sample_start_goal_path(
+            rng,
+            x_min=float(args.arena_x_min),
+            x_max=float(args.arena_x_max),
+            y_min=float(args.arena_y_min),
+            y_max=float(args.arena_y_max),
+            min_start_goal_dist=float(args.min_start_goal_dist),
+            margin=0.5,
+        )
+    if n_bins is None:
+        if with_bin is False:
+            n_bins = 0
+        elif with_bin is True:
+            n_bins = 1
+        else:
+            absent_p = float(args.obstacle_absent_prob)
+            if absent_p > 0.0 and float(rng.random()) < absent_p:
+                n_bins = 0
+            elif float(rng.random()) < float(args.two_obstacle_prob):
+                n_bins = min(2, int(args.max_n_obstacles))
+            else:
+                n_bins = 1
+    n_bins = max(0, min(int(n_bins), int(args.max_n_obstacles), 2))
+    obstacle_xys: list[tuple[float, float]] = []
+    if n_bins > 0:
+        pts = sample_perp_points_on_segment(
+            rng,
+            wps[0],
+            wps[-1],
+            n_bins,
+            perp_offset=float(args.perp_offset),
+            x_min=float(args.arena_x_min),
+            x_max=float(args.arena_x_max),
+            y_min=float(args.arena_y_min),
+            y_max=float(args.arena_y_max),
+        )
+        obstacle_xys = [(float(p[0]), float(p[1])) for p in pts]
         print(
-            f"[INFO] bin covers {names[THIRD_WAYPOINT_IDX]} "
-            f"dist={dist:.2f}m (danger_r={float(args.danger_radius):g})"
+            f"[INFO] train-like bins n={n_bins} xy={obstacle_xys} "
+            f"(perp band ±{float(args.perp_offset):g} m)"
         )
-    blue = (
-        (float(obstacle_xys[0][0]), float(obstacle_xys[0][1]))
-        if obstacle_xys
-        else (0.0, 0.0)
-    )
+    blue = obstacle_xys[0] if obstacle_xys else (0.0, 0.0)
     return {
         "waypoints": np.asarray(wps, dtype=np.float64).copy(),
         "waypoint_region_names": list(names),
         "spawn_yaw": float(spawn_yaw),
-        "obstacle_xys": [(float(p[0]), float(p[1])) for p in obstacle_xys],
+        "obstacle_xys": obstacle_xys,
         "n_obstacles": int(len(obstacle_xys)),
         "obstacle_present": bool(obstacle_xys),
         "blue_bin_xy": blue,
@@ -1017,8 +1491,10 @@ def _save_compare_traj(
             )
         )
 
-    ends = ", ".join(f"{MODE_LABELS[m]}={mode_ends.get(m, '?')}" for m in COMPARE_MODES)
-    bin_tag = "1 bin" if obstacle_present else "no bin"
+    plotted = [m for m in COMPARE_MODES if m in mode_trajs]
+    ends = ", ".join(f"{MODE_LABELS[m]}={mode_ends.get(m, '?')}" for m in plotted)
+    n_bin = int(len(obs_xy)) if obstacle_present else 0
+    bin_tag = f"{n_bin} bin" if n_bin == 1 else f"{n_bin} bins"
     ax.set_title(f"run{run_id:02d} | {bin_tag} | {ends}", fontsize=9)
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
@@ -1029,6 +1505,122 @@ def _save_compare_traj(
     fig.savefig(out_path)
     plt.close(fig)
     print(f"[INFO] Saved compare traj: {out_path}")
+
+
+def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
+    """Per-session rates, then the mean of those session values."""
+    labels = {
+        "waypoint_only": "nominal",
+        "switching": "switching",
+        "safe_only": "sf_only",
+    }
+    lines = [
+        "METRICS",
+        "  success_rate: reached goal without 360° bin-center distance < success_fail_radius",
+        "  collision_rate: contact steps / session steps (h_s <= contact_hs), then mean over sessions",
+        "  avg_velocity_mps: mean XY speed inside a session, then mean over all sessions",
+        "  sf_step_ratio: SF steps / session steps, then mean over sessions",
+        "  min_clearance_m: closest bin-center distance in a session, then averaged",
+        "",
+    ]
+
+    def _fmt(x: float, nd: int = 3) -> str:
+        return "n/a" if not np.isfinite(x) else f"{x:.{nd}f}"
+
+    def _mean_finite(xs: list[float]) -> tuple[float, int]:
+        vals = [float(x) for x in xs if np.isfinite(x)]
+        if not vals:
+            return float("nan"), 0
+        return float(np.mean(vals)), len(vals)
+
+    for mode in modes:
+        rs = [r for r in results if r["mode"] == mode]
+        n = len(rs)
+        name = labels.get(mode, mode)
+        if n == 0:
+            lines.append(f"[{name}] no sessions")
+            lines.append("")
+            continue
+        n_ok = sum(1 for r in rs if r["success"])
+        success_rate = n_ok / n
+        collision_rate, n_col = _mean_finite([r["collision_rate"] for r in rs])
+        velocity, n_vel = _mean_finite([r["mean_speed_mps"] for r in rs])
+        sf_ratio, n_sf = _mean_finite([r["sf_step_ratio"] for r in rs])
+        clearance, n_clr = _mean_finite([r["min_clearance_m"] for r in rs])
+
+        lines.extend(
+            [
+                f"[{name}] n={n}",
+                f"  success_rate={success_rate:.3f} ({n_ok}/{n})",
+                f"  collision_rate={_fmt(collision_rate)} (n={n_col})",
+                f"  avg_velocity_mps={_fmt(velocity)} (n={n_vel})",
+                f"  sf_step_ratio={_fmt(sf_ratio)} (n={n_sf})",
+                f"  min_clearance_m={_fmt(clearance)} (n_with_obstacle={n_clr})",
+            ]
+        )
+        for r in rs:
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            lines.append(
+                f"  {tag}: success={int(bool(r['success']))} "
+                f"collision_rate={_fmt(float(r['collision_rate']))} "
+                f"({r['n_contact_steps']}/{r['n_steps']}) "
+                f"speed={_fmt(float(r['mean_speed_mps']))} "
+                f"sf_step_ratio={_fmt(float(r['sf_step_ratio']))} "
+                f"({r['n_sf_steps']}/{r['n_steps']}) "
+                f"min_clearance={_fmt(float(r['min_clearance_m']))} "
+                f"min_failset={_fmt(float(r['min_failset_m']))}"
+            )
+        lines.append("")
+    return lines
+
+
+def _write_session_metrics(path: Path, results: list[dict]) -> None:
+    """One row per session. Aggregates stay in the summary text."""
+    fields = [
+        "mode",
+        "tag",
+        "run_id",
+        "success",
+        "end_reason",
+        "n_steps",
+        "n_contact_steps",
+        "collision_rate",
+        "mean_speed_mps",
+        "n_sf_steps",
+        "n_nom_steps",
+        "sf_step_ratio",
+        "min_clearance_m",
+        "min_failset_m",
+    ]
+
+    def _cell(x) -> str:
+        if isinstance(x, float) and not np.isfinite(x):
+            return ""
+        return str(x)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in results:
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            writer.writerow(
+                {
+                    "mode": r["mode"],
+                    "tag": tag,
+                    "run_id": int(r["run_id"]),
+                    "success": int(bool(r["success"])),
+                    "end_reason": r["end_reason"],
+                    "n_steps": int(r["n_steps"]),
+                    "n_contact_steps": int(r["n_contact_steps"]),
+                    "collision_rate": _cell(float(r["collision_rate"])),
+                    "mean_speed_mps": _cell(float(r["mean_speed_mps"])),
+                    "n_sf_steps": int(r["n_sf_steps"]),
+                    "n_nom_steps": int(r["n_nom_steps"]),
+                    "sf_step_ratio": _cell(float(r["sf_step_ratio"])),
+                    "min_clearance_m": _cell(float(r["min_clearance_m"])),
+                    "min_failset_m": _cell(float(r["min_failset_m"])),
+                }
+            )
 
 
 def simulate_one(
@@ -1045,6 +1637,8 @@ def simulate_one(
     fixed_layout: dict,
     seed: int | None = None,
     look_ahead: bool = False,
+    file_tag: str | None = None,
+    success_fail_radius: float = 0.5,
 ) -> dict:
     z, info = env.reset(seed=seed, options={"fixed_layout": fixed_layout})
     layout = fixed_layout
@@ -1063,6 +1657,13 @@ def simulate_one(
     last_controller = None
     end_reason = None
     use_sf_hist: list[bool] = []
+    contact_hist: list[bool] = []
+    clearance_hist: list[float] = []
+    failset_hist: list[float] = []
+    d0 = float(env.wrapper.min_obstacle_xy_dist_live())
+    if np.isfinite(d0):
+        failset_hist.append(d0)
+    contact_hs = float(getattr(env.wrapper, "contact_hs", -2.5))
     probe_rng = np.random.default_rng(0)
     q_nom_hist: list[float] = []
     q_sf_hist: list[float] = []
@@ -1130,6 +1731,14 @@ def simulate_one(
         h_s_last = float(h_s)
         if h_s < 0:
             constraint_violations += 1
+        # Contact folds h_s down to contact_hs (-2.5). Lidar alone stays above that.
+        contact_hist.append(h_s_last <= contact_hs + 1e-3)
+        d_fail = float(getattr(env, "_step_min_failset_m", float("nan")))
+        if np.isfinite(d_fail):
+            failset_hist.append(d_fail)
+        d_obs = float(env.wrapper.min_obstacle_xy_dist())
+        if np.isfinite(d_obs):
+            clearance_hist.append(d_obs)
 
         if save_video:
             hj_exec = env._hj_value(
@@ -1150,24 +1759,50 @@ def simulate_one(
     else:
         end_reason = "max_visual_steps"
 
+    tag = file_tag or f"run{run_id:02d}"
     video_path = None
     if save_video and frames:
         try:
             import imageio.v2 as imageio
 
-            video_path = str(out_dir / f"{mode}_run{run_id:02d}.mp4")
+            video_path = str(out_dir / f"{mode}_{tag}.mp4")
             imageio.mimsave(video_path, frames, fps=int(round(env.visual_fps)))
             print(f"[INFO] Saved video: {video_path} ({len(frames)} frames)")
         except Exception as exc:  # noqa: BLE001
             print(f"[WARN] video save failed: {exc}")
 
-    success = end_reason == "all_waypoints"
     def _mean(xs: list[float]) -> float | None:
         return float(np.mean(xs)) if xs else None
+
+    dt = float(getattr(env, "visual_period_s", 1.0 / 15.0))
+    speeds: list[float] = []
+    traj_np = np.asarray(traj, dtype=np.float64)
+    if dt > 0.0 and traj_np.shape[0] >= 2:
+        step_xy = np.linalg.norm(np.diff(traj_np, axis=0), axis=1)
+        speeds = (step_xy / dt).astype(np.float64).tolist()
+    mean_speed = float(np.mean(speeds)) if speeds else float("nan")
+    # Per session: closest approach to a bin center. No bin → NaN (left out of the mean).
+    min_clearance = float(np.min(clearance_hist)) if clearance_hist else float("nan")
+    n_steps = int(len(contact_hist))
+    n_contact_steps = int(sum(contact_hist))
+    n_sf_steps = int(sum(use_sf_hist))
+    n_nom_steps = n_steps - n_sf_steps
+    collision_rate = (
+        float(n_contact_steps) / float(n_steps) if n_steps else float("nan")
+    )
+    min_failset = float(np.min(failset_hist)) if failset_hist else float("nan")
+    entered_fail_margin = bool(
+        np.isfinite(min_failset) and min_failset < float(success_fail_radius)
+    )
+    success = end_reason == "all_waypoints" and not entered_fail_margin
+    sf_step_ratio = (
+        float(n_sf_steps) / float(n_steps) if n_steps else float("nan")
+    )
 
     result = {
         "mode": mode,
         "run_id": run_id,
+        "file_tag": tag,
         "end_reason": end_reason,
         "success": success,
         "visual_steps": int(info.get("episode_step", step + 1)),
@@ -1178,8 +1813,17 @@ def simulate_one(
         "final_h_s": h_s_last,
         "stuck": float(info.get("stuck", 0.0)),
         "video": video_path,
-        "traj": np.asarray(traj, dtype=np.float64),
+        "traj": traj_np,
         "use_sf": np.asarray(use_sf_hist, dtype=bool),
+        "n_steps": n_steps,
+        "n_contact_steps": n_contact_steps,
+        "collision_rate": collision_rate,
+        "n_sf_steps": n_sf_steps,
+        "n_nom_steps": n_nom_steps,
+        "sf_step_ratio": sf_step_ratio,
+        "mean_speed_mps": mean_speed,
+        "min_clearance_m": min_clearance,
+        "min_failset_m": min_failset,
         "layout": layout,
         "q_probe_mean_nom": _mean(q_nom_hist),
         "q_probe_mean_sf": _mean(q_sf_hist),
@@ -1189,6 +1833,9 @@ def simulate_one(
     print(
         f"[RUN {run_id}] mode={mode} end={end_reason} success={success} "
         f"steps={result['visual_steps']} interventions={hj_interventions} "
+        f"collision_rate={collision_rate:.3f} "
+        f"sf_step_ratio="
+        f"{'n/a' if not np.isfinite(sf_step_ratio) else f'{sf_step_ratio:.3f}'} "
         f"violations={constraint_violations} minQ={result['min_q_nom']}"
     )
     if q_nom_hist:
@@ -1207,14 +1854,26 @@ def simulate_one(
 
 def main():
     args = get_args_and_merge_config()
-    args.critic_net = list(args_cli.critic_net)
-    args.control_net = list(args_cli.control_net)
     _validate_custom_layout_args(args)
     args.policy_path = str(resolve_policy_path(args.policy_path))
     args.device = torch_device
-    args.obs_mode = str(getattr(args, "obs_mode", "lidar_joint"))
-    args.hs_mode = str(getattr(args, "hs_mode", "geom"))
+    args.dino_ckpt_dir = os.path.join(args.dino_ckpt_dir, args.dino_encoder)
+    args.obs_mode = str(getattr(args, "obs_mode", "lidar_utonia")).lower()
+    args.lidar_pattern = str(getattr(args, "lidar_pattern", "mid360")).lower()
+    args.visual_mode = "rtx_rgb"
+    args.critic_fusion = str(getattr(args, "critic_fusion", "concat")).lower()
+    args_cli.obs_mode = args.obs_mode
+    args_cli.lidar_pattern = args.lidar_pattern
+    args_cli.visual_mode = "rtx_rgb"
+    args_cli.max_n_obstacles = int(args.max_n_obstacles)
     save_video = bool(args.save_video) and not bool(args.no_save_video)
+
+    look_ahead = bool(getattr(args, "look_ahead", False))
+    if look_ahead:
+        raise ValueError(
+            "--look_ahead needs a world-model z predictor. "
+            "The lidar line has none; the gate uses Q(z_t, a_nom)."
+        )
 
     np.random.seed(int(getattr(args, "seed", 0)))
     torch.manual_seed(int(getattr(args, "seed", 0)))
@@ -1222,74 +1881,123 @@ def main():
         torch.cuda.manual_seed_all(int(getattr(args, "seed", 0)))
 
     stamp = datetime.now().strftime("%m%d_%H%M%S")
-    out_dir = (
-        Path(args.out_dir) if args.out_dir else Path("humanoid_test_sac_lidar") / stamp
-    )
+    default_root = Path("humanoid_test_sac_path_lidar")
+    out_dir = Path(args.out_dir) if args.out_dir else default_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
-    modes = list(COMPARE_MODES) if args.mode == "compare" else [args.mode]
-    look_ahead = bool(getattr(args, "look_ahead", False))
-    if look_ahead:
-        raise ValueError("look_ahead needs the DINO WM; not supported in lidar+joints test.")
+    if args.mode == "compare":
+        modes = list(COMPARE_MODES)
+    elif args.mode == "switch_nominal":
+        modes = ["waypoint_only", "switching"]
+    else:
+        modes = [args.mode]
     print(f"[INFO] out_dir={out_dir}")
     print(f"[INFO] modes={modes} policy={args.policy_path}")
     print(
-        f"[INFO] obs_mode={args.obs_mode} hs_mode={args.hs_mode} "
-        f"critic_net={args.critic_net}"
+        f"[INFO] obs_mode={args.obs_mode} lidar_pattern={args.lidar_pattern} "
+        f"visual_mode={args.visual_mode} "
+        f"critic_fusion={args.critic_fusion} "
+        f"z_fuse_frames={int(getattr(args, 'z_fuse_frames', 5))} "
+        f"freeze_yaw={bool(getattr(args, 'freeze_yaw', False))} "
+        f"freeze_vy={bool(getattr(args, 'freeze_vy', False))}"
     )
     print(
         "[INFO] look_ahead="
         f"{look_ahead} (gate={'V(z_t+1)' if look_ahead else 'Q(z_t, a_nom)'})"
     )
+    print(
+        "[INFO] eval a_nom matches train: "
+        f"|v|={'U[' + str(args.nom_speed_min) + ',' + str(args.nom_speed_max) + ']/ep' if bool(args.randomize_nom_speed) else '0.5'} "
+        f"act_noise={getattr(args, 'nom_act_noise_dist', 'gaussian')} "
+        f"σs={getattr(args, 'nom_act_noise_stds', '') or args.nom_act_noise_std} "
+        f"(vy=yaw shared); a_sf=eval mean; "
+        f"max_n_obstacles={int(args.max_n_obstacles)}"
+    )
+
+    ckpt_dir = Path(args.dino_ckpt_dir)
+    snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
+    if not snapshot.is_file():
+        raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
+    utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
+    if not os.path.isfile(utonia_ckpt):
+        raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
+    args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+    print(f"[INFO] Utonia: {args.utonia_ckpt}")
+    print(f"[INFO] proprio encoder from {snapshot}")
+    proprio_encoder = None
+    if bool(args.with_proprio):
+        payload = torch.load(snapshot, map_location=args.device, weights_only=False)
+        proprio_encoder = payload["proprio_encoder"].to(args.device).eval()
+        for p in proprio_encoder.parameters():
+            p.requires_grad = False
+        print(
+            f"[INFO] proprio encoder in_chans={proprio_encoder.in_chans} "
+            f"emb_dim={proprio_encoder.emb_dim}"
+        )
+        print(
+            "[INFO] actor input = [z_lidar 576, z_proprio "
+            f"{int(proprio_encoder.emb_dim)}]; "
+            "critic concat appends (vx, vy, yaw_rate)"
+        )
 
     env = LatentHumanoidEnv(
         args,
         None,
         args.device,
         args_cli,
-        with_proprio=False,
+        with_proprio=bool(args.with_proprio),
+        proprio_encoder=proprio_encoder,
         latent_h=False,
         wandb_video_every=0,
     )
     configure_path_eval(env, args)
     policy = build_policy(env, args, args.device)
-    load_policy_checkpoint(policy, args.policy_path, args.device)
+    load_policy_checkpoint(
+        policy, args.policy_path, args.device, critic_fusion=args.critic_fusion
+    )
     env.policy_for_log = policy
     env.log_rollout_to_wandb = False
 
     results = []
     base_seed = int(getattr(args, "seed", 0))
     layout_rng = np.random.default_rng(base_seed + 91)
-    no_bin_every = int(getattr(args, "no_bin_every", 2))
     easy = bool(getattr(args, "easy", False))
+    scene_layouts = build_scene_eval_layouts(args) if _scene_flag_list(args) else []
     custom = _custom_waypoints_complete(args)
     custom_layout = build_custom_path_eval_layout(args) if custom else None
-    if custom:
-        no_bin_ids = set() if custom_layout["obstacle_present"] else set(range(int(args.num_runs)))
+    if scene_layouts:
+        n_trials = len(scene_layouts)
+        if int(args.num_runs) != 1:
+            print(
+                f"[INFO] --scene: {n_trials} queued layouts; "
+                f"ignoring --num_runs={int(args.num_runs)}"
+            )
+        print(
+            f"[INFO] {n_trials} scene(s) from --scene; one compare trial each"
+        )
+    elif custom:
+        n_trials = int(args.num_runs)
         print(
             "[INFO] custom layout frozen for all trials "
-            f"(bin={'present' if custom_layout['obstacle_present'] else 'absent'}); "
+            f"(n_bins={int(custom_layout['n_obstacles'])}); "
             "ignores --easy and --no_bin_every"
         )
     elif easy:
-        no_bin_ids = set()
+        n_trials = int(args.num_runs)
         print(
             "[INFO] --easy: straight line start(0,-2)r=1 → wp2(2,-2)r=1.5 → "
             "wp3 within 1 m of bin; bin fixed (4.5,-2); goal(5.5,-2)r=1. Always one bin."
         )
     else:
-        no_bin_ids = _no_bin_run_ids(
-            int(args.num_runs),
-            no_bin_every,
-            np.random.default_rng(base_seed + 17),
+        n_trials = int(args.num_runs)
+        print(
+            "[INFO] sample like train: "
+            f"layout={args.waypoint_layout} "
+            f"perp_band=±{float(args.perp_offset):g} "
+            f"min_|G-S|={float(args.min_start_goal_dist):g} "
+            f"(absent_p={float(args.obstacle_absent_prob):g}, "
+            f"P(2|present)={float(args.two_obstacle_prob):g}, "
+            f"max_n={int(args.max_n_obstacles)})"
         )
-        if no_bin_ids:
-            pretty = ", ".join(str(i + 1) for i in sorted(no_bin_ids))
-            print(
-                f"[INFO] no bin on trial(s) {pretty} "
-                f"(1 per {no_bin_every} trials; else exactly one bin covering wp3)"
-            )
-        else:
-            print("[INFO] exactly one bin on every trial (covering wp3 / trans2)")
 
     arena = (
         float(args.arena_x_min),
@@ -1298,32 +2006,37 @@ def main():
         float(args.arena_y_max),
     )
 
-    for run_id in range(int(args.num_runs)):
-        if custom:
-            layout = {
-                **custom_layout,
-                "waypoints": np.asarray(custom_layout["waypoints"], dtype=np.float64).copy(),
-                "robot_xy": np.asarray(custom_layout["robot_xy"], dtype=np.float64).copy(),
-                "obstacle_xys": list(custom_layout["obstacle_xys"]),
-                "waypoint_region_names": list(custom_layout["waypoint_region_names"]),
-            }
+    for run_id in range(n_trials):
+        if scene_layouts:
+            layout = _copy_layout(scene_layouts[run_id])
             with_bin = bool(layout["obstacle_present"])
+            file_tag = f"scene{run_id:02d}"
+        elif custom:
+            layout = _copy_layout(custom_layout)
+            with_bin = bool(layout["obstacle_present"])
+            file_tag = f"run{run_id:02d}"
         else:
-            with_bin = True if easy else (run_id not in no_bin_ids)
             if easy:
                 layout = sample_easy_path_eval_layout(layout_rng, args)
             else:
-                layout = sample_path_eval_layout(layout_rng, args, with_bin=with_bin)
+                layout = sample_path_eval_layout(layout_rng, args)
+            with_bin = bool(layout["obstacle_present"])
+            file_tag = f"run{run_id:02d}"
         trial_seed = base_seed + run_id
         print(
-            f"\n=== Trial {run_id + 1}/{args.num_runs} modes={modes} "
+            f"\n=== Trial {run_id + 1}/{n_trials} tag={file_tag} modes={modes} "
             f"bin={'present' if with_bin else 'absent'} "
-            f"waypoints={layout['waypoints'].tolist()} ==="
+            f"waypoints={layout['waypoints'].tolist()} "
+            f"bins={layout['obstacle_xys']} ==="
         )
         mode_trajs: dict[str, np.ndarray] = {}
         mode_ends: dict[str, str] = {}
         mode_use_sf: dict[str, np.ndarray] = {}
         for mode in modes:
+            np.random.seed(trial_seed)
+            torch.manual_seed(trial_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(trial_seed)
             r = simulate_one(
                 env,
                 policy,
@@ -1337,24 +2050,30 @@ def main():
                 fixed_layout=layout,
                 seed=trial_seed,
                 look_ahead=look_ahead,
+                file_tag=file_tag,
+                success_fail_radius=float(args.success_fail_radius),
             )
             results.append(r)
             mode_trajs[mode] = r["traj"]
             mode_ends[mode] = r["end_reason"]
             mode_use_sf[mode] = r["use_sf"]
 
-        if args.mode == "compare" and len(modes) > 1:
-            _save_compare_traj(
-                out_path=out_dir / f"run{run_id:02d}_compare_traj.png",
-                mode_trajs=mode_trajs,
-                mode_ends=mode_ends,
-                layout=layout,
-                danger_radius=float(args.danger_radius),
-                goal_radius=float(args.goal_radius),
-                arena=arena,
-                run_id=run_id,
-                mode_use_sf=mode_use_sf,
-            )
+        plot_name = (
+            f"{file_tag}_compare_traj.png"
+            if len(modes) > 1
+            else f"{file_tag}_{modes[0]}_traj.png"
+        )
+        _save_compare_traj(
+            out_path=out_dir / plot_name,
+            mode_trajs=mode_trajs,
+            mode_ends=mode_ends,
+            layout=layout,
+            danger_radius=float(args.lidar_distance_threshold),
+            goal_radius=float(args.goal_radius),
+            arena=arena,
+            run_id=run_id,
+            mode_use_sf=mode_use_sf,
+        )
 
     lines = [
         f"policy={args.policy_path}",
@@ -1365,16 +2084,29 @@ def main():
         f"modes={modes}",
         f"easy={easy}",
         f"custom={custom}",
-        f"danger_radius={float(args.danger_radius)}",
+        f"n_scenes={len(scene_layouts)}",
+        f"danger_radius={float(args.lidar_distance_threshold)}",
         f"goal_radius={float(args.goal_radius)}",
-        f"trials={int(args.num_runs)}",
-        f"no_bin_every={no_bin_every} no_bin_trials="
-        f"{sorted(i + 1 for i in no_bin_ids)}",
+        f"trials={n_trials}",
+        f"nom_speed={bool(args.randomize_nom_speed)} "
+        f"nom_act_noise={bool(args.nom_act_noise)}",
     ]
-    if custom and custom_layout is not None:
+    if scene_layouts:
+        for i, lay in enumerate(scene_layouts):
+            wps = np.asarray(lay["waypoints"], dtype=np.float64)
+            bin_txt = list(lay["obstacle_xys"]) if lay["obstacle_present"] else "none"
+            if wps.shape[0] >= 4:
+                wp_txt = (
+                    f"start={wps[0].tolist()} via1={wps[1].tolist()} "
+                    f"via2={wps[2].tolist()} goal={wps[3].tolist()}"
+                )
+            else:
+                wp_txt = f"start={wps[0].tolist()} goal={wps[-1].tolist()}"
+            lines.append(f"scene{i:02d}={wp_txt} bin={bin_txt}")
+    elif custom and custom_layout is not None:
         wps = np.asarray(custom_layout["waypoints"], dtype=np.float64)
         bin_txt = (
-            list(custom_layout["blue_bin_xy"])
+            list(custom_layout["obstacle_xys"])
             if custom_layout["obstacle_present"]
             else "none"
         )
@@ -1410,22 +2142,34 @@ def main():
                     f" Qnom={r['q_probe_mean_nom']:.3f} Qsf={r['q_probe_mean_sf']:.3f} "
                     f"Qrand={r['q_probe_mean_rand']:.3f}"
                 )
+            tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
+            bin_txt = (
+                "absent"
+                if not r["layout"]["obstacle_present"]
+                else r["layout"]["obstacle_xys"]
+            )
             lines.append(
-                f"  run{r['run_id']:02d}: end={r['end_reason']} success={r['success']} "
-                f"bin={'absent' if not r['layout']['obstacle_present'] else 'present'} "
+                f"  {tag}: end={r['end_reason']} success={r['success']} "
+                f"bin={bin_txt} "
                 f"steps={r['visual_steps']} int={r['hj_interventions']} "
                 f"viol={r['constraint_violations']} minQ={r['min_q_nom']}{qline}"
             )
         lines.append("")
 
+    lines.extend(_metrics_block(results, modes))
     text = "\n".join(lines)
     summary_path = out_dir / (
         "summary_compare.txt" if args.mode == "compare" else f"summary_{args.mode}.txt"
     )
     summary_path.write_text(text, encoding="utf-8")
+    metrics_path = out_dir / (
+        "metrics_compare.csv" if args.mode == "compare" else f"metrics_{args.mode}.csv"
+    )
+    _write_session_metrics(metrics_path, results)
     print("\n" + "=" * 60)
     print(text)
     print(f"[INFO] Wrote {summary_path}")
+    print(f"[INFO] Wrote {metrics_path}")
 
     env.close()
     simulation_app.close()

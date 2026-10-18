@@ -11,6 +11,7 @@ humanoid_test_sac_path/
 humanoid_test_sac_path_depth/
 humanoid_test_sac_path_trainlike/
 humanoid_test_sac_path_trainmatch/
+humanoid_test_sac_path_lidar/
 humanoid_probe_q_vy_sign/
 DataCollection/
 *.pyo
