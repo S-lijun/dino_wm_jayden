@@ -1,0 +1,2 @@
+mode,tag,run_id,success,end_reason,n_steps,n_contact_steps,collision_rate,mean_speed_mps,n_sf_steps,n_nom_steps,sf_step_ratio,min_clearance_m,min_failset_m
+switching,run00,0,1,all_waypoints,205,0,0.0,0.42400030541022327,3,202,0.014634146341463415,0.9196336334031743,0.9186725185300683

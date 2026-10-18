@@ -1851,7 +1851,7 @@ def main():
     default_root = (
         Path("humanoid_test_sac_path_depth")
         if str(getattr(args, "visual_mode", "")) == "rtx_depth"
-        else Path("humanoid_test_sac_path_trainmatch")
+        else Path("humanoid_test_sac_path_vision")
     )
     out_dir = Path(args.out_dir) if args.out_dir else default_root / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
