@@ -13,7 +13,11 @@ humanoid_test_sac_path_trainlike/
 humanoid_test_sac_path_trainmatch/
 humanoid_test_sac_path_lidar/
 humanoid_probe_q_vy_sign/
-DataCollection/
+# DataCollection: ignore scans, video, and packed episodes. Keep scripts and csv.
+DataCollection/**
+!DataCollection/**/
+!DataCollection/**/*.py
+!DataCollection/**/*.csv
 *.pyo
 runs/
 # Ignore virtual environments
