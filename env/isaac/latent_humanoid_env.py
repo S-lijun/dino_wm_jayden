@@ -111,7 +111,11 @@ class LatentHumanoidEnv(gym.Env):
             ckpt = getattr(args, "utonia_ckpt", None)
             if not ckpt:
                 raise ValueError("obs_mode='lidar_utonia' requires args.utonia_ckpt")
-            self.lidar_encoder = UtoniaLidarEncoder(str(ckpt), device)
+            self.lidar_encoder = UtoniaLidarEncoder(
+                str(ckpt),
+                device,
+                grid_size=float(getattr(args, "grid_size", 0.01)),
+            )
             self.wm = None
             if self.with_proprio:
                 if self.proprio_encoder is None:

@@ -12,6 +12,7 @@ humanoid_test_sac_path_depth/
 humanoid_test_sac_path_trainlike/
 humanoid_test_sac_path_trainmatch/
 humanoid_test_sac_path_lidar/
+humanoid_test_sac_path_vision/
 humanoid_probe_q_vy_sign/
 # DataCollection: ignore scans, video, and packed episodes. Keep scripts and csv.
 DataCollection/**

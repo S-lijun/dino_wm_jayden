@@ -77,12 +77,18 @@ parser.add_argument(
     choices=["mid360"],
     help="360° scan, elevation -52..+7 deg. Same rays for z_lidar and h_s.",
 )
-parser.add_argument(
-    "--utonia_ckpt",
-    type=str,
-    default=None,
-    help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
-)
+    parser.add_argument(
+        "--utonia_ckpt",
+        type=str,
+        default=None,
+        help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
+    )
+    parser.add_argument(
+        "--grid_size",
+        type=float,
+        default=0.01,
+        help="Utonia voxel edge in meters. Match the policy: sim is 0.01, 4 cm fine-tune is 0.04.",
+    )
 parser.add_argument(
     "--visual_feature",
     type=str,

@@ -54,7 +54,7 @@ class UtoniaLidarEncoder:
 
     GRID_SIZE = 0.01
 
-    def __init__(self, ckpt_path: str, device: str) -> None:
+    def __init__(self, ckpt_path: str, device: str, grid_size: float | None = None) -> None:
         path = os.path.abspath(ckpt_path)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Utonia checkpoint not found: {path}")
@@ -76,8 +76,11 @@ class UtoniaLidarEncoder:
             p.requires_grad = False
         channels = tuple(cfg["enc_channels"])
         self.out_dim = int(channels[-1])
+        self.grid_size = float(self.GRID_SIZE if grid_size is None else grid_size)
+        if self.grid_size <= 0.0:
+            raise ValueError(f"grid_size must be positive, got {self.grid_size}")
         self._grid = _FirstPointGridSample(
-            grid_size=self.GRID_SIZE,
+            grid_size=self.grid_size,
             hash_type="fnv",
             mode="train",
             return_grid_coord=True,
@@ -90,7 +93,8 @@ class UtoniaLidarEncoder:
         )
         print(
             f"[UtoniaLidarEncoder] {path} out_dim={self.out_dim} "
-            f"flash=off shuffle_orders=off device={self.device}"
+            f"grid_size={self.grid_size:g}m flash=off shuffle_orders=off "
+            f"device={self.device}"
         )
 
     def encode(self, xyz: np.ndarray) -> torch.Tensor:

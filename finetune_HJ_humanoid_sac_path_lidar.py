@@ -24,7 +24,8 @@ Example::
       --resume_policy runs/sac_hj_humanoid_path/.../epoch_id_96/policy.pth \\
       --dino_ckpt_dir wm_ckpt_18-27-17 \\
       --critic_fusion concat --with_proprio \\
-      --z_fuse_frames 5 --lidar_distance_threshold 1.0
+      --z_fuse_frames 5 --lidar_distance_threshold 1.0 \\
+      --grid_size 0.04
 """
 
 from __future__ import annotations
@@ -70,6 +71,13 @@ def get_args():
         type=str,
         default=None,
         help="utonia.pth. Default: <dino_ckpt_dir>/utonia.pth.",
+    )
+    parser.add_argument(
+        "--grid_size",
+        type=float,
+        default=0.04,
+        help="Utonia voxel edge in meters before the forward. "
+        "0.04 is 4 cm. Sim training stays at 1 cm unless that run passes the same flag.",
     )
     parser.add_argument("--config", type=str, default="train_HJ_configs.yaml")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -351,8 +359,10 @@ def main():
     if bool(args.with_proprio) and not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
 
-    print(f"[INFO] Utonia: {args.utonia_ckpt}")
-    utonia = UtoniaLidarEncoder(args.utonia_ckpt, args.device)
+    if float(args.grid_size) <= 0.0:
+        raise ValueError(f"--grid_size must be positive, got {args.grid_size}")
+    print(f"[INFO] Utonia: {args.utonia_ckpt} grid_size={float(args.grid_size):g} m")
+    utonia = UtoniaLidarEncoder(args.utonia_ckpt, args.device, grid_size=float(args.grid_size))
     proprio_encoder = None
     proprio_dim = 0
     if bool(args.with_proprio):
@@ -671,6 +681,7 @@ def main():
             "z_fuse_frames": int(args.z_fuse_frames),
             "z_dim": int(z_dim),
             "utonia_out_dim": int(utonia.out_dim),
+            "grid_size_m": float(args.grid_size),
             "yaw_limit": float(args.yaw_limit),
             "freeze_yaw": bool(args.freeze_yaw),
             "freeze_vy": bool(args.freeze_vy),
