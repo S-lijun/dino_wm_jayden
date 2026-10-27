@@ -262,7 +262,7 @@ def fuse_episode(z: np.ndarray, n_frames: int) -> np.ndarray:
 
 
 class OfflineLidarEncoder:
-    """Match LatentHumanoidEnv._encode_lidar_utonia without Isaac."""
+    """Match LatentHumanoidEnv._encode_frozen_lidar without Isaac."""
 
     def __init__(
         self,

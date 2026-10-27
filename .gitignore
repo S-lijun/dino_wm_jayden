@@ -48,5 +48,6 @@ checkpoints/
 wm_ckpt_18-27-17/
 # Nested clone. Do not stage as a gitlink.
 third_party/Utonia/
+third_party/Pointnet_Pointnet2_pytorch/
 Trajectories/
 Sim2Real/

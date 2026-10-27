@@ -13,10 +13,13 @@ Layout:
   Action box: vx [0,1], vy [-0.5,0.5], yaw [-1,1].
   Blue-bin placement is still the original fixed (3.5, -2) until specified.
 
-  Observation is frozen Utonia on Mid-360 hits (576-D) concatenated with
-  the frozen WM proprio encoder. Actor sees that state. Critic is
-  Q(z, a) with a = (vx, vy, yaw_rate), default fusion ``concat``.
-  The world-model predictor is not loaded and z_{t+1} is not used.
+  Observation is a frozen lidar encoder on Mid-360 hits concatenated with
+  the frozen WM proprio encoder. ``lidar_utonia`` is 576-D.
+  ``lidar_pointnet2`` is PointNet++ set abstraction, 1024-D, no class head.
+  ``lidar_spunet`` is ScanNet SpUNet before the class head, 96-D.
+  Actor sees that state. Critic is Q(z, a) with a = (vx, vy, yaw_rate),
+  default fusion ``concat``. The world-model predictor is not loaded and
+  z_{t+1} is not used.
 """
 
 import argparse
@@ -36,7 +39,7 @@ sys.path.insert(0, ISAACLAB_ROOT)
 import scripts.reinforcement_learning.rsl_rl.cli_args as cli_args
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser("SAC HJ on Utonia lidar latent Humanoid (start-goal path)")
+parser = argparse.ArgumentParser("SAC HJ on lidar latent Humanoid (start-goal path)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument(
@@ -49,8 +52,13 @@ parser.add_argument(
     "--obs_mode",
     type=str,
     default="lidar_utonia",
-    choices=["lidar_utonia"],
-    help="State is Utonia(lidar hits) plus the WM proprio encoder.",
+    choices=["lidar_utonia", "lidar_pointnet2", "lidar_spunet"],
+    help=(
+        "lidar_utonia: frozen Utonia, 576-D. "
+        "lidar_pointnet2: frozen PointNet++ feature, 1024-D. "
+        "lidar_spunet: frozen ScanNet SpUNet feature, 96-D. "
+        "All concat the WM proprio encoder."
+    ),
 )
 parser.add_argument(
     "--lidar_pattern",
@@ -64,6 +72,24 @@ parser.add_argument(
     type=str,
     default=None,
     help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
+)
+parser.add_argument(
+    "--pointnet2_ckpt",
+    type=str,
+    default=None,
+    help=(
+        "PointNet++ SSG checkpoint without the class head. "
+        "Default: <dino_ckpt_dir>/<dino_encoder>/pointnet2_cls_ssg.pth"
+    ),
+)
+parser.add_argument(
+    "--spunet_ckpt",
+    type=str,
+    default=None,
+    help=(
+        "ScanNet SpUNet checkpoint. The 20-class head is not used. "
+        "Default: <dino_ckpt_dir>/<dino_encoder>/spunet_v1m1_scannet.pth"
+    ),
 )
 parser.add_argument(
     "--config",
@@ -702,7 +728,15 @@ def main():
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%m%d_%H%M")
-    run_tag = f"sac-path-utonia-{args.critic_fusion}"
+    if args.obs_mode == "lidar_pointnet2":
+        run_tag = f"sac-path-pointnet2-{args.critic_fusion}"
+        wandb_project = "sac-hj-pointnet2-humanoid"
+    elif args.obs_mode == "lidar_spunet":
+        run_tag = f"sac-path-spunet-{args.critic_fusion}"
+        wandb_project = "sac-hj-spunet-humanoid"
+    else:
+        run_tag = f"sac-path-utonia-{args.critic_fusion}"
+        wandb_project = "sac-hj-utonia-humanoid"
     resume_epoch_for_name = 0
     if args.resume_policy:
         resume_epoch_for_name = _parse_resume_epoch_from_path(args.resume_policy)
@@ -710,7 +744,7 @@ def main():
     if args.resume_policy:
         run_name = f"{run_name}-resume{resume_epoch_for_name}"
     wandb.init(
-        project="sac-hj-utonia-humanoid",
+        project=wandb_project,
         name=run_name,
         config=vars(args),
     )
@@ -732,15 +766,32 @@ def main():
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
     if not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
-    utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
-    if not os.path.isfile(utonia_ckpt):
-        raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
-    args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+    if args.obs_mode == "lidar_pointnet2":
+        pointnet2_ckpt = args.pointnet2_ckpt or str(ckpt_dir / "pointnet2_cls_ssg.pth")
+        if not os.path.isfile(pointnet2_ckpt):
+            raise FileNotFoundError(f"PointNet++ checkpoint not found: {pointnet2_ckpt}")
+        args.pointnet2_ckpt = os.path.abspath(pointnet2_ckpt)
+        z_lidar_dim = 1024
+        encoder_line = f"[INFO] PointNet++: {args.pointnet2_ckpt}"
+    elif args.obs_mode == "lidar_spunet":
+        spunet_ckpt = args.spunet_ckpt or str(ckpt_dir / "spunet_v1m1_scannet.pth")
+        if not os.path.isfile(spunet_ckpt):
+            raise FileNotFoundError(f"SpUNet checkpoint not found: {spunet_ckpt}")
+        args.spunet_ckpt = os.path.abspath(spunet_ckpt)
+        z_lidar_dim = 96
+        encoder_line = f"[INFO] SpUNet: {args.spunet_ckpt}"
+    else:
+        utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
+        if not os.path.isfile(utonia_ckpt):
+            raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
+        args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+        z_lidar_dim = 576
+        encoder_line = f"[INFO] Utonia: {args.utonia_ckpt}"
     print(
         f"[INFO] lidar obs_mode={args.obs_mode} pattern={args.lidar_pattern} "
         f"critic_fusion={args.critic_fusion} with_proprio={args.with_proprio}"
     )
-    print(f"[INFO] Utonia: {args.utonia_ckpt}")
+    print(encoder_line)
     print(f"[INFO] proprio encoder from {snapshot}")
     proprio_encoder = None
     if args.with_proprio:
@@ -753,7 +804,7 @@ def main():
             f"emb_dim={proprio_encoder.emb_dim}"
         )
         print(
-            "[INFO] actor input = [z_lidar 576, z_proprio "
+            f"[INFO] actor input = [z_lidar {z_lidar_dim}, z_proprio "
             f"{int(proprio_encoder.emb_dim)}]; "
             "critic concat appends (vx, vy, yaw_rate)"
         )

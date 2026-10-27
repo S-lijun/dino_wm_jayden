@@ -67,8 +67,13 @@ parser.add_argument(
     "--obs_mode",
     type=str,
     default="lidar_utonia",
-    choices=["lidar_utonia"],
-    help="State is Utonia(lidar hits) plus the WM proprio encoder.",
+    choices=["lidar_utonia", "lidar_pointnet2", "lidar_spunet"],
+    help=(
+        "lidar_utonia: frozen Utonia, 576-D. "
+        "lidar_pointnet2: frozen PointNet++ feature, 1024-D. "
+        "lidar_spunet: frozen ScanNet SpUNet feature, 96-D. "
+        "All concat the WM proprio encoder."
+    ),
 )
 parser.add_argument(
     "--lidar_pattern",
@@ -77,18 +82,36 @@ parser.add_argument(
     choices=["mid360"],
     help="360° scan, elevation -52..+7 deg. Same rays for z_lidar and h_s.",
 )
-    parser.add_argument(
-        "--utonia_ckpt",
-        type=str,
-        default=None,
-        help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
-    )
-    parser.add_argument(
-        "--grid_size",
-        type=float,
-        default=0.01,
-        help="Utonia voxel edge in meters. Match the policy: sim is 0.01, 4 cm fine-tune is 0.04.",
-    )
+parser.add_argument(
+    "--utonia_ckpt",
+    type=str,
+    default=None,
+    help="Utonia utonia.pth. Default: <dino_ckpt_dir>/<dino_encoder>/utonia.pth",
+)
+parser.add_argument(
+    "--grid_size",
+    type=float,
+    default=0.01,
+    help="Utonia voxel edge in meters. Match the policy: sim is 0.01, 4 cm fine-tune is 0.04.",
+)
+parser.add_argument(
+    "--pointnet2_ckpt",
+    type=str,
+    default=None,
+    help=(
+        "PointNet++ SSG checkpoint without the class head. "
+        "Default: <dino_ckpt_dir>/<dino_encoder>/pointnet2_cls_ssg.pth"
+    ),
+)
+parser.add_argument(
+    "--spunet_ckpt",
+    type=str,
+    default=None,
+    help=(
+        "ScanNet SpUNet checkpoint. The 20-class head is not used. "
+        "Default: <dino_ckpt_dir>/<dino_encoder>/spunet_v1m1_scannet.pth"
+    ),
+)
 parser.add_argument(
     "--visual_feature",
     type=str,
@@ -1923,11 +1946,27 @@ def main():
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
     if not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
-    utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
-    if not os.path.isfile(utonia_ckpt):
-        raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
-    args.utonia_ckpt = os.path.abspath(utonia_ckpt)
-    print(f"[INFO] Utonia: {args.utonia_ckpt}")
+    if args.obs_mode == "lidar_pointnet2":
+        pointnet2_ckpt = args.pointnet2_ckpt or str(ckpt_dir / "pointnet2_cls_ssg.pth")
+        if not os.path.isfile(pointnet2_ckpt):
+            raise FileNotFoundError(f"PointNet++ checkpoint not found: {pointnet2_ckpt}")
+        args.pointnet2_ckpt = os.path.abspath(pointnet2_ckpt)
+        z_lidar_dim = 1024
+        print(f"[INFO] PointNet++: {args.pointnet2_ckpt}")
+    elif args.obs_mode == "lidar_spunet":
+        spunet_ckpt = args.spunet_ckpt or str(ckpt_dir / "spunet_v1m1_scannet.pth")
+        if not os.path.isfile(spunet_ckpt):
+            raise FileNotFoundError(f"SpUNet checkpoint not found: {spunet_ckpt}")
+        args.spunet_ckpt = os.path.abspath(spunet_ckpt)
+        z_lidar_dim = 96
+        print(f"[INFO] SpUNet: {args.spunet_ckpt}")
+    else:
+        utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
+        if not os.path.isfile(utonia_ckpt):
+            raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
+        args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+        z_lidar_dim = 576
+        print(f"[INFO] Utonia: {args.utonia_ckpt}")
     print(f"[INFO] proprio encoder from {snapshot}")
     proprio_encoder = None
     if bool(args.with_proprio):
@@ -1940,7 +1979,7 @@ def main():
             f"emb_dim={proprio_encoder.emb_dim}"
         )
         print(
-            "[INFO] actor input = [z_lidar 576, z_proprio "
+            f"[INFO] actor input = [z_lidar {z_lidar_dim}, z_proprio "
             f"{int(proprio_encoder.emb_dim)}]; "
             "critic concat appends (vx, vy, yaw_rate)"
         )

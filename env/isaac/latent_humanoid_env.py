@@ -117,14 +117,25 @@ class LatentHumanoidEnv(gym.Env):
                 grid_size=float(getattr(args, "grid_size", 0.01)),
             )
             self.wm = None
-            if self.with_proprio:
-                if self.proprio_encoder is None:
-                    raise ValueError(
-                        "obs_mode='lidar_utonia' with proprio requires proprio_encoder"
-                    )
-                self.proprio_encoder.eval()
-                for p in self.proprio_encoder.parameters():
-                    p.requires_grad = False
+            self._freeze_proprio_encoder()
+        elif self.obs_mode == "lidar_pointnet2":
+            from env.isaac.pointnet2_encoder import PointNet2LidarEncoder
+
+            ckpt = getattr(args, "pointnet2_ckpt", None)
+            if not ckpt:
+                raise ValueError("obs_mode='lidar_pointnet2' requires args.pointnet2_ckpt")
+            self.lidar_encoder = PointNet2LidarEncoder(str(ckpt), device)
+            self.wm = None
+            self._freeze_proprio_encoder()
+        elif self.obs_mode == "lidar_spunet":
+            from env.isaac.spunet_encoder import SpUNetLidarEncoder
+
+            ckpt = getattr(args, "spunet_ckpt", None)
+            if not ckpt:
+                raise ValueError("obs_mode='lidar_spunet' requires args.spunet_ckpt")
+            self.lidar_encoder = SpUNetLidarEncoder(str(ckpt), device)
+            self.wm = None
+            self._freeze_proprio_encoder()
         else:
             raise ValueError(f"Unknown obs_mode={self.obs_mode!r}")
         self.max_episode_sim_steps = int(
@@ -1536,7 +1547,7 @@ class LatentHumanoidEnv(gym.Env):
 
     def _read_step_obs(self) -> dict[str, Any]:
         """Lidar training reads joints only. Images stay on the vision line."""
-        if self.obs_mode == "lidar_utonia" and not bool(
+        if self.obs_mode in ("lidar_utonia", "lidar_pointnet2", "lidar_spunet") and not bool(
             getattr(self.wrapper, "collect_visual", False)
         ):
             return {"visual": None, "proprio": self.wrapper.get_proprio()}
@@ -1676,8 +1687,8 @@ class LatentHumanoidEnv(gym.Env):
         """Single-frame encode. No temporal average."""
         if self.obs_mode == "lidar_joint":
             return self.wrapper.get_lidar_joint_state()
-        if self.obs_mode == "lidar_utonia":
-            return self._encode_lidar_utonia(obs)
+        if self.obs_mode in ("lidar_utonia", "lidar_pointnet2", "lidar_spunet"):
+            return self._encode_frozen_lidar(obs)
 
         visual, proprio = self._split_raw_obs(obs)
 
@@ -1705,12 +1716,27 @@ class LatentHumanoidEnv(gym.Env):
         ``obs_mode=lidar_joint``: 12-D legs ‖ full lidar ranges (ignores RGB).
         ``obs_mode=lidar_utonia``: frozen Utonia on sensor-frame hits, optional
         frozen proprio encoder. No z_{t+1} predictor.
+        ``obs_mode=lidar_pointnet2``: frozen PointNet++ (1024-D, no class head)
+        on the same hits, optional frozen proprio encoder.
+        ``obs_mode=lidar_spunet``: frozen ScanNet SpUNet (96-D, no class head)
+        on the same hits, optional frozen proprio encoder.
         When ``z_fuse_frames`` > 1, return the mean of the last N full z.
         """
         return self._fuse_z(self._encode_current(obs))
 
-    def _encode_lidar_utonia(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
-        """z = pool(Utonia(xyz)) ‖ proprio_encoder(joints). Action is not in z."""
+    def _freeze_proprio_encoder(self) -> None:
+        if not self.with_proprio:
+            return
+        if self.proprio_encoder is None:
+            raise ValueError(
+                f"obs_mode={self.obs_mode!r} with proprio requires proprio_encoder"
+            )
+        self.proprio_encoder.eval()
+        for p in self.proprio_encoder.parameters():
+            p.requires_grad = False
+
+    def _encode_frozen_lidar(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """z = frozen_lidar(xyz) ‖ proprio_encoder(joints). Action is not in z."""
         if self.lidar_encoder is None:
             raise RuntimeError("lidar encoder is not loaded")
         _, proprio = self._split_raw_obs(obs)
