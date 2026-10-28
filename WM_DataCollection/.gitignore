@@ -1,0 +1,23 @@
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/*.egg-info/
+
+# IDE
+**/.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cluster job diagnostics (temporary outputs)
+IsaacLab/_diag_*
+Trajectories/*
+Data/*
+
+# Model checkpoints (often >100MB, GitHub rejects them)
+wm_ckpt_*/
+wm_ckpt_*.zip
+**/*.pth

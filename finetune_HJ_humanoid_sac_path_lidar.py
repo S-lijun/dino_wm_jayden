@@ -1,9 +1,13 @@
 """Offline real-robot fine-tune of a sim-trained lidar path SAC safety filter.
 
 Same update as ``finetune_HJ_humanoid_sac_path.py``. The state is not DINO.
-Each frame is frozen Utonia on the filtered Mid-360 cloud, concatenated with
-the frozen WM proprio encoder, then averaged over ``--z_fuse_frames``
-(default 5, matching lidar sim training).
+Each frame is a frozen lidar encoder on the filtered Mid-360 cloud,
+concatenated with the frozen WM proprio encoder, then averaged over
+``--z_fuse_frames`` (default 5, matching lidar sim training).
+
+``--obs_mode lidar_utonia`` (default) is Utonia, 576-D.
+``--obs_mode lidar_spunet`` is ScanNet SpUNet before the class head, 96-D.
+The SAC update is the same; only the encoder and the resulting z dim change.
 
 Episode files from ``scripts/pack_real_lidar_episodes.py``::
 
@@ -26,6 +30,16 @@ Example::
       --critic_fusion concat --with_proprio \\
       --z_fuse_frames 5 --lidar_distance_threshold 1.0 \\
       --grid_size 0.04
+
+SpUNet (96-D, grid fixed at 2 cm inside the encoder)::
+
+    python finetune_HJ_humanoid_sac_path_lidar.py \\
+      --obs_mode lidar_spunet \\
+      --data_dir DataCollection/ft_episodes_lidar \\
+      --resume_policy runs/sac_hj_humanoid_path/.../epoch_id_116/policy.pth \\
+      --dino_ckpt_dir wm_ckpt_18-27-17 \\
+      --critic_fusion concat --with_proprio \\
+      --z_fuse_frames 5 --lidar_distance_threshold 1.0
 """
 
 from __future__ import annotations
@@ -45,6 +59,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import finetune_HJ_humanoid_sac_path as ft
+from env.isaac.spunet_encoder import SpUNetLidarEncoder
 from env.isaac.utonia_encoder import UtoniaLidarEncoder
 
 REPO_ROOT = ft.REPO_ROOT
@@ -67,17 +82,37 @@ def get_args():
         "Utonia defaults to <this>/utonia.pth.",
     )
     parser.add_argument(
+        "--obs_mode",
+        type=str,
+        default="lidar_utonia",
+        choices=["lidar_utonia", "lidar_spunet"],
+        help=(
+            "lidar_utonia: frozen Utonia, 576-D. "
+            "lidar_spunet: frozen ScanNet SpUNet feature, 96-D. "
+            "Both concat the WM proprio encoder. The SAC update is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--utonia_ckpt",
         type=str,
         default=None,
-        help="utonia.pth. Default: <dino_ckpt_dir>/utonia.pth.",
+        help="utonia.pth. Default: <dino_ckpt_dir>/utonia.pth. Ignored for lidar_spunet.",
+    )
+    parser.add_argument(
+        "--spunet_ckpt",
+        type=str,
+        default=None,
+        help=(
+            "ScanNet SpUNet checkpoint. The 20-class head is not used. "
+            "Default: <dino_ckpt_dir>/spunet_v1m1_scannet.pth. Ignored for lidar_utonia."
+        ),
     )
     parser.add_argument(
         "--grid_size",
         type=float,
         default=0.04,
         help="Utonia voxel edge in meters before the forward. "
-        "0.04 is 4 cm. Sim training stays at 1 cm unless that run passes the same flag.",
+        "0.04 is 4 cm. Ignored for lidar_spunet (that encoder uses 2 cm).",
     )
     parser.add_argument("--config", type=str, default="train_HJ_configs.yaml")
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -159,7 +194,12 @@ def get_args():
         help="Isaac/WM joint names, only if real proprio dim or order differs.",
     )
     parser.add_argument("--no_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="sac-hj-utonia-humanoid")
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="Default: sac-hj-utonia-humanoid or sac-hj-spunet-humanoid from --obs_mode.",
+    )
     ft_args, remaining = parser.parse_known_args()
 
     with open(ft_args.config) as f:
@@ -266,22 +306,22 @@ class OfflineLidarEncoder:
 
     def __init__(
         self,
-        utonia: UtoniaLidarEncoder,
+        lidar_encoder: UtoniaLidarEncoder | SpUNetLidarEncoder,
         proprio_encoder,
         with_proprio: bool,
         z_fuse_frames: int,
     ):
-        self.utonia = utonia
+        self.lidar_encoder = lidar_encoder
         self.proprio_encoder = proprio_encoder
         self.with_proprio = bool(with_proprio)
         self.z_fuse_frames = max(1, int(z_fuse_frames))
-        self.device = utonia.device
+        self.device = lidar_encoder.device
 
     @torch.no_grad()
     def encode_episode(self, clouds: list[np.ndarray], proprios: np.ndarray) -> np.ndarray:
         rows: list[np.ndarray] = []
         for i, pts in enumerate(clouds):
-            z_lidar = self.utonia.encode(pts)
+            z_lidar = self.lidar_encoder.encode(pts)
             if self.with_proprio:
                 prop = np.asarray(proprios[i], dtype=np.float32).reshape(-1)
                 expected = int(self.proprio_encoder.in_chans)
@@ -311,8 +351,9 @@ def load_policy_checkpoint(policy, ckpt_path: str | Path, device: str) -> None:
         policy.load_state_dict(state, strict=True)
     except RuntimeError as exc:
         raise RuntimeError(
-            "Failed to load checkpoint: match --critic_fusion / --with_proprio "
-            "to the lidar sim run (z = Utonia 576 ‖ proprio). "
+            "Failed to load checkpoint: match --obs_mode / --critic_fusion / "
+            "--with_proprio to the lidar sim run "
+            "(Utonia 576-D or SpUNet 96-D, then ‖ proprio). "
             f"Path: {ckpt_path}"
         ) from exc
     print(f"[INFO] Resumed policy from {ckpt_path}")
@@ -352,17 +393,30 @@ def main():
 
     ckpt_dir = Path(args.dino_ckpt_dir)
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
-    utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
-    if not os.path.isfile(utonia_ckpt):
-        raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
-    args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+    args.obs_mode = str(args.obs_mode).lower()
     if bool(args.with_proprio) and not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
 
-    if float(args.grid_size) <= 0.0:
-        raise ValueError(f"--grid_size must be positive, got {args.grid_size}")
-    print(f"[INFO] Utonia: {args.utonia_ckpt} grid_size={float(args.grid_size):g} m")
-    utonia = UtoniaLidarEncoder(args.utonia_ckpt, args.device, grid_size=float(args.grid_size))
+    if args.obs_mode == "lidar_spunet":
+        spunet_ckpt = args.spunet_ckpt or str(ckpt_dir / "spunet_v1m1_scannet.pth")
+        if not os.path.isfile(spunet_ckpt):
+            raise FileNotFoundError(f"SpUNet checkpoint not found: {spunet_ckpt}")
+        args.spunet_ckpt = os.path.abspath(spunet_ckpt)
+        print(f"[INFO] SpUNet: {args.spunet_ckpt} grid_size=0.02 m (fixed)")
+        lidar_encoder: UtoniaLidarEncoder | SpUNetLidarEncoder = SpUNetLidarEncoder(
+            args.spunet_ckpt, args.device
+        )
+    else:
+        utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
+        if not os.path.isfile(utonia_ckpt):
+            raise FileNotFoundError(f"Utonia checkpoint not found: {utonia_ckpt}")
+        args.utonia_ckpt = os.path.abspath(utonia_ckpt)
+        if float(args.grid_size) <= 0.0:
+            raise ValueError(f"--grid_size must be positive, got {args.grid_size}")
+        print(f"[INFO] Utonia: {args.utonia_ckpt} grid_size={float(args.grid_size):g} m")
+        lidar_encoder = UtoniaLidarEncoder(
+            args.utonia_ckpt, args.device, grid_size=float(args.grid_size)
+        )
     proprio_encoder = None
     proprio_dim = 0
     if bool(args.with_proprio):
@@ -377,15 +431,15 @@ def main():
             f"emb_dim={int(proprio_encoder.emb_dim)} from {snapshot}"
         )
         print(
-            f"[INFO] actor input = [z_lidar {utonia.out_dim}, z_proprio "
+            f"[INFO] actor input = [z_lidar {lidar_encoder.out_dim}, z_proprio "
             f"{int(proprio_encoder.emb_dim)}]"
         )
     else:
-        print(f"[INFO] actor input = z_lidar {utonia.out_dim} (no proprio)")
+        print(f"[INFO] actor input = z_lidar {lidar_encoder.out_dim} (no proprio)")
 
     dst_names = ft.load_name_file(args.wm_joint_names) if args.wm_joint_names else None
     encoder = OfflineLidarEncoder(
-        utonia,
+        lidar_encoder,
         proprio_encoder,
         bool(args.with_proprio),
         int(args.z_fuse_frames),
@@ -645,8 +699,11 @@ def main():
     mode = "actor" if train_actor else "critics"
     if actor_reg_coef > 0.0:
         mode = f"{mode}-pisim"
+    encoder_tag = "spunet" if args.obs_mode == "lidar_spunet" else "utonia"
+    if not args.wandb_project:
+        args.wandb_project = f"sac-hj-{encoder_tag}-humanoid"
     run_name = (
-        f"ft-path-utonia-{args.critic_fusion}-{mode}"
+        f"ft-path-{encoder_tag}-{args.critic_fusion}-{mode}"
         f"-{args.dino_encoder}-{timestamp}-resume{resume_epoch}"
     )
     print(
@@ -675,13 +732,13 @@ def main():
         "latest_epoch": 0,
         "config": {k: ft._json_safe(v) for k, v in sorted(vars(args).items())},
         "policy": {
-            "obs": "lidar_utonia",
+            "obs": str(args.obs_mode),
             "critic_fusion": str(args.critic_fusion),
             "with_proprio": bool(args.with_proprio),
             "z_fuse_frames": int(args.z_fuse_frames),
             "z_dim": int(z_dim),
-            "utonia_out_dim": int(utonia.out_dim),
-            "grid_size_m": float(args.grid_size),
+            "lidar_out_dim": int(lidar_encoder.out_dim),
+            "grid_size_m": float(getattr(lidar_encoder, "grid_size", args.grid_size)),
             "yaw_limit": float(args.yaw_limit),
             "freeze_yaw": bool(args.freeze_yaw),
             "freeze_vy": bool(args.freeze_vy),
@@ -705,7 +762,8 @@ def main():
             "dino_ckpt_dir": str(ckpt_dir.resolve()),
             "dino_encoder": str(args.dino_encoder),
             "snapshot": str(snapshot.resolve()) if snapshot.is_file() else "",
-            "utonia_ckpt": str(args.utonia_ckpt),
+            "utonia_ckpt": str(getattr(args, "utonia_ckpt", "") or ""),
+            "spunet_ckpt": str(getattr(args, "spunet_ckpt", "") or ""),
         },
         "resume": {
             "resume_policy": str(Path(args.resume_policy).resolve()),
