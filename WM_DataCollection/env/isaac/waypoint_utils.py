@@ -171,3 +171,208 @@ class WaypointNavController:
         self.prev_vy = float(vy_cmd)
 
         return np.array([vx_cmd, vy_cmd, yaw_rate], dtype=np.float32)
+
+
+# start→goal arena used by the lidar / vision sac_path trainers.
+DEFAULT_ARENA_BOUNDS: tuple[float, float, float, float] = (-1.0, 6.0, -4.0, 2.0)
+DEFAULT_PERP_OFFSET_M: float = 1.5
+DEFAULT_PERP_KEEPOUT_M: float = 0.25
+DEFAULT_MIN_START_GOAL_DIST: float = 5.0
+
+
+def _point_in_rect(
+    xy: np.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    margin: float = 0.0,
+) -> bool:
+    x, y = float(xy[0]), float(xy[1])
+    return (x_min + margin) <= x <= (x_max - margin) and (y_min + margin) <= y <= (
+        y_max - margin
+    )
+
+
+def _clamp_to_rect(
+    xy: np.ndarray,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    *,
+    margin: float = 0.0,
+) -> np.ndarray:
+    return np.array(
+        [
+            float(np.clip(xy[0], x_min + margin, x_max - margin)),
+            float(np.clip(xy[1], y_min + margin, y_max - margin)),
+        ],
+        dtype=np.float64,
+    )
+
+
+def sample_start_goal_in_arena(
+    rng: np.random.Generator,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    min_start_goal_dist: float = DEFAULT_MIN_START_GOAL_DIST,
+    margin: float = 0.5,
+    max_tries: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample start and goal inside the arena inset, with a min separation."""
+    ix0, ix1 = float(x_min + margin), float(x_max - margin)
+    iy0, iy1 = float(y_min + margin), float(y_max - margin)
+    if ix1 <= ix0 or iy1 <= iy0:
+        raise ValueError("Arena inset is empty; increase bounds or reduce margin.")
+    last_err = "failed to sample start-goal"
+    for _ in range(int(max_tries)):
+        start = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        goal = np.array(
+            [rng.uniform(ix0, ix1), rng.uniform(iy0, iy1)], dtype=np.float64
+        )
+        dist = float(np.linalg.norm(goal - start))
+        if dist < float(min_start_goal_dist):
+            last_err = f"start-goal dist {dist:.2f} < {min_start_goal_dist}"
+            continue
+        return start, goal
+    raise RuntimeError(f"sample_start_goal_in_arena: {last_err}")
+
+
+def sample_start_goal_path(
+    rng: np.random.Generator,
+    *,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    min_start_goal_dist: float = DEFAULT_MIN_START_GOAL_DIST,
+    margin: float = 0.5,
+    max_tries: int = 256,
+) -> tuple[np.ndarray, list[str], float]:
+    """Straight start → goal. ``spawn_yaw`` faces start → goal."""
+    start, goal = sample_start_goal_in_arena(
+        rng,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        min_start_goal_dist=min_start_goal_dist,
+        margin=margin,
+        max_tries=max_tries,
+    )
+    heading = goal - start
+    spawn_yaw = float(np.arctan2(heading[1], heading[0]))
+    wps = np.stack([start, goal], axis=0)
+    return wps, ["start", "goal"], spawn_yaw
+
+
+def sample_perp_points_on_segment(
+    rng: np.random.Generator,
+    start: np.ndarray,
+    goal: np.ndarray,
+    n: int,
+    *,
+    perp_offset: float = DEFAULT_PERP_OFFSET_M,
+    perp_keepout: float = DEFAULT_PERP_KEEPOUT_M,
+    side: int | None = None,
+    x_min: float = DEFAULT_ARENA_BOUNDS[0],
+    x_max: float = DEFAULT_ARENA_BOUNDS[1],
+    y_min: float = DEFAULT_ARENA_BOUNDS[2],
+    y_max: float = DEFAULT_ARENA_BOUNDS[3],
+    t_lo: float = 0.25,
+    t_hi: float = 0.75,
+    min_t_gap: float = 0.18,
+    min_pairwise: float = 1.2,
+    min_end_dist: float = 1.0,
+    margin: float = 0.3,
+    max_tries: int = 256,
+) -> list[np.ndarray]:
+    """Sample ``n`` points off the start→goal line.
+
+    ``|offset| ~ U[perp_keepout, perp_offset]``. ``side`` is +1 = left of
+    heading, -1 = right; ``None`` draws the sign at random per point.
+    """
+    n = int(n)
+    if n <= 0:
+        return []
+    start = np.asarray(start, dtype=np.float64).reshape(2)
+    goal = np.asarray(goal, dtype=np.float64).reshape(2)
+    delta = goal - start
+    dist = float(np.linalg.norm(delta))
+    if dist < 1e-6:
+        raise ValueError("start and goal are coincident")
+    tangent = delta / dist
+    normal = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+    off = abs(float(perp_offset))
+    keep = min(abs(float(perp_keepout)), off)
+    side_sign = None if side is None else (1.0 if int(side) >= 0 else -1.0)
+
+    def _draw_offsets() -> list[float]:
+        mags = [
+            float(keep) if off <= keep else float(rng.uniform(keep, off))
+            for _ in range(n)
+        ]
+        if side_sign is None:
+            return [m * (1.0 if rng.random() < 0.5 else -1.0) for m in mags]
+        return [side_sign * m for m in mags]
+
+    def _place_at(foot: np.ndarray, signed_off: float) -> np.ndarray | None:
+        pt = foot + signed_off * normal
+        if _point_in_rect(pt, x_min, x_max, y_min, y_max, margin=margin):
+            return pt
+        if side_sign is None:
+            flipped = foot - signed_off * normal
+            if _point_in_rect(flipped, x_min, x_max, y_min, y_max, margin=margin):
+                return flipped
+            if _point_in_rect(flipped, x_min, x_max, y_min, y_max, margin=0.15):
+                return _clamp_to_rect(
+                    flipped, x_min, x_max, y_min, y_max, margin=0.15
+                )
+        sgn = float(np.sign(signed_off)) if abs(signed_off) > 1e-9 else 1.0
+        for frac in (0.85, 0.7, 0.55, 0.4):
+            mag = max(keep, abs(signed_off) * frac)
+            cand = foot + sgn * mag * normal
+            if _point_in_rect(cand, x_min, x_max, y_min, y_max, margin=0.15):
+                return cand
+        return None
+
+    for relax in (1.0, 0.7, 0.45, 0.25, 0.0):
+        end_min = float(min_end_dist) * relax
+        pair_min = float(min_pairwise) * relax
+        gap = float(min_t_gap) * relax
+        for _ in range(int(max_tries)):
+            ts = sorted(float(rng.uniform(t_lo, t_hi)) for _ in range(n))
+            if any(ts[i] - ts[i - 1] < gap for i in range(1, n)):
+                continue
+            pts: list[np.ndarray] = []
+            ok = True
+            for t, signed_off in zip(ts, _draw_offsets()):
+                foot = start + t * delta
+                pt = _place_at(foot, signed_off)
+                if pt is None:
+                    ok = False
+                    break
+                if float(np.linalg.norm(pt - start)) < end_min:
+                    ok = False
+                    break
+                if float(np.linalg.norm(pt - goal)) < end_min:
+                    ok = False
+                    break
+                pts.append(pt)
+            if not ok:
+                continue
+            if pair_min > 0.0 and any(
+                float(np.linalg.norm(pts[i] - pts[j])) < pair_min
+                for i in range(n)
+                for j in range(i + 1, n)
+            ):
+                continue
+            return pts
+    raise RuntimeError("sample_perp_points_on_segment: no placement found")

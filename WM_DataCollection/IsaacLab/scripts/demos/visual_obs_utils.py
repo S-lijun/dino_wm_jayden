@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 VISUAL_MODES = ("off", "depth_rgb", "lidar_rgb", "rtx_rgb")
-DEFAULT_VISUAL_MODE = "depth_rgb"  # cluster-safe; DataCollection_test defaults to rtx_rgb
+DEFAULT_VISUAL_MODE = "rtx_rgb"
 IMG_RES_LANDSCAPE = (480, 640)  # (height, width) = 640×480 landscape
 LIDAR_CHANNELS = 45
 LIDAR_HORIZONTAL_RES = 2.0

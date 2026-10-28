@@ -20,7 +20,12 @@ parser = argparse.ArgumentParser(description="Collect humanoid G1 offline trajec
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 parser.add_argument("--num_episodes", type=int, default=3000)
-parser.add_argument("--max_steps", type=int, default=500)
+parser.add_argument(
+    "--max_steps",
+    type=int,
+    default=8000,
+    help="Sim-step cap. start→goal paths are several meters; 8000 steps ≈ 40s at dt=0.005.",
+)
 parser.add_argument(
     "--output_dir",
     type=str,
@@ -46,7 +51,7 @@ parser.add_argument(
 parser.add_argument(
     "--visual_mode",
     type=str,
-    default="depth_rgb",
+    default="rtx_rgb",
     choices=["off", "depth_rgb", "lidar_rgb", "rtx_rgb"],
 )
 parser.add_argument(
@@ -77,8 +82,28 @@ parser.add_argument(
     "--bin_y",
     type=float,
     default=0.0,
-    help="Blue bin world Y position (m).",
+    help="Unused. Bins are resampled beside the start-goal line each episode.",
 )
+parser.add_argument("--arena_x_min", type=float, default=-1.0)
+parser.add_argument("--arena_x_max", type=float, default=6.0)
+parser.add_argument("--arena_y_min", type=float, default=-4.0)
+parser.add_argument("--arena_y_max", type=float, default=2.0)
+parser.add_argument(
+    "--perp_offset",
+    type=float,
+    default=1.5,
+    help="Outer |offset| (m) of bins from the start-goal line. Vision train uses 1.0.",
+)
+parser.add_argument(
+    "--perp_keepout",
+    type=float,
+    default=0.25,
+    help="Inner keep-out (m). Bin |offset| ~ U[this, perp_offset].",
+)
+parser.add_argument("--min_start_goal_dist", type=float, default=5.0)
+parser.add_argument("--max_n_obstacles", type=int, default=2)
+parser.add_argument("--obstacle_absent_prob", type=float, default=0.1)
+parser.add_argument("--two_obstacle_prob", type=float, default=0.5)
 parser.add_argument(
     "--camera_fps",
     type=float,
@@ -162,10 +187,10 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         nav.reset()
 
         print(
-            f"[EP {ep}] regions={reset_info.get('waypoint_region_names')} "
-            f"waypoints={reset_info.get('waypoints')} "
-            f"blue_bin={reset_info.get('obstacle_positions', {}).get('blue_bin_0')} "
-            f"robot_xy={reset_info.get('robot_xy')}"
+            f"[EP {ep}] {reset_info.get('waypoint_region_names')} "
+            f"start={reset_info.get('robot_xy')} goal={reset_info.get('goal_xy')} "
+            f"bins={reset_info.get('n_obstacles')} side={reset_info.get('bin_side')} "
+            f"obstacles={reset_info.get('obstacle_positions')}"
         )
 
         episode_actions = []
@@ -261,7 +286,20 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
             "stuck_contact_steps": args_cli.stuck_contact_steps,
             "waypoint_stop_thresh": args_cli.waypoint_stop_thresh,
             "max_speed": args_cli.max_speed,
-            "blue_bin_xy": (args_cli.bin_x, args_cli.bin_y),
+            "scene": "start_goal",
+            "arena_xy": (
+                args_cli.arena_x_min,
+                args_cli.arena_x_max,
+                args_cli.arena_y_min,
+                args_cli.arena_y_max,
+            ),
+            "perp_offset": args_cli.perp_offset,
+            "perp_keepout": args_cli.perp_keepout,
+            "min_start_goal_dist": args_cli.min_start_goal_dist,
+            "max_n_obstacles": args_cli.max_n_obstacles,
+            "obstacle_absent_prob": args_cli.obstacle_absent_prob,
+            "two_obstacle_prob": args_cli.two_obstacle_prob,
+            "bin_side": "random_left_or_right",
             "state_lidar_min_field": "lidar_min_range_nonzero_m",
             "end_reason_counts": {
                 "all_waypoints": n_finished_all_waypoints,

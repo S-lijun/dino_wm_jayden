@@ -13,9 +13,15 @@ import numpy as np
 import torch
 
 from env.isaac.waypoint_utils import (
+    DEFAULT_ARENA_BOUNDS,
+    DEFAULT_MIN_START_GOAL_DIST,
+    DEFAULT_PERP_KEEPOUT_M,
+    DEFAULT_PERP_OFFSET_M,
     DEFAULT_TRAJECTORY_REGIONS,
     DEFAULT_TRAJECTORY_REGION_SEQUENCE,
     generate_random_waypoint_sequence,
+    sample_perp_points_on_segment,
+    sample_start_goal_path,
     waypoints_to_list,
 )
 
@@ -29,6 +35,18 @@ OBSTACLE_SPECS: dict[str, dict[str, Any]] = {
 }
 
 HIDDEN_OBSTACLE_POS = (100.0, 100.0, -10.0)
+_BIN_DEFAULT_Z = 0.5
+_BIN_DEFAULT_ROT = (0.5, 0.5, 0.5, 0.5)
+
+
+def _bin_spec(name: str) -> dict[str, Any]:
+    if name in OBSTACLE_SPECS:
+        return OBSTACLE_SPECS[name]
+    return {
+        "default_z": _BIN_DEFAULT_Z,
+        "rot": _BIN_DEFAULT_ROT,
+        "spawn_xy": (2.0, 0.0),
+    }
 DEFAULT_SENSOR_IMG_RES = (640, 480)  # portrait (height, width) before CCW rotation
 
 
@@ -134,7 +152,7 @@ class IsaacG1Wrapper:
     ):
         self.args_cli = args_cli
         if visual_mode is None:
-            visual_mode = getattr(args_cli, "visual_mode", "depth_rgb")
+            visual_mode = getattr(args_cli, "visual_mode", "rtx_rgb")
         self.visual_mode = visual_mode
         self.collect_visual = self.visual_mode != "off"
         self.img_res = img_res
@@ -159,6 +177,19 @@ class IsaacG1Wrapper:
             else DEFAULT_TRAJECTORY_REGION_SEQUENCE
         )
         self.max_speed = max_speed
+        self._max_n_obstacles = max(1, int(getattr(args_cli, "max_n_obstacles", 2)))
+        self.arena_x_min = float(getattr(args_cli, "arena_x_min", DEFAULT_ARENA_BOUNDS[0]))
+        self.arena_x_max = float(getattr(args_cli, "arena_x_max", DEFAULT_ARENA_BOUNDS[1]))
+        self.arena_y_min = float(getattr(args_cli, "arena_y_min", DEFAULT_ARENA_BOUNDS[2]))
+        self.arena_y_max = float(getattr(args_cli, "arena_y_max", DEFAULT_ARENA_BOUNDS[3]))
+        self.perp_offset = float(getattr(args_cli, "perp_offset", DEFAULT_PERP_OFFSET_M))
+        self.perp_keepout = float(getattr(args_cli, "perp_keepout", DEFAULT_PERP_KEEPOUT_M))
+        self.min_start_goal_dist = float(
+            getattr(args_cli, "min_start_goal_dist", DEFAULT_MIN_START_GOAL_DIST)
+        )
+        self.obstacle_absent_prob = float(getattr(args_cli, "obstacle_absent_prob", 0.1))
+        self.two_obstacle_prob = float(getattr(args_cli, "two_obstacle_prob", 0.5))
+        self._spawn_yaw: float | None = None
 
         if demos_dir is None:
             demos_dir = os.path.join(
@@ -208,7 +239,7 @@ class IsaacG1Wrapper:
         self._Sdf = Sdf
         self._omni_usd = omni.usd
 
-        self._obstacle_names = list(OBSTACLE_SPECS.keys())
+        self._obstacle_names = [f"blue_bin_{i}" for i in range(self._max_n_obstacles)]
         self._depth_cam_names: list[str] = []
 
         if self.visual_mode == "depth_rgb":
@@ -238,7 +269,8 @@ class IsaacG1Wrapper:
         env_cfg.sim.render_interval = 1
         env_cfg.terminations.base_contact = None
 
-        add_blue_bin(env_cfg, pos=(2.0, 0.0, 0.5), index=0)
+        for i in range(self._max_n_obstacles):
+            add_blue_bin(env_cfg, pos=(2.0 + 0.05 * i, 0.0, _BIN_DEFAULT_Z), index=i)
 
         env_cfg.scene.robot_contact = ContactSensorCfg(
             prim_path="{ENV_REGEX_NS}/Robot/.*link.*",
@@ -346,7 +378,7 @@ class IsaacG1Wrapper:
         )
 
     def _set_obstacle_pose(self, name: str, pos: tuple[float, float, float]) -> None:
-        rot = OBSTACLE_SPECS[name]["rot"]
+        rot = _bin_spec(name)["rot"]
         obj = self.env.unwrapped.scene[name]
         obj.write_root_pose_to_sim(self._pose_tensor(pos, rot))
         if hasattr(obj, "write_root_velocity_to_sim"):
@@ -360,6 +392,61 @@ class IsaacG1Wrapper:
             trajectory_regions=self.trajectory_regions,
             trajectory_region_sequence=self.trajectory_region_sequence,
         )
+
+    def _choose_n_path_obstacles(self, rng: np.random.Generator) -> int:
+        absent_p = float(self.obstacle_absent_prob)
+        if absent_p > 0.0 and float(rng.random()) < absent_p:
+            return 0
+        max_n = min(2, int(self._max_n_obstacles))
+        if max_n <= 1:
+            return 1
+        if float(rng.random()) < float(self.two_obstacle_prob):
+            return 2
+        return 1
+
+    def _place_path_bins(
+        self,
+        rng: np.random.Generator,
+        start_xy: np.ndarray,
+        goal_xy: np.ndarray,
+    ) -> tuple[dict[str, tuple[float, float, float]], int, str]:
+        """Place 0/1/2 bins on one random side of the start→goal line."""
+        n = self._choose_n_path_obstacles(rng)
+        n = max(0, min(n, int(self._max_n_obstacles)))
+        if n <= 0:
+            side_name = "none"
+            xys: list[np.ndarray] = []
+        else:
+            side = 1 if float(rng.random()) < 0.5 else -1
+            side_name = "left" if side > 0 else "right"
+            xys = sample_perp_points_on_segment(
+                rng,
+                start_xy,
+                goal_xy,
+                n,
+                perp_offset=float(self.perp_offset),
+                perp_keepout=float(self.perp_keepout),
+                side=side,
+                x_min=float(self.arena_x_min),
+                x_max=float(self.arena_x_max),
+                y_min=float(self.arena_y_min),
+                y_max=float(self.arena_y_max),
+            )
+        self._n_obstacles = len(xys)
+        self._active_obstacles = list(self._obstacle_names[: self._n_obstacles])
+        obstacle_positions: dict[str, tuple[float, float, float]] = {}
+        for i, name in enumerate(self._obstacle_names):
+            z = float(_bin_spec(name)["default_z"])
+            if i < self._n_obstacles:
+                xy = xys[i]
+                pos = (float(xy[0]), float(xy[1]), z)
+            else:
+                pos = HIDDEN_OBSTACLE_POS
+            self._set_obstacle_pose(name, pos)
+            obstacle_positions[name] = pos
+        if self._n_obstacles > 0:
+            self._blue_bin_xy = (float(xys[0][0]), float(xys[0][1]))
+        return obstacle_positions, self._n_obstacles, side_name
 
     def _reset_stuck_counters(self) -> None:
         n = len(self._collision_link_indices)
@@ -403,23 +490,35 @@ class IsaacG1Wrapper:
         return False
 
     def reset_scene(self, seed: int | None = None) -> dict[str, Any]:
-        """Reset sim, place blue_bin obstacle, region waypoints, spawn at first waypoint."""
+        """Reset sim, sample a straight start→goal line, place bins on one side."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
         obs, _ = self.env.reset()
 
-        self.waypoints, self.waypoint_region_names = self._sample_waypoint_sequence(self._rng)
+        self.waypoints, self.waypoint_region_names, spawn_yaw = sample_start_goal_path(
+            self._rng,
+            x_min=float(self.arena_x_min),
+            x_max=float(self.arena_x_max),
+            y_min=float(self.arena_y_min),
+            y_max=float(self.arena_y_max),
+            min_start_goal_dist=float(self.min_start_goal_dist),
+        )
+        self._spawn_yaw = float(spawn_yaw)
         waypoint_list = waypoints_to_list(self.waypoints)
-        self.current_waypoint_idx = 0
-        self.waypoint = waypoint_list[0].copy()
         start_xy = waypoint_list[0]
+        goal_xy = waypoint_list[-1]
+        # Spawn is already on the start point; track the goal.
+        self.current_waypoint_idx = 1 if len(waypoint_list) > 1 else 0
+        self.waypoint = waypoint_list[self.current_waypoint_idx].copy()
 
         robot = self.env.unwrapped.scene["robot"]
         robot_xy = start_xy.copy()
+        half = 0.5 * float(spawn_yaw)
+        spawn_quat = (float(np.cos(half)), 0.0, 0.0, float(np.sin(half)))
         root_pose = self._pose_tensor(
             (float(robot_xy[0]), float(robot_xy[1]), 0.8),
-            (1.0, 0.0, 0.0, 0.0),
+            spawn_quat,
         )
         robot.write_root_pose_to_sim(root_pose)
         if hasattr(robot, "write_root_velocity_to_sim"):
@@ -428,23 +527,21 @@ class IsaacG1Wrapper:
             )
         self._reset_stuck_counters()
 
-        self._active_obstacles = list(self._obstacle_names)
-        obstacle_positions: dict[str, tuple[float, float, float]] = {}
-
-        for name in self._obstacle_names:
-            if name == "blue_bin_0":
-                x, y = self._blue_bin_xy
-            else:
-                x, y = OBSTACLE_SPECS[name]["spawn_xy"]
-            z = OBSTACLE_SPECS[name]["default_z"]
-            self._set_obstacle_pose(name, (x, y, z))
-            obstacle_positions[name] = (x, y, z)
+        obstacle_positions, n_obstacles, bin_side = self._place_path_bins(
+            self._rng, start_xy, goal_xy
+        )
 
         self.commands.zero_()
 
-        # Warm up physics/sensors after teleporting assets.
+        # RTX camera needs ~1/15s of sim time before RGB is valid.
         zero_actions = torch.zeros(1, self.num_joints, device=self.device)
-        for _ in range(3):
+        warmup_steps = 3
+        if self.visual_mode == "rtx_rgb":
+            cam_period = float(
+                getattr(self.camera.cfg, "update_period", 1.0 / 15.0) or (1.0 / 15.0)
+            )
+            warmup_steps = max(30, int(np.ceil(cam_period / max(self.sim_dt, 1e-6))) + 5)
+        for _ in range(warmup_steps):
             self.env.unwrapped.command_manager._terms["base_velocity"].command[:] = self.commands
             obs, _, _, _ = self.env.step(zero_actions)
 
@@ -453,7 +550,11 @@ class IsaacG1Wrapper:
 
         return {
             "active_obstacles": list(self._active_obstacles),
+            "n_obstacles": int(n_obstacles),
+            "bin_side": bin_side,
             "robot_xy": robot_xy,
+            "goal_xy": np.asarray(goal_xy, dtype=np.float64).copy(),
+            "spawn_yaw": float(spawn_yaw),
             "obstacle_positions": obstacle_positions,
             "waypoint": self.waypoint.copy(),
             "waypoints": self.waypoints.copy(),
@@ -530,7 +631,7 @@ class IsaacG1Wrapper:
     def get_raw_obs(self) -> dict[str, np.ndarray]:
         if not self.collect_visual:
             raise RuntimeError(
-                f"visual_mode={self.visual_mode!r} — set --visual_mode depth_rgb (default on cluster)."
+                f"visual_mode={self.visual_mode!r} — set --visual_mode rtx_rgb."
             )
 
         if self.visual_mode == "rtx_rgb":
