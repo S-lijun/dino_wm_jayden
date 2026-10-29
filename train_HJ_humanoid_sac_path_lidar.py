@@ -429,6 +429,15 @@ parser.add_argument(
     help="Optional BC of actor mean to waypoint acts before joint SAC. Default 0.",
 )
 parser.add_argument(
+    "--nom_reg_coef",
+    type=float,
+    default=0.0,
+    help=(
+        "λ for MSE(a_sf, a_nom) on every actor update, safe and unsafe. "
+        "Pulls π toward the waypoint action. Default 0 (disabled)."
+    ),
+)
+parser.add_argument(
     "--action_reg_coef",
     type=float,
     default=0.0,
@@ -901,6 +910,7 @@ def main():
     policy.warmup = False
     policy._attach_act_nom = False
     action_reg_coef = float(args.action_reg_coef)
+    nom_reg_coef = float(getattr(args, "nom_reg_coef", 0.0))
     boundary_reg_coef = float(args.boundary_reg_coef)
     freeze_yaw = bool(getattr(args, "freeze_yaw", False))
     freeze_vy = bool(getattr(args, "freeze_vy", False))
@@ -1221,6 +1231,15 @@ def main():
             nom_reg = act.new_zeros(())
             good_reg = act.new_zeros(())
             boundary_reg = act.new_zeros(())
+            if nom_reg_coef > 0.0:
+                act_nom_t = _batch_act_nom_tensor(batch, act).detach()
+                if int(act_nom_t.numel()) != int(act.numel()):
+                    raise RuntimeError(
+                        f"a_nom numel {int(act_nom_t.numel())} != act {tuple(act.shape)}"
+                    )
+                act_nom_t = act_nom_t.reshape(act.shape)
+                nom_reg = (act - act_nom_t).pow(2).mean()
+                actor_loss = actor_loss + nom_reg_coef * nom_reg
             if action_reg_coef > 0.0 or boundary_reg_coef > 0.0:
                 if action_reg_coef > 0.0:
                     # HJ(Q(a_nom))<0, any collect controller: pull π toward frozen a_good.
@@ -1284,6 +1303,7 @@ def main():
         f"[INFO] SAC avoid SF (path pipeline): gamma={args.gamma_pyhj}, "
         f"auto_alpha={use_auto_alpha}, alpha={args.alpha}, "
         f"critic_warmup={args.critic_warmup_updates}, "
+        f"λ_nom={nom_reg_coef} (MSE(a_sf, a_nom) every update), "
         f"λ_good={action_reg_coef} (any controller, HJ(Q(a_nom))<0; "
         f"freeze a_good until HJ>=0, hold_steps="
         f"{int(getattr(args, 'a_good_hold_steps', 0))}), "
