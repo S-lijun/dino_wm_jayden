@@ -48,9 +48,13 @@ def configure_headless_cameras(args_cli, *, verbose: bool = True) -> None:
         args_cli.rendering_mode = "performance"
         #args_cli.rendering_mode = None
 
-    # HPC kit args (RaytracedLighting + multiGpu off) are for Linux cluster nodes.
+    # HPC kit args are for Slurm/shared-GPU nodes. Desktop GeForce: set ISAAC_HPC_RTX=1 to enable.
     # On Windows laptops they often break Replicator RGB (overscan NoneType).
-    default_hpc = os.name != "nt"
+    default_hpc = os.name != "nt" and os.environ.get("ISAAC_HPC_RTX", "0").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
     if hasattr(args_cli, "hpc_gs_rgb") and args_cli.hpc_gs_rgb is not None:
         use_hpc_gs = bool(args_cli.hpc_gs_rgb)
     else:

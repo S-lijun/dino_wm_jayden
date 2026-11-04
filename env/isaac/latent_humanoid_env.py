@@ -136,6 +136,18 @@ class LatentHumanoidEnv(gym.Env):
             self.lidar_encoder = SpUNetLidarEncoder(str(ckpt), device)
             self.wm = None
             self._freeze_proprio_encoder()
+        elif self.obs_mode == "wm_spunet":
+            if wm is None:
+                raise ValueError("obs_mode='wm_spunet' requires the DINO world model.")
+            self.wm.eval()
+            for p in self.wm.parameters():
+                p.requires_grad = False
+            from env.isaac.spunet_encoder import SpUNetLidarEncoder
+
+            ckpt = getattr(args, "spunet_ckpt", None)
+            if not ckpt:
+                raise ValueError("obs_mode='wm_spunet' requires args.spunet_ckpt")
+            self.lidar_encoder = SpUNetLidarEncoder(str(ckpt), device)
         else:
             raise ValueError(f"Unknown obs_mode={self.obs_mode!r}")
         self.max_episode_sim_steps = int(
@@ -1687,6 +1699,8 @@ class LatentHumanoidEnv(gym.Env):
         """Single-frame encode. No temporal average."""
         if self.obs_mode == "lidar_joint":
             return self.wrapper.get_lidar_joint_state()
+        if self.obs_mode == "wm_spunet":
+            return self._encode_wm_spunet(obs)
         if self.obs_mode in ("lidar_utonia", "lidar_pointnet2", "lidar_spunet"):
             return self._encode_frozen_lidar(obs)
 
@@ -1720,7 +1734,9 @@ class LatentHumanoidEnv(gym.Env):
         on the same hits, optional frozen proprio encoder.
         ``obs_mode=lidar_spunet``: frozen ScanNet SpUNet (96-D, no class head)
         on the same hits, optional frozen proprio encoder.
-        When ``z_fuse_frames`` > 1, return the mean of the last N full z.
+        ``obs_mode=wm_spunet``: cat(DINO visual, SpUNet 96-D, proprio).
+        Action is still outside z. When ``z_fuse_frames`` > 1, return the
+        mean of the last N full z.
         """
         return self._fuse_z(self._encode_current(obs))
 
@@ -1763,6 +1779,38 @@ class LatentHumanoidEnv(gym.Env):
                 z = torch.cat([z_lidar, z_prop], dim=0)
             else:
                 z = z_lidar
+        return z.detach().cpu().numpy().astype(np.float32)
+
+    def _encode_wm_spunet(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """z = DINO(RGB) ‖ SpUNet(xyz) ‖ proprio. Action is not in z."""
+        if self.wm is None or self.lidar_encoder is None:
+            raise RuntimeError("vision and lidar encoders are not loaded")
+        visual, proprio = self._split_raw_obs(obs)
+        if visual is None:
+            raise RuntimeError(
+                "wm_spunet needs an RGB frame. Keep --visual_mode rtx_rgb."
+            )
+        with torch.no_grad():
+            vis_np = self._visual_to_normalized_chw(visual)
+            vis_t = torch.from_numpy(vis_np).unsqueeze(0).unsqueeze(1).to(self.device)
+            if isinstance(proprio, torch.Tensor):
+                prop_t = proprio.unsqueeze(0).unsqueeze(1).float().to(self.device)
+            else:
+                prop_t = (
+                    torch.from_numpy(np.asarray(proprio, dtype=np.float32))
+                    .unsqueeze(0)
+                    .unsqueeze(1)
+                    .to(self.device)
+                )
+            lat = self._encode_obs_visual(vis_t, prop_t)
+            z_vis = lat["visual"].reshape(-1)
+            z_lidar = self.lidar_encoder.encode(
+                self.wrapper.get_lidar_points_sensor()
+            ).reshape(-1)
+            parts = [z_vis, z_lidar]
+            if self.with_proprio:
+                parts.append(lat["proprio"].reshape(-1))
+            z = torch.cat(parts, dim=0)
         return z.detach().cpu().numpy().astype(np.float32)
 
     def _encode_obs_visual(self, vis_t: torch.Tensor, prop_t: torch.Tensor):

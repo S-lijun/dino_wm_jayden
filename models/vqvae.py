@@ -165,6 +165,32 @@ class Decoder(nn.Module):
         return self.blocks(input)
 
 
+class CLSImageDecoder(nn.Module):
+    """One emb_dim vector -> RGB image. Five stride-2 layers, ×32."""
+
+    def __init__(self, emb_dim: int, out_h: int, out_w: int, channel: int):
+        super().__init__()
+        if out_h % 32 or out_w % 32:
+            raise ValueError(f"CLS decoder size must be divisible by 32, got {out_h}x{out_w}")
+        self.base_h = out_h // 32
+        self.base_w = out_w // 32
+        self.channel = channel
+        self.fc = nn.Linear(emb_dim, channel * self.base_h * self.base_w)
+        layers = []
+        ch = channel
+        for i in range(5):
+            out_ch = 3 if i == 4 else max(ch // 2, 3)
+            layers.append(nn.ConvTranspose2d(ch, out_ch, 4, stride=2, padding=1))
+            if i < 4:
+                layers.append(nn.ReLU(inplace=True))
+            ch = out_ch
+        self.up = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.fc(z).view(-1, self.channel, self.base_h, self.base_w)
+        return self.up(x)
+
+
 class VQVAE(nn.Module):
     def __init__(
         self,
@@ -178,10 +204,18 @@ class VQVAE(nn.Module):
         quantize=True,
         n_patches_h: Optional[int] = None,
         n_patches_w: Optional[int] = None,
+        from_cls: bool = False,
+        out_h: Optional[int] = None,
+        out_w: Optional[int] = None,
     ):
         super().__init__()
         self.n_patches_h = n_patches_h
         self.n_patches_w = n_patches_w
+        self.cls_decoder = None
+        if from_cls:
+            if out_h is None or out_w is None:
+                raise ValueError("from_cls decoder needs out_h and out_w")
+            self.cls_decoder = CLSImageDecoder(emb_dim, int(out_h), int(out_w), channel)
 
         self.quantize = quantize
         self.quantize_b = Quantize(emb_dim, n_embed)
@@ -205,6 +239,13 @@ class VQVAE(nn.Module):
         '''
             input: (b, t, num_patches, emb_dim)
         '''
+        if self.cls_decoder is not None:
+            b, t, n_tok, e = input.shape
+            if n_tok != 1:
+                raise RuntimeError(f"CLS decoder expects 1 token, got {n_tok}")
+            dec = self.cls_decoder(input.reshape(b * t, e))
+            diff = torch.zeros(1, device=input.device).unsqueeze(0)
+            return dec, diff
         num_patches = input.shape[2]
         if self.n_patches_h is not None and self.n_patches_w is not None:
             h, w = self.n_patches_h, self.n_patches_w

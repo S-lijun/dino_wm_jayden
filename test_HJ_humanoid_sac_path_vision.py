@@ -248,6 +248,14 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--tie_vy_yaw",
+    action="store_true",
+    help=(
+        "Match a --tie_vy_yaw train run: actor is (vx, u), and u is copied "
+        "onto yaw before map_action. Required to load that checkpoint."
+    ),
+)
+parser.add_argument(
     "--freeze_vy",
     action="store_true",
     default=False,
@@ -484,6 +492,8 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
 
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
+    tie_vy_yaw = bool(getattr(args, "tie_vy_yaw", False))
+    actor_action_shape = (2,) if tie_vy_yaw else action_shape
     actor_net = Net(
         state_shape,
         hidden_sizes=args.control_net,
@@ -491,7 +501,11 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
         device=device,
     )
     actor1 = ActorProb(
-        actor_net, action_shape, max_action=1.0, unbounded=True, device=device
+        actor_net,
+        actor_action_shape,
+        max_action=1.0,
+        unbounded=True,
+        device=device,
     ).to(device)
     actor1_optim = torch.optim.AdamW(actor1.parameters(), lr=float(args.actor_lr))
     policy = avoid_SACPolicy_annealing(
@@ -511,6 +525,21 @@ def build_policy(env: LatentHumanoidEnv, args, device: str):
         actor1_optim=actor1_optim,
     )
     policy.critic = policy.critic1
+    if tie_vy_yaw:
+        orig_forward = policy.forward
+
+        def _tied_forward(batch, state=None, input="obs", **kwargs):
+            out = orig_forward(batch, state=state, input=input, **kwargs)
+            act = out.act
+            if isinstance(act, torch.Tensor) and act.shape[-1] == 2:
+                out.act = torch.cat([act, act[..., 1:2]], dim=-1)
+            return out
+
+        policy.forward = _tied_forward
+        print(
+            "[INFO] tie_vy_yaw: loaded 2D actor (vx, u); "
+            "u maps to both vy and yaw_rate."
+        )
     return policy
 
 
@@ -1307,6 +1336,42 @@ def sample_path_eval_layout(
     }
 
 
+def _save_trial_positions(
+    out_dir: Path, result: dict, layout: dict, trial_seed: int
+) -> Path:
+    """XY of one rollout, plus the scene, so later plots can overlay runs."""
+    traj_dir = out_dir / "trajs"
+    traj_dir.mkdir(parents=True, exist_ok=True)
+    tag = result.get("file_tag") or f"run{int(result['run_id']):02d}"
+    mode = str(result["mode"])
+    path = traj_dir / f"{tag}_{mode}.npz"
+    obstacles = np.asarray(layout.get("obstacle_xys") or [], dtype=np.float64)
+    if obstacles.size == 0:
+        obstacles = np.zeros((0, 2), dtype=np.float64)
+    else:
+        obstacles = obstacles.reshape(-1, 2)
+    xy = np.asarray(result["traj"], dtype=np.float64).reshape(-1, 2)
+    use_sf = np.asarray(result["use_sf"], dtype=bool).reshape(-1)
+    # xy[0] is the spawn, before any action. use_sf[i] marks the step that reached xy[i].
+    if use_sf.shape[0] + 1 == xy.shape[0]:
+        use_sf = np.concatenate([np.zeros(1, dtype=bool), use_sf])
+    np.savez_compressed(
+        path,
+        xy=xy,
+        use_sf=use_sf,
+        waypoints=np.asarray(layout["waypoints"], dtype=np.float64).reshape(-1, 2),
+        obstacle_xys=obstacles,
+        spawn_yaw=np.float64(layout.get("spawn_yaw", np.nan)),
+        trial_seed=np.int64(trial_seed),
+        run_id=np.int64(result["run_id"]),
+        mode=np.array(mode),
+        end_reason=np.array(str(result["end_reason"])),
+        success=np.bool_(result["success"]),
+        success_strict=np.bool_(result["success_strict"]),
+    )
+    return path
+
+
 def _save_compare_traj(
     *,
     out_path: Path,
@@ -1489,6 +1554,7 @@ def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
     lines = [
         "METRICS",
         "  success_rate: reached goal without 360° bin-center distance < success_fail_radius",
+        "  success_rate_strict: reached goal without entering any bin-center circle of radius 1 m",
         "  collision_rate: contact steps / session steps (h_s <= contact_hs), then mean over sessions",
         "  avg_velocity_mps: mean XY speed inside a session, then mean over all sessions",
         "  sf_step_ratio: SF steps / session steps, then mean over sessions",
@@ -1515,6 +1581,8 @@ def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
             continue
         n_ok = sum(1 for r in rs if r["success"])
         success_rate = n_ok / n
+        n_ok_strict = sum(1 for r in rs if r["success_strict"])
+        success_rate_strict = n_ok_strict / n
         collision_rate, n_col = _mean_finite([r["collision_rate"] for r in rs])
         velocity, n_vel = _mean_finite([r["mean_speed_mps"] for r in rs])
         sf_ratio, n_sf = _mean_finite([r["sf_step_ratio"] for r in rs])
@@ -1524,6 +1592,7 @@ def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
             [
                 f"[{name}] n={n}",
                 f"  success_rate={success_rate:.3f} ({n_ok}/{n})",
+                f"  success_rate_strict={success_rate_strict:.3f} ({n_ok_strict}/{n})",
                 f"  collision_rate={_fmt(collision_rate)} (n={n_col})",
                 f"  avg_velocity_mps={_fmt(velocity)} (n={n_vel})",
                 f"  sf_step_ratio={_fmt(sf_ratio)} (n={n_sf})",
@@ -1534,6 +1603,7 @@ def _metrics_block(results: list[dict], modes: list[str]) -> list[str]:
             tag = r.get("file_tag") or f"run{int(r['run_id']):02d}"
             lines.append(
                 f"  {tag}: success={int(bool(r['success']))} "
+                f"success_strict={int(bool(r['success_strict']))} "
                 f"collision_rate={_fmt(float(r['collision_rate']))} "
                 f"({r['n_contact_steps']}/{r['n_steps']}) "
                 f"speed={_fmt(float(r['mean_speed_mps']))} "
@@ -1553,6 +1623,7 @@ def _write_session_metrics(path: Path, results: list[dict]) -> None:
         "tag",
         "run_id",
         "success",
+        "success_strict",
         "end_reason",
         "n_steps",
         "n_contact_steps",
@@ -1581,6 +1652,7 @@ def _write_session_metrics(path: Path, results: list[dict]) -> None:
                     "tag": tag,
                     "run_id": int(r["run_id"]),
                     "success": int(bool(r["success"])),
+                    "success_strict": int(bool(r["success_strict"])),
                     "end_reason": r["end_reason"],
                     "n_steps": int(r["n_steps"]),
                     "n_contact_steps": int(r["n_contact_steps"]),
@@ -1591,6 +1663,65 @@ def _write_session_metrics(path: Path, results: list[dict]) -> None:
                     "sf_step_ratio": _cell(float(r["sf_step_ratio"])),
                     "min_clearance_m": _cell(float(r["min_clearance_m"])),
                     "min_failset_m": _cell(float(r["min_failset_m"])),
+                }
+            )
+
+
+def _write_summary_metrics(path: Path, results: list[dict], modes: list[str]) -> None:
+    """One row per mode. Columns are the aggregate metrics."""
+    fields = [
+        "mode",
+        "n",
+        "success_rate",
+        "success_rate_strict",
+        "collision_rate",
+        "avg_velocity_mps",
+        "sf_step_ratio",
+        "min_clearance_m",
+    ]
+    labels = {
+        "waypoint_only": "nominal",
+        "switching": "switching",
+        "safe_only": "sf_only",
+    }
+
+    def _mean_finite(xs: list[float]) -> float:
+        vals = [float(x) for x in xs if np.isfinite(x)]
+        if not vals:
+            return float("nan")
+        return float(np.mean(vals))
+
+    def _cell(x: float) -> str:
+        return "" if not np.isfinite(x) else f"{x:.6f}"
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for mode in modes:
+            rs = [r for r in results if r["mode"] == mode]
+            n = len(rs)
+            if n == 0:
+                continue
+            writer.writerow(
+                {
+                    "mode": labels.get(mode, mode),
+                    "n": n,
+                    "success_rate": _cell(sum(1 for r in rs if r["success"]) / n),
+                    "success_rate_strict": _cell(
+                        sum(1 for r in rs if r["success_strict"]) / n
+                    ),
+                    "collision_rate": _cell(
+                        _mean_finite([r["collision_rate"] for r in rs])
+                    ),
+                    "avg_velocity_mps": _cell(
+                        _mean_finite([r["mean_speed_mps"] for r in rs])
+                    ),
+                    "sf_step_ratio": _cell(
+                        _mean_finite([r["sf_step_ratio"] for r in rs])
+                    ),
+                    "min_clearance_m": _cell(
+                        _mean_finite([r["min_clearance_m"] for r in rs])
+                    ),
                 }
             )
 
@@ -1767,6 +1898,10 @@ def simulate_one(
         np.isfinite(min_failset) and min_failset < float(success_fail_radius)
     )
     success = end_reason == "all_waypoints" and not entered_fail_margin
+    entered_strict_margin = bool(
+        np.isfinite(min_failset) and min_failset < 1.0
+    )
+    success_strict = end_reason == "all_waypoints" and not entered_strict_margin
     sf_step_ratio = (
         float(n_sf_steps) / float(n_steps) if n_steps else float("nan")
     )
@@ -1777,6 +1912,7 @@ def simulate_one(
         "file_tag": tag,
         "end_reason": end_reason,
         "success": success,
+        "success_strict": success_strict,
         "visual_steps": int(info.get("episode_step", step + 1)),
         "hj_interventions": hj_interventions,
         "total_switches": total_switches,
@@ -2009,6 +2145,8 @@ def main():
                 success_fail_radius=float(args.success_fail_radius),
             )
             results.append(r)
+            saved = _save_trial_positions(out_dir, r, layout, trial_seed)
+            print(f"[INFO] Saved traj: {saved}")
             mode_trajs[mode] = r["traj"]
             mode_ends[mode] = r["end_reason"]
             mode_use_sf[mode] = r["use_sf"]
@@ -2121,10 +2259,15 @@ def main():
         "metrics_compare.csv" if args.mode == "compare" else f"metrics_{args.mode}.csv"
     )
     _write_session_metrics(metrics_path, results)
+    summary_csv_path = out_dir / (
+        "summary_compare.csv" if args.mode == "compare" else f"summary_{args.mode}.csv"
+    )
+    _write_summary_metrics(summary_csv_path, results, modes)
     print("\n" + "=" * 60)
     print(text)
     print(f"[INFO] Wrote {summary_path}")
     print(f"[INFO] Wrote {metrics_path}")
+    print(f"[INFO] Wrote {summary_csv_path}")
 
     env.close()
     simulation_app.close()

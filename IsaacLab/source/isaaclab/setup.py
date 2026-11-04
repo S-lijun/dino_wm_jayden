@@ -37,12 +37,12 @@ INSTALL_REQUIRES = [
     # make sure this is consistent with isaac sim version
     "pillow==11.3.0",
     # livestream
-    "starlette==0.49.1",
+    "starlette>=0.40.0,<0.46.0",  # isaacsim-kernel pins fastapi==0.115.7
     # testing
     "pytest",
     "pytest-mock",
     "junitparser",
-    "flatdict==4.0.1",
+    "flatdict==4.1.0",  # 4.0.1 is sdist-only; fails under pip build isolation (pkg_resources)
     "flaky",
 ]
 

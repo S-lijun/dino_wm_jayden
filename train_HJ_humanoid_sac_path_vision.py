@@ -416,6 +416,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--tie_vy_yaw",
+    action="store_true",
+    help=(
+        "Actor emits (vx, u) only. One score s=(u+1)/2 in (0,1) is mapped "
+        "to both vy and yaw_rate, so they always share a sign. "
+        "vy=(2s-1)*0.5, yaw=(2s-1)*yaw_limit. Critic still sees the 3D action."
+    ),
+)
+parser.add_argument(
     "--freeze_vy",
     action="store_true",
     help=(
@@ -776,6 +785,15 @@ def main():
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
 
+    tie_vy_yaw = bool(getattr(args, "tie_vy_yaw", False))
+    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
+    freeze_vy = bool(getattr(args, "freeze_vy", False))
+    if tie_vy_yaw and (freeze_yaw or freeze_vy):
+        raise SystemExit(
+            "[ERROR] --tie_vy_yaw cannot be combined with --freeze_vy or --freeze_yaw"
+        )
+    # Critic / env stay 3D. Tied actor samples only (vx, u).
+    actor_action_shape = (2,) if tie_vy_yaw else action_shape
     actor_net = Net(
         state_shape,
         hidden_sizes=args.control_net,
@@ -785,7 +803,7 @@ def main():
     # unbounded=True: mu in R, tanh applied inside SACPolicy.forward (standard SAC).
     actor1 = ActorProb(
         actor_net,
-        action_shape,
+        actor_action_shape,
         max_action=1.0,
         unbounded=True,
         device=args.device,
@@ -793,7 +811,7 @@ def main():
     actor1_optim = torch.optim.AdamW(actor1.parameters(), lr=args.actor_lr)
 
     if use_auto_alpha:
-        target_entropy = float(-np.prod(action_shape))
+        target_entropy = float(-np.prod(actor_action_shape))
         log_alpha = torch.zeros(1, requires_grad=True, device=args.device)
         alpha_optim = torch.optim.Adam([log_alpha], lr=float(args.alpha_lr))
         alpha_arg = (target_entropy, log_alpha, alpha_optim)
@@ -823,8 +841,13 @@ def main():
     policy._attach_act_nom = False
     action_reg_coef = float(args.action_reg_coef)
     boundary_reg_coef = float(args.boundary_reg_coef)
-    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
-    freeze_vy = bool(getattr(args, "freeze_vy", False))
+    if tie_vy_yaw:
+        print(
+            "[INFO] tie_vy_yaw: actor outputs (vx, u) in (-1, 1). "
+            "s=(u+1)/2 in (0, 1) maps to vy=(2s-1)*0.5 and "
+            "yaw=(2s-1)*yaw_limit, so the two always share a sign. "
+            f"target entropy {float(-np.prod(actor_action_shape)):.0f}."
+        )
     if freeze_vy and use_auto_alpha:
         # log π is over (vx, yaw) only; do not spend entropy budget on vy.
         policy._target_entropy = -2.0
@@ -837,6 +860,18 @@ def main():
             f"(MSE(a_sf, a_nom) if Q>=thr else MSE(a_sf, a_good))."
         )
         boundary_reg_coef = 0.0
+
+    def _tie_vy_yaw_act(act):
+        """Expand (vx, u) to (vx, u, u) in policy space. map_action then scales both."""
+        if isinstance(act, torch.Tensor):
+            if act.shape[-1] != 2:
+                return act
+            return torch.cat([act, act[..., 1:2]], dim=-1)
+        arr = np.asarray(act, dtype=np.float32)
+        if arr.shape[-1] != 2:
+            return arr
+        u = arr[..., 1:2]
+        return np.concatenate([arr, u], axis=-1)
 
     def _zero_yaw_act(act):
         """Force yaw (dim 2) to 0 in policy-space actions (tensor or ndarray)."""
@@ -1061,6 +1096,9 @@ def main():
     def _sac_forward(batch, state=None, input="obs", **kwargs):
         """SAC forward; collect may execute waypoint or Q-gate switch."""
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
+        if tie_vy_yaw:
+            # log π stays the 2D Gaussian; critic and env see the expanded 3D action.
+            out.act = _tie_vy_yaw_act(out.act)
         if freeze_yaw:
             out.act = _zero_yaw_act(out.act)
         if freeze_vy:

@@ -1043,12 +1043,13 @@ class IsaacG1Wrapper:
         reuse that bin pose + waypoint sequence instead of resampling — used by
         multi-mode eval so SF / waypoint / switching see the same scene.
         """
-        if seed is not None:
-            # Path layout: do not reseed from yaml train seed=0, or every
-            # bash run repeats the same buffer trajectories.
-            use_path = self._is_path_pipeline()
-            if not use_path:
-                self._rng = np.random.default_rng(seed)
+        if seed is not None and (
+            not self._is_path_pipeline() or fixed_layout is not None
+        ):
+            # Training path resets stay unseeded so episodes do not repeat.
+            # Eval passes fixed_layout and a trial seed, so |v| matches
+            # across the three observation modes.
+            self._rng = np.random.default_rng(int(seed))
 
         self._advance_collect_controller()
         self._n_scene_resets = int(self._n_scene_resets) + 1

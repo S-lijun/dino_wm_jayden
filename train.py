@@ -367,12 +367,23 @@ class Trainer:
                     log.info(f"Loaded decoder from {decoder_path}")
                 else:
                     img_h, img_w = int(self.cfg.img_h), int(self.cfg.img_w)
+                    from_cls = int(getattr(self.encoder, "latent_ndim", 2)) == 1
                     self.decoder = hydra.utils.instantiate(
                         self.cfg.decoder,
                         emb_dim=self.encoder.emb_dim,
                         n_patches_h=img_h // 16,
                         n_patches_w=img_w // 16,
+                        from_cls=from_cls,
+                        out_h=img_h,
+                        out_w=img_w,
                     )
+                    if from_cls:
+                        log.info(
+                            "CLS decoder: 1x%d -> image %dx%d",
+                            int(self.encoder.emb_dim),
+                            img_h,
+                            img_w,
+                        )
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False

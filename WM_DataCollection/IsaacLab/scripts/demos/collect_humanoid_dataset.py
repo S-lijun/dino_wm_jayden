@@ -15,6 +15,9 @@ from isaaclab.app import AppLauncher
 # Matches DataCollection_test.py camera_fps / next_camera_time_s gating.
 DEFAULT_CAMERA_FPS = 15.0
 OBSES_15FPS_DIRNAME = "obses_15fps"
+# Saved frames match wm_ckpt_18-27-17 (img_h, img_w). Full sensor frames are ~6x larger.
+SAVE_IMG_H = 192
+SAVE_IMG_W = 256
 
 parser = argparse.ArgumentParser(description="Collect humanoid G1 offline trajectories.")
 cli_args.add_rsl_rl_args(parser)
@@ -92,13 +95,16 @@ parser.add_argument(
     "--perp_offset",
     type=float,
     default=1.5,
-    help="Outer |offset| (m) of bins from the start-goal line. Vision train uses 1.0.",
+    help="Outer |offset| (m) of bins from the start-goal line.",
 )
 parser.add_argument(
     "--perp_keepout",
     type=float,
-    default=0.25,
-    help="Inner keep-out (m). Bin |offset| ~ U[this, perp_offset].",
+    default=0.0,
+    help=(
+        "Inner keep-out (m). Bin |offset| ~ U[this, perp_offset]. "
+        "0 lets a bin sit on the start-goal line, directly ahead of the robot."
+    ),
 )
 parser.add_argument("--min_start_goal_dist", type=float, default=5.0)
 parser.add_argument("--max_n_obstacles", type=int, default=2)
@@ -115,6 +121,11 @@ parser.add_argument(
     action="store_true",
     help="Also save per-control-step obses/ (default: only obses_15fps/).",
 )
+parser.add_argument(
+    "--save_video",
+    action="store_true",
+    help="Write videos/episode_XXXX.mp4 at --camera_fps and a first-frame PNG.",
+)
 args_cli, _ = parser.parse_known_args()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -128,6 +139,7 @@ simulation_app = app_launcher.app
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 
 from env.isaac.isaac_g1_wrapper import IsaacG1Wrapper
@@ -149,6 +161,44 @@ def subsample_frame_indices(num_frames: int, sim_dt: float, camera_fps: float) -
     return indices
 
 
+def _resize_uint8_hwc(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """(T, H, W, C) uint8 -> (T, height, width, C) uint8."""
+    if frames.ndim != 4:
+        raise ValueError(f"expected (T,H,W,C), got {tuple(frames.shape)}")
+    if int(frames.shape[1]) == height and int(frames.shape[2]) == width:
+        return frames
+    x = frames.permute(0, 3, 1, 2).float()
+    x = F.interpolate(x, size=(height, width), mode="bilinear", align_corners=False)
+    return x.permute(0, 2, 3, 1).clamp(0, 255).to(torch.uint8)
+
+
+def _frame_uint8(frame: torch.Tensor) -> np.ndarray:
+    arr = frame.detach().cpu().numpy()
+    if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.dtype != np.uint8:
+        scale = 255.0 if float(np.max(arr)) <= 1.0 else 1.0
+        arr = (arr * scale).clip(0, 255).astype(np.uint8)
+    return np.ascontiguousarray(arr)
+
+
+def _save_episode_preview(frames: torch.Tensor, video_dir: Path, ep: int, fps: float) -> None:
+    """15 Hz frames -> first PNG plus an mp4 that can be opened directly."""
+    if frames.shape[0] == 0:
+        return
+    video_dir.mkdir(parents=True, exist_ok=True)
+    images = [_frame_uint8(frames[i]) for i in range(int(frames.shape[0]))]
+    png_path = video_dir / f"episode_{ep:04d}_first.png"
+    from PIL import Image
+
+    Image.fromarray(images[0]).save(png_path)
+    mp4_path = video_dir / f"episode_{ep:04d}.mp4"
+    import imageio.v2 as imageio
+
+    imageio.mimsave(str(mp4_path), images, fps=max(1, int(round(fps))))
+    print(f"[INFO] preview png={png_path} video={mp4_path} frames={len(images)}")
+
+
 def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: int):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -156,8 +206,11 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
     if args_cli.save_full_obses:
         obses_dir.mkdir(exist_ok=True)
     obses_15fps_dir = output_path / OBSES_15FPS_DIRNAME
+    video_dir = output_path / "videos"
     if _visual_mode != "off":
         obses_15fps_dir.mkdir(exist_ok=True)
+    if args_cli.save_video and _visual_mode != "off":
+        video_dir.mkdir(exist_ok=True)
 
     wrapper = IsaacG1Wrapper(
         args_cli,
@@ -210,7 +263,6 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
             episode_actions.append(torch.from_numpy(cmd))
             _, _, _, step_info = wrapper.apply_velocity_command(cmd)
 
-            # Post-step labels (matches DataCollection_test.py after env.step).
             episode_states.append(torch.from_numpy(wrapper.get_full_state()))
             episode_costs.append(torch.tensor(wrapper.calculate_cost(), dtype=torch.float32))
 
@@ -236,14 +288,20 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
         all_states.append(torch.stack(episode_states))
         all_costs.append(torch.stack(episode_costs))
         seq_lengths.append(len(episode_actions))
-        if args_cli.save_full_obses:
-            torch.save(torch.stack(episode_obs).cpu(), obses_dir / f"episode_{ep}.pth")
         if _visual_mode != "off":
             idx_15 = subsample_frame_indices(
                 len(episode_obs), wrapper.sim_dt, args_cli.camera_fps
             )
             obs_15 = torch.stack([episode_obs[i] for i in idx_15]).cpu()
+            obs_15 = _resize_uint8_hwc(obs_15, SAVE_IMG_H, SAVE_IMG_W)
             torch.save(obs_15, obses_15fps_dir / f"episode_{ep}.pth")
+            if args_cli.save_video:
+                _save_episode_preview(obs_15, video_dir, ep, args_cli.camera_fps)
+        if args_cli.save_full_obses:
+            full = _resize_uint8_hwc(torch.stack(episode_obs).cpu(), SAVE_IMG_H, SAVE_IMG_W)
+            torch.save(full, obses_dir / f"episode_{ep}.pth")
+        # Drop the full-resolution frames before the next episode.
+        episode_obs.clear()
 
         if (ep + 1) % 50 == 0:
             print(
@@ -259,8 +317,8 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
     state_dim = all_states[0].shape[-1]
 
     padded_actions = torch.zeros(len(all_actions), max_len, action_dim)
-    padded_states = torch.zeros(len(all_actions), max_len, state_dim)
-    padded_costs = torch.zeros(len(all_actions), max_len)
+    padded_states = torch.zeros(len(all_states), max_len, state_dim)
+    padded_costs = torch.zeros(len(all_costs), max_len)
 
     for i, (actions, states, costs) in enumerate(zip(all_actions, all_states, all_costs)):
         length = len(actions)
@@ -275,11 +333,12 @@ def collect_episodes(num_episodes: int, max_steps: int, output_dir: str, seed: i
     torch.save(
         {
             "proprio_dim": wrapper.proprio_dim,
-            "visual_size": wrapper.visual_output_size,
+            "visual_size": (SAVE_IMG_H, SAVE_IMG_W),
             "sensor_img_res": wrapper.img_res,
             "control_fps": 1.0 / wrapper.sim_dt,
             "visual_fps": args_cli.camera_fps,
             "save_full_obses": args_cli.save_full_obses,
+            "save_video": bool(args_cli.save_video),
             "obses_15fps_dir": OBSES_15FPS_DIRNAME,
             "action_dim": action_dim,
             "state_dim": state_dim,

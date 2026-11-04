@@ -17,6 +17,7 @@ Layout:
   the frozen WM proprio encoder. ``lidar_utonia`` is 576-D.
   ``lidar_pointnet2`` is PointNet++ set abstraction, 1024-D, no class head.
   ``lidar_spunet`` is ScanNet SpUNet before the class head, 96-D.
+  ``wm_spunet`` concatenates DINO z_vision, that 96-D lidar feature, then proprio.
   Actor sees that state. Critic is Q(z, a) with a = (vx, vy, yaw_rate),
   default fusion ``concat``. The world-model predictor is not loaded and
   z_{t+1} is not used.
@@ -52,12 +53,13 @@ parser.add_argument(
     "--obs_mode",
     type=str,
     default="lidar_utonia",
-    choices=["lidar_utonia", "lidar_pointnet2", "lidar_spunet"],
+    choices=["lidar_utonia", "lidar_pointnet2", "lidar_spunet", "wm_spunet"],
     help=(
         "lidar_utonia: frozen Utonia, 576-D. "
         "lidar_pointnet2: frozen PointNet++ feature, 1024-D. "
         "lidar_spunet: frozen ScanNet SpUNet feature, 96-D. "
-        "All concat the WM proprio encoder."
+        "wm_spunet: cat(DINO visual, SpUNet 96-D, proprio). "
+        "Lidar-only modes concat the WM proprio encoder."
     ),
 )
 parser.add_argument(
@@ -473,6 +475,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--tie_vy_yaw",
+    action="store_true",
+    help=(
+        "Actor emits (vx, u) only. One score s=(u+1)/2 in (0,1) is mapped "
+        "to both vy and yaw_rate, so they always share a sign. "
+        "vy=(2s-1)*0.5, yaw=(2s-1)*yaw_limit. Critic still sees the 3D action."
+    ),
+)
+parser.add_argument(
     "--freeze_vy",
     action="store_true",
     help=(
@@ -743,6 +754,10 @@ def main():
     elif args.obs_mode == "lidar_spunet":
         run_tag = f"sac-path-spunet-{args.critic_fusion}"
         wandb_project = "sac-hj-spunet-humanoid"
+    elif args.obs_mode == "wm_spunet":
+        feat = str(getattr(args, "visual_feature", "patch")).lower()
+        run_tag = f"sac-path-{feat}-spunet-dino-{args.critic_fusion}"
+        wandb_project = "sac-hj-vision-lidar-humanoid"
     else:
         run_tag = f"sac-path-utonia-{args.critic_fusion}"
         wandb_project = "sac-hj-utonia-humanoid"
@@ -775,6 +790,7 @@ def main():
     snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
     if not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
+    wm = None
     if args.obs_mode == "lidar_pointnet2":
         pointnet2_ckpt = args.pointnet2_ckpt or str(ckpt_dir / "pointnet2_cls_ssg.pth")
         if not os.path.isfile(pointnet2_ckpt):
@@ -782,13 +798,31 @@ def main():
         args.pointnet2_ckpt = os.path.abspath(pointnet2_ckpt)
         z_lidar_dim = 1024
         encoder_line = f"[INFO] PointNet++: {args.pointnet2_ckpt}"
-    elif args.obs_mode == "lidar_spunet":
+    elif args.obs_mode in ("lidar_spunet", "wm_spunet"):
         spunet_ckpt = args.spunet_ckpt or str(ckpt_dir / "spunet_v1m1_scannet.pth")
         if not os.path.isfile(spunet_ckpt):
             raise FileNotFoundError(f"SpUNet checkpoint not found: {spunet_ckpt}")
         args.spunet_ckpt = os.path.abspath(spunet_ckpt)
         z_lidar_dim = 96
         encoder_line = f"[INFO] SpUNet: {args.spunet_ckpt}"
+        if args.obs_mode == "wm_spunet":
+            hydra_cfg = ckpt_dir / "hydra.yaml"
+            if not hydra_cfg.is_file():
+                raise FileNotFoundError(f"WM hydra.yaml not found: {hydra_cfg}")
+            from omegaconf import OmegaConf
+            from wm_load import load_model
+
+            train_cfg = OmegaConf.load(str(hydra_cfg))
+            wm = load_model(
+                snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device
+            )
+            wm.eval()
+            for p in wm.parameters():
+                p.requires_grad = False
+            encoder_line = (
+                f"[INFO] DINO {snapshot} visual_feature={args.visual_feature}; "
+                f"SpUNet {args.spunet_ckpt}"
+            )
     else:
         utonia_ckpt = args.utonia_ckpt or str(ckpt_dir / "utonia.pth")
         if not os.path.isfile(utonia_ckpt):
@@ -803,7 +837,12 @@ def main():
     print(encoder_line)
     print(f"[INFO] proprio encoder from {snapshot}")
     proprio_encoder = None
-    if args.with_proprio:
+    if args.obs_mode == "wm_spunet":
+        print(
+            "[INFO] z = cat(z_vision, z_lidar 96, z_proprio); "
+            "critic concat appends (vx, vy, yaw_rate)"
+        )
+    elif args.with_proprio:
         payload = torch.load(snapshot, map_location=args.device, weights_only=False)
         proprio_encoder = payload["proprio_encoder"].to(args.device).eval()
         for p in proprio_encoder.parameters():
@@ -821,7 +860,7 @@ def main():
     def make_env():
         return LatentHumanoidEnv(
             args,
-            None,
+            wm,
             args.device,
             args_cli,
             with_proprio=args.with_proprio,
@@ -864,6 +903,15 @@ def main():
     critic1, critic1_optim = _make_critic()
     critic2, critic2_optim = _make_critic()
 
+    tie_vy_yaw = bool(getattr(args, "tie_vy_yaw", False))
+    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
+    freeze_vy = bool(getattr(args, "freeze_vy", False))
+    if tie_vy_yaw and (freeze_yaw or freeze_vy):
+        raise SystemExit(
+            "[ERROR] --tie_vy_yaw cannot be combined with --freeze_vy or --freeze_yaw"
+        )
+    # Critic / env stay 3D. Tied actor samples only (vx, u).
+    actor_action_shape = (2,) if tie_vy_yaw else action_shape
     actor_net = Net(
         state_shape,
         hidden_sizes=args.control_net,
@@ -873,7 +921,7 @@ def main():
     # unbounded=True: mu in R, tanh applied inside SACPolicy.forward (standard SAC).
     actor1 = ActorProb(
         actor_net,
-        action_shape,
+        actor_action_shape,
         max_action=1.0,
         unbounded=True,
         device=args.device,
@@ -881,7 +929,7 @@ def main():
     actor1_optim = torch.optim.AdamW(actor1.parameters(), lr=args.actor_lr)
 
     if use_auto_alpha:
-        target_entropy = float(-np.prod(action_shape))
+        target_entropy = float(-np.prod(actor_action_shape))
         log_alpha = torch.zeros(1, requires_grad=True, device=args.device)
         alpha_optim = torch.optim.Adam([log_alpha], lr=float(args.alpha_lr))
         alpha_arg = (target_entropy, log_alpha, alpha_optim)
@@ -912,8 +960,13 @@ def main():
     action_reg_coef = float(args.action_reg_coef)
     nom_reg_coef = float(getattr(args, "nom_reg_coef", 0.0))
     boundary_reg_coef = float(args.boundary_reg_coef)
-    freeze_yaw = bool(getattr(args, "freeze_yaw", False))
-    freeze_vy = bool(getattr(args, "freeze_vy", False))
+    if tie_vy_yaw:
+        print(
+            "[INFO] tie_vy_yaw: actor outputs (vx, u) in (-1, 1). "
+            "s=(u+1)/2 in (0, 1) maps to vy=(2s-1)*0.5 and "
+            "yaw=(2s-1)*yaw_limit, so the two always share a sign. "
+            f"target entropy {float(-np.prod(actor_action_shape)):.0f}."
+        )
     if freeze_vy and use_auto_alpha:
         # log π is over (vx, yaw) only; do not spend entropy budget on vy.
         policy._target_entropy = -2.0
@@ -926,6 +979,18 @@ def main():
             f"(MSE(a_sf, a_nom) if Q>=thr else MSE(a_sf, a_good))."
         )
         boundary_reg_coef = 0.0
+
+    def _tie_vy_yaw_act(act):
+        """Expand (vx, u) to (vx, u, u) in policy space. map_action then scales both."""
+        if isinstance(act, torch.Tensor):
+            if act.shape[-1] != 2:
+                return act
+            return torch.cat([act, act[..., 1:2]], dim=-1)
+        arr = np.asarray(act, dtype=np.float32)
+        if arr.shape[-1] != 2:
+            return arr
+        u = arr[..., 1:2]
+        return np.concatenate([arr, u], axis=-1)
 
     def _zero_yaw_act(act):
         """Force yaw (dim 2) to 0 in policy-space actions (tensor or ndarray)."""
@@ -1150,6 +1215,9 @@ def main():
     def _sac_forward(batch, state=None, input="obs", **kwargs):
         """SAC forward; collect may execute waypoint or Q-gate switch."""
         out = _orig_policy_forward(batch, state=state, input=input, **kwargs)
+        if tie_vy_yaw:
+            # log π stays the 2D Gaussian; critic and env see the expanded 3D action.
+            out.act = _tie_vy_yaw_act(out.act)
         if freeze_yaw:
             out.act = _zero_yaw_act(out.act)
         if freeze_vy:
