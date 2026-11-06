@@ -239,6 +239,22 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--wm_ckpt_name",
+    type=str,
+    default="model_latest.pth",
+    help="File name under <dino run>/checkpoints/. Default model_latest.pth.",
+)
+parser.add_argument(
+    "--pred_next_z",
+    action="store_true",
+    help=(
+        "Replace each frame's z with the WM predictor's z_{t+1}. "
+        "The predictor sees the last num_hist encoded frames (CLS + proprio) "
+        "and each frame's action embedding. "
+        "Off by default, so the original vision script is unchanged."
+    ),
+)
+parser.add_argument(
     "--layout_seed",
     type=int,
     default=None,
@@ -695,6 +711,8 @@ def main():
     run_tag = "sac-path"
     if args.visual_feature == "cls" or args.critic_fusion == "concat":
         run_tag = f"sac-path-{args.visual_feature}-{args.critic_fusion}"
+    if bool(getattr(args, "pred_next_z", False)):
+        run_tag = f"{run_tag}-pred"
     resume_epoch_for_name = 0
     if args.resume_policy:
         resume_epoch_for_name = _parse_resume_epoch_from_path(args.resume_policy)
@@ -722,7 +740,8 @@ def main():
 
     ckpt_dir = Path(args.dino_ckpt_dir)
     hydra_cfg = ckpt_dir / "hydra.yaml"
-    snapshot = ckpt_dir / "checkpoints" / "model_latest.pth"
+    wm_ckpt_name = str(getattr(args, "wm_ckpt_name", "model_latest.pth"))
+    snapshot = ckpt_dir / "checkpoints" / wm_ckpt_name
     if not hydra_cfg.is_file():
         raise FileNotFoundError(
             f"WM hydra.yaml not found: {hydra_cfg}\n"
@@ -731,9 +750,11 @@ def main():
     if not snapshot.is_file():
         raise FileNotFoundError(f"WM checkpoint not found: {snapshot}")
     print(f"[INFO] Loading WM from {ckpt_dir}")
+    print(f"[INFO] WM snapshot: {snapshot.name}")
     print(
         f"[INFO] visual_feature={args.visual_feature} "
-        f"critic_fusion={args.critic_fusion}"
+        f"critic_fusion={args.critic_fusion} "
+        f"pred_next_z={bool(getattr(args, 'pred_next_z', False))}"
     )
     train_cfg = OmegaConf.load(str(hydra_cfg))
     wm = load_model(snapshot, train_cfg, train_cfg.num_action_repeat, device=args.device)
@@ -1255,6 +1276,11 @@ def main():
         )
         + f", lidar_cone=±{float(args.lidar_h_half_fov_deg):g}°"
         + f", z_fuse_frames={int(getattr(args, 'z_fuse_frames', 5))}"
+        + (
+            ", pred_next_z=last 3 frames + action embeddings -> z_t+1"
+            if bool(getattr(args, "pred_next_z", False))
+            else ""
+        )
         + ", "
         f"vy=[{float(ENV_VY_RANGE[0]):g},{float(ENV_VY_RANGE[1]):g}], "
         f"yaw_limit={float(args.yaw_limit):g}, "

@@ -182,6 +182,13 @@ class LatentHumanoidEnv(gym.Env):
         self._act_hist: list[np.ndarray] = []
         self._z_fuse_frames = max(1, int(getattr(args, "z_fuse_frames", 5)))
         self._z_fuse_hist: deque[np.ndarray] = deque(maxlen=self._z_fuse_frames)
+        # Off unless a training script passes --pred_next_z. The original
+        # vision script does not, so its encode() path is unchanged.
+        self.pred_next_z = bool(getattr(args, "pred_next_z", False))
+        self._z_tok_hist: deque[tuple[np.ndarray, np.ndarray, np.ndarray]] = deque(
+            maxlen=self._wm_num_hist()
+        )
+        self._pred_frame_action: np.ndarray | None = None
         # Formal-train switch episodes: 2D traj PNG (off by default / original pipeline).
         self.record_switch_traj = False
         self.switch_traj_dir = ""
@@ -279,6 +286,7 @@ class LatentHumanoidEnv(gym.Env):
             f"(OOB → truncate only, no h_s penalty), "
             f"wm_num_hist={self._wm_num_hist()}, "
             f"z_fuse_frames={self._z_fuse_frames}, "
+            f"pred_next_z={self.pred_next_z}, "
             f"wandb_video_every={self.wandb_video_every}, reset: {reset_info}"
         )
         def _region_summary(v: dict) -> dict:
@@ -1393,6 +1401,8 @@ class LatentHumanoidEnv(gym.Env):
         self._start_episode_recording()
         obs = self._read_step_obs()
         self._reset_z_fuse_hist()
+        self._z_tok_hist.clear()
+        self._pred_frame_action = None
         z = self.encode(obs)
         self._reset_wm_history(obs)
         l_val = float(self.wrapper.calculate_cost())
@@ -1503,6 +1513,9 @@ class LatentHumanoidEnv(gym.Env):
             )
         obs = self._read_step_obs()
         self._push_wm_history(obs, action)
+        # Action just executed belongs to the last stored frame. encode()
+        # writes it into that frame before predicting z_{t+1}.
+        self._pred_frame_action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
         z_next = self.encode(obs)
         # Q(z, a_executed) — same cost as the old actor-based overlay.
         hj_val = self._hj_value(z_next, action_env=np.asarray(action, dtype=np.float64))
@@ -1695,17 +1708,9 @@ class LatentHumanoidEnv(gym.Env):
             hist.append(z.copy())
         return np.mean(np.stack(list(hist), axis=0), axis=0).astype(np.float32)
 
-    def _encode_current(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
-        """Single-frame encode. No temporal average."""
-        if self.obs_mode == "lidar_joint":
-            return self.wrapper.get_lidar_joint_state()
-        if self.obs_mode == "wm_spunet":
-            return self._encode_wm_spunet(obs)
-        if self.obs_mode in ("lidar_utonia", "lidar_pointnet2", "lidar_spunet"):
-            return self._encode_frozen_lidar(obs)
-
+    def _encode_wm_lat(self, obs: dict[str, Any] | tuple | list) -> dict[str, torch.Tensor]:
+        """One-frame WM encode_obs: visual tokens and proprio embedding."""
         visual, proprio = self._split_raw_obs(obs)
-
         with torch.no_grad():
             vis_np = self._visual_to_normalized_chw(visual)
             vis_t = torch.from_numpy(vis_np).unsqueeze(0).unsqueeze(1).to(self.device)
@@ -1718,8 +1723,100 @@ class LatentHumanoidEnv(gym.Env):
                     .unsqueeze(1)
                     .to(self.device)
                 )
-            lat = self._encode_obs_visual(vis_t, prop_t)
-            return self._flatten_latent_obs(lat)
+            return self._encode_obs_visual(vis_t, prop_t)
+
+    def _encode_current(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """Single-frame encode. No temporal average."""
+        if self.obs_mode == "lidar_joint":
+            return self.wrapper.get_lidar_joint_state()
+        if self.obs_mode == "wm_spunet":
+            return self._encode_wm_spunet(obs)
+        if self.obs_mode in ("lidar_utonia", "lidar_pointnet2", "lidar_spunet"):
+            return self._encode_frozen_lidar(obs)
+        return self._flatten_latent_obs(self._encode_wm_lat(obs))
+
+    def _zero_raw_action(self) -> np.ndarray:
+        dim = int(getattr(self.wm.action_encoder, "in_chans", 3))
+        return np.zeros((dim,), dtype=np.float32)
+
+    def _append_z_frame(self, obs: dict[str, Any] | tuple | list, action: np.ndarray) -> None:
+        lat = self._encode_wm_lat(obs)
+        vis = lat["visual"].detach().float().reshape(-1).cpu().numpy()
+        prop = lat["proprio"].detach().float().reshape(-1).cpu().numpy()
+        emb_dim = int(self.wm.encoder.emb_dim)
+        if int(vis.size) != emb_dim:
+            raise RuntimeError(
+                f"pred_next_z expected one CLS token of dim {emb_dim}, got {int(vis.size)}"
+            )
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        need = int(getattr(self.wm.action_encoder, "in_chans", act.size))
+        if int(act.size) != need:
+            raise RuntimeError(
+                f"pred_next_z action dim {int(act.size)} != action encoder in_chans {need}"
+            )
+        self._z_tok_hist.append((vis.copy(), prop.copy(), act.copy()))
+
+    def _predict_from_z_hist(self) -> np.ndarray:
+        """Predict the next frame from the stored (z, a) window.
+
+        Same layout as WM training: each token is CLS ‖ proprio ‖ action_encoder(a).
+        Padded early frames repeat the oldest image and use a zero command.
+        The returned vector drops the action slice (CLS + proprio).
+        """
+        n = int(self._z_tok_hist.maxlen or 1)
+        frames = list(self._z_tok_hist)
+        if not frames:
+            raise RuntimeError("pred_next_z history is empty")
+        zero = self._zero_raw_action()
+        while len(frames) < n:
+            vis, prop, _ = frames[0]
+            frames.insert(0, (vis, prop, zero.copy()))
+        frames = frames[-n:]
+        vis_np = np.stack([f[0] for f in frames], axis=0).astype(np.float32)
+        prop_np = np.stack([f[1] for f in frames], axis=0).astype(np.float32)
+        act_np = np.stack([f[2] for f in frames], axis=0).astype(np.float32)
+        emb_dim = int(vis_np.shape[-1])
+
+        vis_t = torch.from_numpy(vis_np).to(self.device).view(1, n, 1, emb_dim)
+        prop_t = torch.from_numpy(prop_np).to(self.device).view(1, n, 1, -1)
+        prop_t = prop_t.repeat(1, 1, 1, int(self.wm.num_proprio_repeat))
+        act_in = torch.from_numpy(act_np).to(self.device).view(1, n, -1)
+        self.wm.eval()
+        with torch.no_grad():
+            act_emb = self.wm.encode_act(act_in)
+            act_t = act_emb.unsqueeze(2).repeat(1, 1, 1, int(self.wm.num_action_repeat))
+            z = torch.cat([vis_t, prop_t, act_t], dim=-1)
+            z_pred = self.wm.predict(z)
+            z_obs, _ = self.wm.separate_emb(z_pred[:, -1:, ...])
+            return self._flatten_latent_obs(z_obs)
+
+    def _predict_next_z(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
+        """z_{t+1} from the last ``num_hist`` frames and their action embeddings.
+
+        After a step, the executed action is written onto the previous frame
+        (the frame it was issued from). The predictor then emits the next
+        frame. The new image is stored for the following window, with a zero
+        command until the next step supplies its action.
+        """
+        if self.wm is None or self.wm.predictor is None:
+            raise RuntimeError("pred_next_z needs a world model with a predictor")
+        if self.visual_feature != "cls":
+            raise RuntimeError("pred_next_z is implemented for visual_feature=cls")
+        if int(getattr(self.wm, "concat_dim", 1)) != 1:
+            raise RuntimeError("pred_next_z expects concat_dim=1")
+
+        pending = getattr(self, "_pred_frame_action", None)
+        self._pred_frame_action = None
+        if pending is not None and len(self._z_tok_hist) > 0:
+            vis, prop, _ = self._z_tok_hist[-1]
+            act = np.asarray(pending, dtype=np.float32).reshape(-1)
+            self._z_tok_hist[-1] = (vis, prop, act.copy())
+            z_hat = self._predict_from_z_hist()
+            self._append_z_frame(obs, self._zero_raw_action())
+            return z_hat
+
+        self._append_z_frame(obs, self._zero_raw_action())
+        return self._predict_from_z_hist()
 
     def encode(self, obs: dict[str, Any] | tuple | list) -> np.ndarray:
         """Encode the current observation into the critic/actor state.
@@ -1736,9 +1833,14 @@ class LatentHumanoidEnv(gym.Env):
         on the same hits, optional frozen proprio encoder.
         ``obs_mode=wm_spunet``: cat(DINO visual, SpUNet 96-D, proprio).
         Action is still outside z. When ``z_fuse_frames`` > 1, return the
-        mean of the last N full z.
+        mean of the last N full z. ``pred_next_z`` swaps the single frame
+        for the predictor's z_{t+1} before that mean.
         """
-        return self._fuse_z(self._encode_current(obs))
+        if self.pred_next_z and self.obs_mode == "wm":
+            z = self._predict_next_z(obs)
+        else:
+            z = self._encode_current(obs)
+        return self._fuse_z(z)
 
     def _freeze_proprio_encoder(self) -> None:
         if not self.with_proprio:
